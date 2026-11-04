@@ -28,6 +28,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     run_traced,
 )
 from torchtitan.experiments.graph_trainer.memory_policy import (
+    _LOOP_HOPS,
     _full_memory_policy_pass,
     _make_default_memory_policy,
     _make_full_memory_policy,
@@ -540,25 +541,33 @@ class TestTpuRematSchedule(unittest.TestCase):
 
 class TestScanRecomputePolicy(unittest.TestCase):
 
-    def test_a_scan_over_the_layers_is_never_recomputed(self) -> None:
-        """Recomputing one scan node reruns the whole decoder loop in backward.
+    def test_a_loop_node_is_never_recomputed(self) -> None:
+        """Recomputing one loop node reruns the whole loop in backward.
 
         It is the one recompute decision here with no visible symptom: the loss
         stays exact and the saved set really does shrink, so the memory number
         improves while the step does twice the forward work.
         """
-        graph = torch.fx.Graph()
-        x = graph.placeholder("x")
-        xs = graph.placeholder("xs")
-        node = graph.call_function(
-            torch.ops.higher_order.scan, args=(None, [x], [xs], ())
-        )
-        graph.output(node)
-        gm = torch.fx.GraphModule(nn.Module(), graph)
+        loop_hops = [
+            torch.ops.higher_order.scan,
+            torch.ops.higher_order.while_loop,
+            torch.ops.higher_order.while_loop_stack_output,
+            torch.ops.higher_order.map_impl,
+        ]
+        self.assertCountEqual(_LOOP_HOPS, loop_hops)
+        for hop in loop_hops:
+            with self.subTest(hop=hop.name()):
+                graph = torch.fx.Graph()
+                x = graph.placeholder("x")
+                node = graph.call_function(hop, args=(None, [x]))
+                graph.output(node)
+                gm = torch.fx.GraphModule(nn.Module(), graph)
 
-        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+                tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
 
-        self.assertEqual(node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+                self.assertEqual(
+                    node.meta["recompute"], CheckpointPolicy.MUST_SAVE
+                )
 
 
 if __name__ == "__main__":

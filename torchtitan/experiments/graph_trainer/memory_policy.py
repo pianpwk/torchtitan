@@ -63,6 +63,14 @@ if TYPE_CHECKING:
 
 _INF_DISTANCE = int(1e9)
 
+# Loop HOPs in this torch build. A joint graph holds while_loop's forward as
+# while_loop_stack_output, and map's as map_impl.
+_LOOP_HOPS = tuple(
+    op
+    for name in ("scan", "while_loop", "while_loop_stack_output", "map_impl")
+    if (op := getattr(torch.ops.higher_order, name, None)) is not None
+)
+
 
 def _make_default_memory_policy(save_ops: set | None = None) -> Callable:
     """Create a SAC policy function from a set of op targets to save."""
@@ -305,16 +313,10 @@ def tag_sac_policy(
                 node.meta["recompute"] = parent.meta["recompute"]
             continue
 
-        # A `scan` node stands for its whole loop, so recomputing one reruns
-        # every iteration in backward: exact loss, smaller saved set, twice the
-        # work -- a regression that looks like a win in the memory number.
-        #
-        # This saves *every* scan, deliberately. A node's meta cannot say which
-        # loop it is (a HOP's body is traced separately, so tags placed there do
-        # not survive into the joint graph), and a loop is expensive to redo
-        # whatever it contains. The body's own checkpointing is set where the
-        # scan is built; see `graph_trainer/layer_stack.py`.
-        if node.target is torch.ops.higher_order.scan:
+        # Recomputing a loop node reruns the whole loop in backward, doubling
+        # forward work while the loss stays exact. That is true of any loop in
+        # any lane, so every loop is saved.
+        if node.target in _LOOP_HOPS:
             node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
             continue
 
