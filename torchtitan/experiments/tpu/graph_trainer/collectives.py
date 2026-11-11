@@ -206,7 +206,12 @@ def classify_fsdp_roles(
   roles: dict[torch.fx.Node, FsdpRole | None] = {}
   for launch in reversed(list(collective_chains)):
     inputs, users = chain_boundary(collective_chains[launch])
-    if all(n.op in ("placeholder", "get_attr") for n in inputs):
+    val = launch.meta.get("val")
+    if isinstance(val, torch.Tensor) and val.dtype in (torch.int32, torch.int64):
+      # Integer payloads (e.g. EP routing ids replayed from saved inputs) are
+      # never parameters, even when fed only by graph inputs.
+      roles[launch] = None
+    elif all(n.op in ("placeholder", "get_attr") for n in inputs):
       roles[launch] = "ag"
     elif users and all(
         n.op == "output" or roles.get(member.get(n)) == "rs" for n in users
