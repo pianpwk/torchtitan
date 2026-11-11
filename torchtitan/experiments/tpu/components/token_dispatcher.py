@@ -351,22 +351,32 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
 
 class TpuRoutedExperts(RoutedExperts):
-  """Routed experts that can apply the routing scores before W2.
+  """TPU `RoutedExperts` with pre-W2 score scaling and Ring-of-Experts chunking.
 
-  W2 is linear, so scaling its input rows gives the same result as scaling its
-  output rows. Scaling the input makes the score gradient
-  ``rowsum(hidden * dHidden)``, which does not read the W2 output, so a
-  rematerializing backward no longer recomputes the W2 forward. Only rounding
-  changes: each BF16 hidden row is scaled in FP32 and rounded before W2,
-  instead of each W2 output row after it.
+  * `scale_before_down_proj`: W2 is linear, so scaling its input rows gives the
+    same result as scaling its output rows. Scaling the input makes the score
+    gradient ``rowsum(hidden * dHidden)``, which does not read the W2 output, so
+    a rematerializing backward no longer recomputes the W2 forward.
+  * `num_moe_token_chunks`: For Ring-of-Experts EP, local tokens are split into
+    `num_moe_token_chunks` independent chunks that each run
+    dispatch -> experts -> combine. Chunks have no data dependencies, so XLA can
+    overlap chunk c+1's EP all-gather and chunk c-1's reduce-scatter with chunk
+    c's grouped matmuls (MaxText `num_moe_token_chunks`).
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(RoutedExperts.Config):
     scale_before_down_proj: bool = False
+    num_moe_token_chunks: int = 1
 
   def __init__(self, config: Config):
     super().__init__(config)
+    if config.num_moe_token_chunks < 1:
+      raise ValueError(
+          "num_moe_token_chunks must be >= 1, got"
+          f" {config.num_moe_token_chunks}"
+      )
+    self.num_moe_token_chunks = config.num_moe_token_chunks
     self.scale_before_down_proj = config.scale_before_down_proj
     if not self.scale_before_down_proj:
       return
@@ -387,31 +397,63 @@ class TpuRoutedExperts(RoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
-    if not self.scale_before_down_proj:
-      return super().forward(
-          x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+    if self.scale_before_down_proj:
+      routed_input_RD, num_tokens_per_expert_e, metadata = (
+          self.token_dispatcher.dispatch(
+              x_TD,
+              topk_scores_TK,
+              topk_expert_ids_TK,
+              num_local_tokens_per_expert_E,
+          )
       )
-    routed_input_RD, num_tokens_per_expert_e, metadata = (
-        self.token_dispatcher.dispatch(
-            x_TD,
-            topk_scores_TK,
-            topk_expert_ids_TK,
-            num_local_tokens_per_expert_E,
+      if not isinstance(metadata, LocalDispatchMetadata):
+        raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
+      with maybe_set_sparse_mesh():
+        routed_output_RD = self.inner_experts(
+            routed_input_RD,
+            num_tokens_per_expert_e,
+            row_scale_R=metadata.topk_scores_experts_sorted_N,
         )
-    )
-    if not isinstance(metadata, LocalDispatchMetadata):
-      raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
-    with maybe_set_sparse_mesh():
-      routed_output_RD = self.inner_experts(
-          routed_input_RD,
-          num_tokens_per_expert_e,
-          row_scale_R=metadata.topk_scores_experts_sorted_N,
+      return stable_grouped_reduce(
+          routed_output_RD,
+          metadata.token_indices_experts_sorted_N,
+          self.token_dispatcher.top_k,
       )
-    return stable_grouped_reduce(
-        routed_output_RD,
-        metadata.token_indices_experts_sorted_N,
-        self.token_dispatcher.top_k,
-    )
+
+    n = self.num_moe_token_chunks
+    num_tokens = int(x_TD.shape[0])
+    dispatcher = self.token_dispatcher
+    if (
+        n == 1
+        or not isinstance(dispatcher, TpuAllToAllTokenDispatcher)
+        or not dispatcher.uses_ring_of_experts
+    ):
+      return super().forward(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+      )
+    if num_tokens % n != 0:
+      raise ValueError(
+          f"{num_tokens} local tokens are not divisible into {n} chunks"
+      )
+
+    chunk = num_tokens // n
+    outs = []
+    for c in range(n):
+      rows = slice(c * chunk, (c + 1) * chunk)
+      # Ring-of-Experts counts each chunk's routes from its gathered expert
+      # ids, so the whole-batch counts are passed through unused.
+      outs.append(
+          super().forward(
+              x_TD[rows],
+              topk_scores_TK[rows],
+              topk_expert_ids_TK[rows],
+              num_local_tokens_per_expert_E,
+          )
+      )
+    return torch.cat(outs, dim=0)
 
 
 class TpuRoutedExpertsConverter(ModelConfigConverter):
@@ -446,25 +488,60 @@ class TpuTokenDispatcherConverter(ModelConfigConverter):
 
   @dataclass(kw_only=True, slots=True)
   class Config(ModelConfigConverter.Config):
-    pass
+    # >1 pipelines Ring-of-Experts EP over this many token chunks.
+    num_moe_token_chunks: int = 1
+    # Ring-of-Experts capacity factor; None is drop-free. See
+    # `TpuAllToAllTokenDispatcher.Config.capacity_factor`.
+    moe_capacity_factor: float | None = None
 
   def __init__(self, config: Config):
-    pass
+    self.num_moe_token_chunks = config.num_moe_token_chunks
+    self.moe_capacity_factor = config.moe_capacity_factor
+
+  @staticmethod
+  def _replace(model_config, parent, field_name, replacement):
+    if parent is None:
+      return replacement
+    if isinstance(parent, list):
+      assert isinstance(field_name, int)
+      parent[field_name] = replacement
+    else:
+      assert isinstance(field_name, str)
+      setattr(parent, field_name, replacement)
+    return model_config
 
   def convert(self, model_config):
-    matches = list(model_config.traverse(AllToAllTokenDispatcher.Config))
-    for _, config, parent, field_name in matches:
+    if self.num_moe_token_chunks > 1:
+      for _, config, parent, field_name in list(
+          model_config.traverse(RoutedExperts.Config)
+      ):
+        if type(config) not in (RoutedExperts.Config, TpuRoutedExperts.Config):
+          continue
+        model_config = self._replace(
+            model_config,
+            parent,
+            field_name,
+            derive(
+                config,
+                TpuRoutedExperts.Config,
+                num_moe_token_chunks=self.num_moe_token_chunks,
+            ),
+        )
+    for _, config, parent, field_name in list(
+        model_config.traverse(AllToAllTokenDispatcher.Config)
+    ):
       if type(config) is not AllToAllTokenDispatcher.Config:
         continue
-      replacement = derive(config, TpuAllToAllTokenDispatcher.Config)
-      if parent is None:
-        model_config = replacement
-      elif isinstance(parent, list):
-        assert isinstance(field_name, int)
-        parent[field_name] = replacement
-      else:
-        assert isinstance(field_name, str)
-        setattr(parent, field_name, replacement)
+      model_config = self._replace(
+          model_config,
+          parent,
+          field_name,
+          derive(
+              config,
+              TpuAllToAllTokenDispatcher.Config,
+              capacity_factor=self.moe_capacity_factor,
+          ),
+      )
     return model_config
 
 
