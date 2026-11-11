@@ -23,9 +23,13 @@ earlier bounded-ragged prototype did exactly that around ``combine_route``.
 its receive buffer is sized for the worst case rather than a capacity, so it
 has no overflow, and its combine calls the same local reduction after the
 return exchange. Bounded capacity is still future work.
+
+For EP>1 the dispatcher defaults to the static-shape Ring-of-Experts transport
+in ``ring_of_experts.py``, which does its own fused gather and reduction.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 import weakref
 
 import torch
@@ -43,6 +47,11 @@ from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
     MOE_ROUTING,
+)
+from torchtitan.experiments.tpu.components.ring_of_experts import (
+    ring_of_experts_combine,
+    ring_of_experts_dispatch,
+    RingOfExpertsMetadata,
 )
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
@@ -442,36 +451,49 @@ def local_reorder(
 
 
 class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
-  """Standard dispatcher with TPU-local permutation VJPs.
+  """Standard dispatcher with TPU-local permutation VJPs and EP transports.
 
-  ``_local_reorder`` is shared by EP=1 and EP>1 and is optimized in both
-  cases. ``combine`` selects the fixed-K reduction only when ``ep_mesh`` is
-  absent. The standard dropless EP path should also admit fixed-K reduction,
-  but must retain its return all-to-all and separately handle SP-local rows in
-  the global output layout. It intentionally delegates until that path has its
-  own correctness and performance gate.
+  ``_local_reorder`` is shared by EP=1 and the all-to-all EP>1 paths. With
+  EP=1, ``combine`` uses the fixed-K reduction. With EP>1, ``ep_transport``
+  selects the static-shape Ring-of-Experts transport (``ring_of_experts.py``),
+  the upstream dynamic-shape all-to-all, or the dropless ragged all-to-all.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(AllToAllTokenDispatcher.Config):
     fuse_route_score_backward: bool = False
-    # EP > 1 transport. "all_to_all": upstream's variable-size all-to-all,
-    # which copies the splits to the host. "ragged_all_to_all": dropless and
-    # static-shape (no host sync; traceable), with a worst-case receive buffer
-    # of ep_size * T * top_k rows per rank. EP=1 ignores this.
-    ep_transport: str = "all_to_all"
+    # EP > 1 transport. "ring_of_experts": static-shape all-gather /
+    # reduce-scatter (ring_of_experts.py), bounded by capacity_factor.
+    # "all_to_all": upstream's variable-size all-to-all, which copies the
+    # splits to the host. "ragged_all_to_all": dropless and static-shape (no
+    # host sync; traceable), with a worst-case receive buffer of
+    # ep_size * T * top_k rows per rank. EP=1 ignores this.
+    ep_transport: Literal["ring_of_experts", "all_to_all", "ragged_all_to_all"] = (
+        "ring_of_experts"
+    )
+    # Ring-of-Experts rows per EP rank as a multiple of the local routes. None
+    # (the default) is drop-free, like the upstream dispatcher; a factor such
+    # as MaxText's 1.125 bounds the buffer and drops routes past capacity.
+    capacity_factor: float | None = None
 
   def __init__(self, config: Config):
     super().__init__(config)
     self.fuse_route_score_backward = config.fuse_route_score_backward
     self.ep_transport = config.ep_transport
-    if self.ep_transport not in ("all_to_all", "ragged_all_to_all"):
+    if self.ep_transport not in (
+        "ring_of_experts", "all_to_all", "ragged_all_to_all"
+    ):
       raise ValueError(
-          f"ep_transport must be 'all_to_all' or 'ragged_all_to_all', got"
-          f" {self.ep_transport!r}"
+          "ep_transport must be 'ring_of_experts', 'all_to_all' or"
+          f" 'ragged_all_to_all', got {self.ep_transport!r}"
       )
+    self.capacity_factor = config.capacity_factor
     self._ep_rank_holder_ref: weakref.ReferenceType | None = None
     self._ep_local_rank_buf: torch.Tensor | None = None
+
+  @property
+  def uses_ring_of_experts(self) -> bool:
+    return self.ep_mesh is not None and self.ep_transport == "ring_of_experts"
 
   def init_buffer(self) -> None:
     super().init_buffer()
@@ -605,7 +627,10 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
   ) -> tuple[
       torch.Tensor,
       torch.Tensor,
-      AllToAllDispatchMetadata | LocalDispatchMetadata | TpuRaggedDispatchMetadata,
+      AllToAllDispatchMetadata
+      | LocalDispatchMetadata
+      | RingOfExpertsMetadata
+      | TpuRaggedDispatchMetadata,
   ]:
     if self.ep_mesh is None or self.ep_transport == "all_to_all":
       return super().dispatch(
@@ -613,6 +638,18 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           topk_scores_TK,
           topk_expert_ids_TK,
           num_local_tokens_per_expert_E,
+      )
+
+    if self.uses_ring_of_experts:
+      # Ring-of-Experts counts routes from the gathered expert ids itself.
+      del num_local_tokens_per_expert_E
+      return ring_of_experts_dispatch(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_experts=self.num_experts,
+          ep_mesh=self.ep_mesh,
+          capacity_factor=self.capacity_factor,
       )
 
     if self._ep_rank_holder_ref is None or self._ep_rank_holder_ref() is None:
@@ -736,11 +773,20 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       metadata: (
           AllToAllDispatchMetadata
           | LocalDispatchMetadata
+          | RingOfExpertsMetadata
           | TpuRaggedDispatchMetadata
       ),
       x_TD: torch.Tensor,
   ) -> torch.Tensor:
-    if self.ep_mesh is not None and self.ep_transport == "all_to_all":
+    if isinstance(metadata, RingOfExpertsMetadata):
+      return ring_of_experts_combine(
+          routed_output_RD,
+          metadata,
+          fuse_route_score_backward=self.fuse_route_score_backward,
+      )
+    if self.ep_mesh is not None and self.ep_transport != "ragged_all_to_all":
+      # Upstream all-to-all metadata (ep_transport="all_to_all", or a
+      # non-Ring-of-Experts dispatch under the default transport).
       return super().combine(routed_output_RD, metadata, x_TD)
 
     if self.ep_mesh is None:
