@@ -79,6 +79,39 @@ class RaggedGatherReduceTest(
         out.cpu().reshape(num_tokens, 256), expected, rtol=1e-2, atol=1e-2
     )
 
+  def test_block_size_follows_row_bytes(self):
+    # Up to D = 4096 in bf16 the default block; wider rows keep the same VMEM.
+    self.assertEqual(rgr.reduce_block_size(), rgr.REDUCE_BLOCK_SIZE)
+    self.assertEqual(rgr.reduce_block_size(4096 * 2), rgr.REDUCE_BLOCK_SIZE)
+    self.assertEqual(rgr.reduce_block_size(5120 * 2), 1152)
+    self.assertEqual(rgr.reduce_block_size(7168 * 2), 768)
+
+  @parameterized.parameters(5120, 7168)
+  def test_wide_rows_match_reference(self, dim):
+    # DeepSeek-V3 widths: a smaller block, so several blocks plus a remainder.
+    num_tokens, rows, valid = 2048, 5000, 4321
+    g = torch.Generator().manual_seed(2)
+    x = torch.randn(rows, dim, generator=g).to(torch.bfloat16)
+    scale = torch.rand(rows, generator=g)
+    token_ids, valid_1 = _routing(g, num_tokens, rows, valid)
+    expected = _expected_reduce(x, scale, token_ids, valid, num_tokens)
+    x[valid:] = float("nan")
+    scale[valid:] = float("nan")
+
+    device = self.accelerator_device
+    ids_d, valid_d = token_ids.to(device), valid_1.to(device)
+    meta = rgr.ragged_gather_reduce_metadata(
+        ids_d, valid_d, top_k=_TOP_K, num_out_tokens=num_tokens,
+        row_bytes=dim * 2,
+    )
+    out = rgr.ragged_gather_reduce(
+        x.to(device), scale.to(device), valid_d, meta,
+        num_out_tokens=num_tokens, top_k=_TOP_K,
+    )
+    torch.testing.assert_close(
+        out.cpu().reshape(num_tokens, dim), expected, rtol=1e-2, atol=1e-2
+    )
+
   def test_rejects_hidden_not_multiple_of_128(self):
     meta = rgr.ragged_gather_reduce_metadata(
         torch.zeros(4, dtype=torch.int32),

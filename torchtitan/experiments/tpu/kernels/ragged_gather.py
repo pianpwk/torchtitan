@@ -30,6 +30,20 @@ _GATHER_2D_VMEM_LIMIT = 64 * 1024 * 1024
 
 # Rows per grid step of the gather kernel.
 GATHER_BLOCK_SIZE = 1536
+_GATHER_BLOCK_ROW_BYTES = 4096 * 2
+
+
+def gather_block_size(row_bytes: int) -> int:
+  """Rows per grid step for rows of `row_bytes` bytes (`D * itemsize`).
+
+  `GATHER_BLOCK_SIZE` up to D = 4096 in bf16. The 2D kernel holds
+  2 x num_buffers row blocks in VMEM, so wider rows (DeepSeek-V3's
+  D = 5120 / 7168) get the largest multiple of 128 rows in the same budget.
+  """
+  if row_bytes <= _GATHER_BLOCK_ROW_BYTES:
+    return GATHER_BLOCK_SIZE
+  rows = GATHER_BLOCK_SIZE * _GATHER_BLOCK_ROW_BYTES // row_bytes
+  return max(128, rows // 128 * 128)
 
 
 def _ragged_gather_tc_impl(
@@ -580,7 +594,7 @@ def ragged_gather(
         x_T3,
         token_ids_R.to(torch.int32),
         valid_count_1.reshape(1).to(torch.int32),
-        GATHER_BLOCK_SIZE,
+        gather_block_size(x_T3.shape[1] * x_T3.shape[2] * x_T3.element_size()),
     )
   x_TD = x_T3.reshape(x_T3.shape[0], -1)
   max_R = int(token_ids_R.shape[0])
@@ -628,6 +642,7 @@ def inverse_permute_scatter(
 
 __all__ = [
     "GATHER_BLOCK_SIZE",
+    "gather_block_size",
     "inverse_permute_scatter",
     "ragged_gather",
     "to_token_3d",
