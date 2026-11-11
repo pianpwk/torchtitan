@@ -329,18 +329,11 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
       )
     if self.compile.compile_grad_norm:
       # PP needs an additional reduction across stages, which each own only a
-      # subset of the parameters. EP mixes dense and expert gradients on
-      # different meshes, so upstream computes their norms separately before
-      # combining the scalar results. Both can be supported by tracing those
-      # extra reductions; the current compiled path handles one gradient list.
-      if (
-          self.parallelism.expert_parallel_degree > 1
-          or self.parallelism.pipeline_parallel_degree > 1
-      ):
+      # subset of the parameters.
+      if self.parallelism.pipeline_parallel_degree > 1:
         raise ValueError(
-            "compile.compile_grad_norm currently requires EP1 and PP1; pass"
+            "compile.compile_grad_norm currently requires PP1; pass"
             " --compile.no-compile_grad_norm with"
-            " --parallelism.expert_parallel_degree > 1 or"
             " --parallelism.pipeline_parallel_degree > 1"
         )
     # Set the default location of dump_folder. Allow the runtime CLI
