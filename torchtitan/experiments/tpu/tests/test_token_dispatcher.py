@@ -303,6 +303,8 @@ def test_converter_preserves_fields_and_is_idempotent():
     assert root.dispatcher.num_experts == 8
     assert root.dispatcher.top_k == 2
     assert not root.dispatcher.fuse_route_score_backward
+    # Drop-free unless a recipe opts into a capacity factor.
+    assert root.dispatcher.capacity_factor is None
 
     dispatcher = root.dispatcher
     converter.convert(root)
@@ -439,9 +441,11 @@ def test_scale_before_down_proj_rejects_all_to_all_metadata():
       routed(x, scores, expert_ids, counts)
 
 
-@pytest.mark.parametrize("ep_transport", ["all_to_all", "ragged_all_to_all"])
+@pytest.mark.parametrize(
+    "ep_transport", ["ring_of_experts", "all_to_all", "ragged_all_to_all"]
+)
 def test_ep1_combine_keeps_the_fixed_k_reduction(ep_transport):
-  """Without an EP mesh, either transport uses the local fixed-K reduction."""
+  """Without an EP mesh, every transport uses the local fixed-K reduction."""
   generator = torch.Generator().manual_seed(11)
   num_experts, top_k, dim, tokens = 4, 2, 8, 6
   dispatcher = TpuAllToAllTokenDispatcher.Config(
@@ -471,3 +475,43 @@ def test_ep1_combine_keeps_the_fixed_k_reduction(ep_transport):
 def test_ragged_dispatch_metadata_is_not_local_metadata():
   # EP-1's guard in TpuRoutedExperts relies on this to refuse EP metadata.
   assert not issubclass(TpuRaggedDispatchMetadata, LocalDispatchMetadata)
+
+
+def test_ep_dispatch_uses_ring_of_experts_by_default():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=4, top_k=2, capacity_factor=1.5
+    ).build()
+    dispatcher.ep_mesh = mock.sentinel.ep_mesh
+    args = (torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+    target = "torchtitan.experiments.tpu.components.token_dispatcher.ring_of_experts_dispatch"
+
+    with mock.patch(target, return_value=mock.sentinel.out) as dispatch:
+        assert dispatcher.dispatch(*args) is mock.sentinel.out
+
+    dispatch.assert_called_once_with(
+        *args[:3],
+        num_experts=4,
+        ep_mesh=mock.sentinel.ep_mesh,
+        capacity_factor=1.5,
+    )
+
+
+def test_ep_dispatch_all_to_all_transport_delegates():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=4, top_k=2, ep_transport="all_to_all"
+    ).build()
+    dispatcher.ep_mesh = mock.sentinel.ep_mesh
+    args = (torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+
+    with mock.patch.object(
+        AllToAllTokenDispatcher, "dispatch", return_value=mock.sentinel.out
+    ) as dispatch:
+        assert dispatcher.dispatch(*args) is mock.sentinel.out
+    dispatch.assert_called_once()
+
+
+def test_rejects_unknown_ep_transport():
+    with pytest.raises(ValueError, match="ep_transport"):
+        TpuAllToAllTokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport="ragged"
+        ).build()
