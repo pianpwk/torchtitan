@@ -702,3 +702,29 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned() -> TpuGraphTrainer.Config:
   split.expert_all_gathers_under_splash_recomputed_only = True
   split.expert_all_gathers_under_splash_max_gathers = 1
   return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam() -> (
+    TpuGraphTrainer.Config
+):
+  """``deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned`` with Adam's moments in
+  bf16 (fp32 parameters and gradients kept), as in DeepSeek-V3's own
+  training: 12 instead of 16 bytes per parameter, ~19.5 GiB less per rank.
+  Changes numerics."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned()
+  config.optimizer.implementation = "fused_opt_states_bf16"
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_defer() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._tuned_bf16_adam`` with each backward layer's gradient
+  reduce-scatters waited on in the next backward executable
+  (``fsdp_pipeline``), so they overlap that layer's compute. Holding a layer's
+  unreduced f32 expert gradients (~5.6 GB) into the next executable fits once
+  the Adam moments are bf16."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam()
+  config.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
+  config.compile.graph_split.pipeline_kinds = ("rs",)
+  return config
