@@ -143,7 +143,10 @@ def _parity_worker(device, rank, world_size, ep_size, num_chunks):
 _HIDDEN = 128
 
 
-def _moe_block(num_local_experts, ep_mesh, num_chunks, w1, w2, w3):
+def _moe_block(
+    num_local_experts, ep_mesh, num_chunks, w1, w2, w3,
+    scale_before_down_proj=False,
+):
   """The Qwen3-235B scan recipe's MoE block over the given expert weights.
 
   Pallas paired grouped matmuls, kernel-native weight layout, 256-row tiles,
@@ -164,9 +167,10 @@ def _moe_block(num_local_experts, ep_mesh, num_chunks, w1, w2, w3):
       token_dispatcher=token_dispatcher.TpuAllToAllTokenDispatcher.Config(
           num_experts=_NUM_EXPERTS,
           top_k=_TOP_K,
-          fuse_route_score_backward=True,
+          fuse_route_score_backward=not scale_before_down_proj,
       ),
       num_moe_token_chunks=num_chunks,
+      scale_before_down_proj=scale_before_down_proj,
   )
   block = config.build()
   with torch.no_grad():
@@ -176,7 +180,9 @@ def _moe_block(num_local_experts, ep_mesh, num_chunks, w1, w2, w3):
   return block
 
 
-def _moe_block_parity_worker(device, rank, world_size, ep_size, num_chunks):
+def _moe_block_parity_worker(
+    device, rank, world_size, ep_size, num_chunks, scale_before_down_proj=False
+):
   """EP and no-EP runs of the production MoE block with the same weights.
 
   The EP block holds this rank's slice of the experts and dispatches its own
@@ -222,7 +228,8 @@ def _moe_block_parity_worker(device, rank, world_size, ep_size, num_chunks):
 
   ep_out, ep_grads = run(
       _moe_block(
-          num_local, ep_mesh, num_chunks, w1[experts], w2[experts], w3[experts]
+          num_local, ep_mesh, num_chunks, w1[experts], w2[experts], w3[experts],
+          scale_before_down_proj=scale_before_down_proj,
       ),
       x[rank],
       scores[rank],
@@ -230,7 +237,10 @@ def _moe_block_parity_worker(device, rank, world_size, ep_size, num_chunks):
       grad_out[rank],
   )
   ref_out, ref_grads = run(
-      _moe_block(_NUM_EXPERTS, None, 1, w1, w2, w3),
+      _moe_block(
+          _NUM_EXPERTS, None, 1, w1, w2, w3,
+          scale_before_down_proj=scale_before_down_proj,
+      ),
       x[group].reshape(-1, _DIM),
       scores[group].reshape(-1, _TOP_K),
       ids[group].reshape(-1, _TOP_K),
@@ -304,9 +314,11 @@ class RingOfExpertsDistributedTest(
       ("ep_half", 2, 1),
       ("ep_all_chunked", 0, 4),
       ("ep_half_chunked", 2, 4),
+      ("ep_all_scaled", 0, 1, True),
+      ("ep_half_chunked_scaled", 2, 2, True),
   )
   def test_moe_block_matches_no_ep_with_the_same_weights(
-      self, ep_divisor, num_chunks
+      self, ep_divisor, num_chunks, scale_before_down_proj=False
   ):
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
       self.skipTest("the Pallas grouped matmuls run on TPU only")
@@ -319,6 +331,7 @@ class RingOfExpertsDistributedTest(
         _moe_block_parity_worker,
         ep_size,
         num_chunks,
+        scale_before_down_proj,
     )
 
 

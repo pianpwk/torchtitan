@@ -238,9 +238,17 @@ class _CombineTokens(torch.autograd.Function):
   @staticmethod
   def forward(ctx, routed_RD, scores_R, token_ids_R, valid_count_1,
               reduce_metadata, num_out_tokens, top_k, ep_mesh,
-              fuse_route_score_backward):
+              fuse_route_score_backward, pre_scaled):
     ctx.set_materialize_grads(False)
-    ctx.save_for_backward(routed_RD, scores_R, token_ids_R, valid_count_1)
+    ctx.pre_scaled = pre_scaled
+    if pre_scaled:
+      # Rows already carry their scores: sum them as they are. Nothing of the
+      # expert output is needed for backward, so it is not saved (and a
+      # rematerializing backward does not recompute the last expert matmul).
+      scores_R = torch.ones_like(scores_R)
+      ctx.save_for_backward(token_ids_R, valid_count_1)
+    else:
+      ctx.save_for_backward(routed_RD, scores_R, token_ids_R, valid_count_1)
     ctx.ep_mesh = ep_mesh
     ctx.fuse_route_score_backward = fuse_route_score_backward
     # Same values as `(routed.float() * scores).to(routed.dtype)` followed by
@@ -263,12 +271,17 @@ class _CombineTokens(torch.autograd.Function):
   @once_differentiable
   def backward(ctx, grad_TD):
     if grad_TD is None:
-      return (None,) * 9
-    routed_RD, scores_R, token_ids_R, valid_count_1 = ctx.saved_tensors
+      return (None,) * 10
+    if ctx.pre_scaled:
+      token_ids_R, valid_count_1 = ctx.saved_tensors
+    else:
+      routed_RD, scores_R, token_ids_R, valid_count_1 = ctx.saved_tensors
     grad_global_T3 = funcol.all_gather_tensor(
         to_token_3d(grad_TD), gather_dim=0, group=ctx.ep_mesh
     )
     grad_weighted_RD = ragged_gather(grad_global_T3, token_ids_R, valid_count_1)
+    if ctx.pre_scaled:
+      return (grad_weighted_RD,) + (None,) * 9
     grad_routed_RD = None
     if ctx.needs_input_grad[0]:
       grad_routed_RD = (
@@ -289,7 +302,7 @@ class _CombineTokens(torch.autograd.Function):
             .sum(dim=1)
             .to(scores_R.dtype)
         )
-    return (grad_routed_RD, grad_scores_R) + (None,) * 7
+    return (grad_routed_RD, grad_scores_R) + (None,) * 8
 
 
 def ring_of_experts_dispatch(
@@ -391,6 +404,7 @@ def ring_of_experts_combine(
     metadata: RingOfExpertsMetadata,
     *,
     fuse_route_score_backward: bool = False,
+    pre_scaled: bool = False,
 ) -> torch.Tensor:
   """Score-weight, sum per token, and return each token to its EP owner.
 
@@ -399,6 +413,9 @@ def ring_of_experts_combine(
     metadata: state returned by `ring_of_experts_dispatch`.
     fuse_route_score_backward: compute the score gradient with the fused
       `route_score_grad` kernel (BF16 rows and FP32 scores only).
+    pre_scaled: the rows were already multiplied by `metadata.scores_R`
+      (e.g. before the down projection), so they are summed unweighted and
+      the score gradient comes from where the scaling happened.
 
   Returns:
     `[T, D]` combined local tokens.
@@ -413,6 +430,7 @@ def ring_of_experts_combine(
       metadata.top_k,
       metadata.ep_mesh,
       fuse_route_score_backward,
+      pre_scaled,
   )
 
 

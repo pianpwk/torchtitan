@@ -118,6 +118,11 @@ class TpuGroupedExperts(GroupedExperts):
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
         pallas_grouped_mm_tgmm_tiling: tuple[int, int, int] = (128, 128, 128)
+        # ``(tile_k, tile_n)`` for the W2 (down-projection) GMM and its dInput
+        # GMM. ``None`` follows ``pallas_grouped_mm_tile_k`` / ``_tile_n``. W2's
+        # K and N are W1/W3's N and K, so a tile that divides one need not
+        # divide the other (DeepSeek-V3: N = 2048 for W1/W3, 7168 for W2).
+        pallas_grouped_mm_w2_tiling: tuple[int, int] | None = None
         # TGMM tiling for the W2 (down-projection) dWeight. ``None`` follows
         # ``pallas_grouped_mm_tgmm_tiling``. Set it when W1/W3 want a K tile
         # that W2's shorter K axis cannot hold.
@@ -165,6 +170,7 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
         self.pallas_grouped_mm_tgmm_tiling = config.pallas_grouped_mm_tgmm_tiling
+        self.pallas_grouped_mm_w2_tiling = config.pallas_grouped_mm_w2_tiling
         self.pallas_grouped_mm_w2_tgmm_tiling = config.pallas_grouped_mm_w2_tgmm_tiling
         self.pallas_grouped_mm_w2_transposed_tgmm_tiling = (
             config.pallas_grouped_mm_w2_transposed_tgmm_tiling
@@ -372,13 +378,14 @@ class TpuGroupedExperts(GroupedExperts):
             hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
                 hidden_RF.dtype
             )
+        w2_tile_k, w2_tile_n = self.pallas_grouped_mm_w2_tiling or (tile_k, tile_n)
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),
             num_tokens_per_expert_E,
             tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
+            tile_k=w2_tile_k,
+            tile_n=w2_tile_n,
             tgmm_tiling=w2_tgmm_tiling,
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
