@@ -711,9 +711,10 @@ def _collect_backward_collective_owners(
 
   A parameter gather is owned by the layer of its first consumer, a gradient
   reduction by the layer that produced its input (``classify_fsdp_roles``).
-  Collectives with neither role stay with their inputs. An all-gather or
-  reduce-scatter of a ``pipelined_kinds`` kind that has neither role raises,
-  since pipelining it as FSDP traffic would be wrong.
+  Collectives with neither role stay with their inputs and are never
+  pipelined: activation collectives such as expert-parallel token exchanges
+  (Ring-of-Experts' all-gather / reduce-scatter and their transposes) depend on
+  the layer's compute.
   """
   owners: dict[torch.fx.Node, tuple[str, int]] = {}
   for launch, role in classify_fsdp_roles(collective_chains).items():
@@ -721,9 +722,10 @@ def _collect_backward_collective_owners(
       if (is_gather(launch) and "ag" in pipelined_kinds) or (
           is_reduce_scatter(launch) and "rs" in pipelined_kinds
       ):
-        raise ValueError(
-            f"Backward collective {launch.name!r} is neither a parameter "
-            "gather nor a gradient reduction, so fsdp_pipeline cannot move it"
+        logger.debug(
+            "Backward collective %s is neither a parameter gather nor a "
+            "gradient reduction; fsdp_pipeline leaves it in place",
+            launch.name,
         )
       continue
     inputs, users = chain_boundary(collective_chains[launch])
@@ -743,9 +745,19 @@ def _validate_backward_partitions(
   for producer, chain in collective_chains.items():
     partitions = {partition_map[node] for node in chain}
     if len(partitions) != 1:
+      details = "; ".join(
+          f"{node.name}@{partition_map[node]} <- ["
+          + ", ".join(
+              f"{i.name}@{partition_map.get(i)}" for i in node.all_input_nodes
+          )
+          + "] -> ["
+          + ", ".join(f"{u.name}@{partition_map.get(u)}" for u in node.users)
+          + "]"
+          for node in chain
+      )
       raise ValueError(
           f"Collective {producer.name!r} spans backward partitions "
-          f"{sorted(partitions)}"
+          f"{sorted(partitions)}: {details}"
       )
   for node, partition in partition_map.items():
     for input_node in node.all_input_nodes:
@@ -883,16 +895,27 @@ def split_backward_graph_by_layer(
       ]
       if user_partitions:
         partition_map[node] = min(user_partitions)
+  # Collective-chain nodes with no partitioned input (e.g. an arange feeding a
+  # gathered index buffer) carry no layer; place them with their consumers
+  # below so the chain stays in one partition.
+  sourceless_chain_nodes: dict[torch.fx.Node, None] = {}
   for node in body_nodes:
     if node not in partition_map and node not in ao_nodes:
-      partition_map[node] = max(
-          (
-              partition_map[input_node]
-              for input_node in node.all_input_nodes
-              if input_node in partition_map
-          ),
-          default=0,
-      )
+      input_partitions = [
+          partition_map[input_node]
+          for input_node in node.all_input_nodes
+          if input_node in partition_map
+          and input_node not in sourceless_chain_nodes
+      ]
+      if not input_partitions and node in collective_nodes:
+        sourceless_chain_nodes[node] = None
+      partition_map[node] = max(input_partitions, default=0)
+  for node in reversed(sourceless_chain_nodes):
+    user_partitions = [
+        partition_map[user] for user in node.users if user in partition_map
+    ]
+    if user_partitions:
+      partition_map[node] = min(user_partitions)
 
   place_ao_transfer_pairs(
       gm,

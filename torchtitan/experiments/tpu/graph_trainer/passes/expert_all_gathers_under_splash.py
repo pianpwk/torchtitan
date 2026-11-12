@@ -24,9 +24,8 @@ output has no Splash to anchor on and is left alone.
 
 The pass applies to any model whose MoE weights live under a ``moe`` module
 (TorchTitan's decoder convention) and whose attention runs Splash: it matches
-TorchTPU's dim-d all-gather and the functional all-gather. Layers without both
-are left alone; a graph with none raises, since enabling it there is a
-configuration error.
+TorchTPU's dim-d all-gather and the functional all-gather of parameters (EP
+token exchanges are left in place). Layers without both are left alone.
 """
 
 from __future__ import annotations
@@ -55,17 +54,62 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
 from torchtitan.tools.logging import logger
 
 
+# Ops a parameter passes through between its placeholder and the all-gather
+# (dtype cast, views, layout copies).
+_PARAMETER_PREP_OPS = frozenset({
+    "aten::_to_copy", "aten::view", "aten::reshape", "aten::alias",
+    "aten::permute", "aten::transpose", "aten::t", "aten::clone",
+    "aten::contiguous", "aten::flatten", "aten::unsqueeze", "aten::squeeze",
+    "aten::slice", "aten::cat", "aten::split", "aten::split_with_sizes",
+})
+
+
+def _gathers_parameters(launch: torch.fx.Node) -> bool:
+    """Whether an all-gather's operand is graph inputs through prep ops only.
+
+    FSDP weight gathers read a parameter (a placeholder) through casts and
+    views. EP token exchanges, such as Ring-of-Experts' all-gather of tokens
+    and routing ids, read activations, so they are not moved.
+    """
+    val = launch.meta.get("val")
+    if isinstance(val, torch.Tensor) and not val.is_floating_point():
+        return False
+    pending = list(launch.all_input_nodes)
+    seen: set[torch.fx.Node] = set()
+    while pending:
+        node = pending.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if node.op in ("placeholder", "get_attr"):
+            continue
+        if node.op != "call_function":
+            return False
+        if node.target is operator.getitem:
+            pending.extend(node.all_input_nodes)
+            continue
+        name = node.target.name() if isinstance(node.target, torch._ops.OpOverload) else ""
+        if name.split(".")[0] not in _PARAMETER_PREP_OPS:
+            return False
+        pending.extend(node.all_input_nodes)
+    return True
+
+
 def _is_gathered_expert_weight(node: torch.fx.Node) -> bool:
     """A gathered expert weight: TorchTPU's dim-d all-gather, or a funcol wait."""
     if node.op != "call_function" or ".moe." not in _get_module_fqn(node) + ".":
         return False
     if is_wait_tensor(node):
-        return isinstance(node.args[0], torch.fx.Node) and is_all_gather_into_tensor(
-            node.args[0]
+        launch = node.args[0]
+        return (
+            isinstance(launch, torch.fx.Node)
+            and is_all_gather_into_tensor(launch)
+            and _gathers_parameters(launch)
         )
     return (
         isinstance(node.target, torch._ops.OpOverload)
         and node.target.name() == "tpu::_all_gather_dim"
+        and _gathers_parameters(node)
     )
 
 
@@ -141,10 +185,13 @@ def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.
         barriers += 1
 
     if not barriers:
-        raise ValueError(
+        # E.g. expert parallelism over the whole FSDP axis leaves the expert
+        # banks unsharded, so there is no expert all-gather to move.
+        logger.warning(
             "expert_all_gathers_under_splash found no layer with both gathered "
-            "MoE weights and a Splash attention output"
+            "MoE weights and a Splash attention output; the pass is a no-op"
         )
+        return gm
     gm.graph.lint()
     gm.recompile()
     logger.info(

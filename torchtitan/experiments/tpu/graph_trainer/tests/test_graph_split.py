@@ -807,9 +807,10 @@ class GraphSplitTest(absltest.TestCase):
         # Only the barrier reads the gathered weight in its copy of the layer.
         self.assertEqual(list(weight.users), [barrier])
     self.assertIsNotNone(split.backward_graph)
-    # A model without MoE layers or Splash has nothing to join.
-    with self.assertRaisesRegex(ValueError, "no layer with both"):
-      self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
+    # A model without MoE layers or Splash has nothing to join: a no-op.
+    barriers.clear()
+    self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
+    self.assertEmpty(barriers)
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.
@@ -942,19 +943,17 @@ class GraphSplitTest(absltest.TestCase):
     )
 
     # A reduce-scatter that is not a gradient reduction (like a TP activation
-    # reduce-scatter): truncating a reduction's chain to its launch makes its
-    # consumer ordinary compute. It stays with its inputs unless RS are
-    # pipelined, which cannot move it.
+    # reduce-scatter or an EP token exchange): truncating a reduction's chain
+    # to its launch makes its consumer ordinary compute. It stays with its
+    # inputs, whichever kinds are pipelined.
     chains = collectives_lib.collect_collective_chains(backward)
     launch = next(n for n in chains if collectives_lib.is_reduce_scatter(n))
     chains[launch] = {launch}
-    for pipelined_kinds in ((), ("ag",)):
+    for pipelined_kinds in ((), ("ag",), ("rs",), ("ag", "rs")):
       owners = graph_split_lib._collect_backward_collective_owners(
           chains, 4, pipelined_kinds
       )
       self.assertNotIn(launch, owners)
-    with self.assertRaisesRegex(ValueError, "neither a parameter gather"):
-      graph_split_lib._collect_backward_collective_owners(chains, 4, ("rs",))
     with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
       split_backward_graph_by_layer(
           backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=()
@@ -1111,6 +1110,87 @@ class GraphSplitTest(absltest.TestCase):
       self.assertEqual(chunked.partition_map[view], chunked.partition_map[wait])
       self.assertEqual(chunked.partition_map[cast], chunked.partition_map[wait])
 
+  def test_activation_gather_with_constant_index_input_stays_atomic(self):
+    """An activation gather whose payload mixes a constant index buffer.
+
+    Like forced balanced MoE routing: ``arange -> remainder`` feeds
+    ``where(compute >= 0, ...)`` and the EP gather. The arange branch has no
+    partitioned input and must follow its consumers, not partition 0.
+    """
+    gm = self._trace_simple_fsdp(n_layers=2).backward_graph
+    graph = gm.graph
+    launch = next(
+        n for n in graph.nodes if collectives_lib.is_all_gather_into_tensor(n)
+    )
+    group_size, group_name = launch.args[1], launch.args[2]
+    compute = next(
+        n
+        for n in graph.nodes
+        if n.op == "call_function"
+        and _get_layer_id(n) == 0
+        and isinstance(n.meta.get("val"), torch.Tensor)
+        and n.meta["val"].is_floating_point()
+        and not collectives_lib.is_collective(n)
+        and n.users
+    )
+    numel = compute.meta["val"].numel()
+    ops = torch.ops.aten
+    c10d_ops = torch.ops._c10d_functional
+
+    def add(target, args, val):
+      node = graph.call_function(target, args)
+      node.meta["val"] = val
+      node.meta["custom"] = dict(compute.meta.get("custom", {}))
+      return node
+
+    int_val = torch.empty(numel, dtype=torch.int32)
+    with graph.inserting_after(compute):
+      flat = add(ops.view.default, (compute, [numel]),
+                 torch.empty(numel, dtype=compute.meta["val"].dtype))
+    with graph.inserting_after(flat):
+      positive = add(ops.ge.Scalar, (flat, 0),
+                     torch.empty(numel, dtype=torch.bool))
+    with graph.inserting_after(positive):
+      arange = add(ops.arange.default, (numel,), int_val)
+      arange.kwargs = {"dtype": torch.int32}
+    with graph.inserting_after(arange):
+      rem = add(ops.remainder.Scalar, (arange, 4), int_val)
+    with graph.inserting_after(rem):
+      ids = add(ops.where.self, (positive, rem, rem), int_val)
+    with graph.inserting_after(ids):
+      gathered = add(c10d_ops.all_gather_into_tensor.default,
+                     (ids, group_size, group_name),
+                     torch.empty(numel * group_size, dtype=torch.int32))
+    with graph.inserting_after(gathered):
+      wait = add(c10d_ops.wait_tensor.default, (gathered,), gathered.meta["val"])
+    with graph.inserting_after(wait):
+      head = add(ops.slice.Tensor, (wait, 0, 0, numel), int_val)
+    with graph.inserting_after(head):
+      as_float = add(ops._to_copy.default, (head,),
+                     torch.empty(numel, dtype=compute.meta["val"].dtype))
+      as_float.kwargs = {"dtype": compute.meta["val"].dtype}
+    with graph.inserting_after(as_float):
+      mixed = add(ops.add.Tensor, (flat, as_float), flat.meta["val"])
+    with graph.inserting_after(mixed):
+      back = add(ops.view.default, (mixed, list(compute.meta["val"].shape)),
+                 compute.meta["val"])
+    for user in list(compute.users):
+      if user is not flat:
+        user.replace_input_with(compute, back)
+    graph.lint()
+    gm.recompile()
+
+    chains = collectives_lib.collect_collective_chains(gm)
+    self.assertIn(arange, chains[gathered])
+    self.assertIsNone(collectives_lib.classify_fsdp_roles(chains)[gathered])
+    for kwargs in ({}, {"pipeline_collectives": True,
+                        "pipeline_kinds": ("rs",)}):
+      chunked = split_backward_graph_by_layer(gm, n_layers=2, **kwargs)
+      self._assert_collective_chains_are_atomic(gm, chunked.partition_map)
+      self.assertEqual(
+          chunked.partition_map[arange], chunked.partition_map[mixed]
+      )
+
   def test_reduce_scatter_chain_stops_at_compute(self):
     """Compute after an RS wait stays out of its chain and fails closed."""
     gm = self._trace_simple_fsdp(
@@ -1141,8 +1221,7 @@ class GraphSplitTest(absltest.TestCase):
     self.assertNotIn(cast, chain)
     with self.assertRaisesRegex(
         ValueError,
-        "reverse dependency|neither a parameter gather nor a gradient"
-        " reduction",
+        "reverse dependency|requires AG and RS ownership for every layer",
     ):
       split_backward_graph_by_layer(gm, n_layers=2, pipeline_collectives=True)
 
