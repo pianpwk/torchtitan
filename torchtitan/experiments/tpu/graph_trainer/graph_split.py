@@ -25,6 +25,7 @@ indivisible.
 """
 
 from collections import Counter, defaultdict
+import operator
 from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Any
@@ -37,6 +38,7 @@ from torch.fx.passes.split_module import split_module
 from torchtitan.experiments.graph_trainer.cpu_offload import _is_view
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
+    _get_module_fqn,
     _is_backward_node,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.partition import (
@@ -57,7 +59,11 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
     op_name,
 )
 from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gathers_under_splash import (
+    _is_splash_output,
     apply_expert_all_gathers_under_splash,
+)
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    _optimization_barrier,
 )
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
   HostDonorSpec,
@@ -277,6 +283,13 @@ class GraphSplitter:
       raise ValueError(
           "forward_layers_per_executable must be -1 or positive"
       )
+    if split_config.forward_prefetch_parameter_gathers and (
+        not enabled or split_config.forward_layers_per_executable < 1
+    ):
+      raise ValueError(
+          "forward_prefetch_parameter_gathers requires a split forward graph "
+          "(compile.graph_split.enabled and forward_layers_per_executable > 0)"
+      )
     if split_config.backward_partition_mode not in (
         "none",
         "by_layer",
@@ -335,7 +348,15 @@ class GraphSplitter:
       raise RuntimeError("GraphSplitter is disabled")
 
     if self.config.expert_all_gathers_under_splash:
-      apply_expert_all_gathers_under_splash(traced.gm)
+      apply_expert_all_gathers_under_splash(
+          traced.gm,
+          recomputed_only=(
+              self.config.expert_all_gathers_under_splash_recomputed_only
+          ),
+          max_gathers_per_layer=(
+              self.config.expert_all_gathers_under_splash_max_gathers
+          ),
+      )
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
     # Host-slot recurrence belongs to the top-level forward signature, whether
@@ -355,6 +376,13 @@ class GraphSplitter:
           split.forward_graph,
           self.config.forward_layers_per_executable,
           isolate_prefix=self.config.forward_isolate_prefix,
+          prefetch_parameter_gathers=(
+              self.config.forward_prefetch_parameter_gathers
+          ),
+          prefetch_min_gather_bytes=self.config.prefetch_min_gather_bytes,
+          prefetch_gathers_under_splash=(
+              self.config.forward_prefetch_gathers_under_splash
+          ),
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
@@ -378,6 +406,10 @@ class GraphSplitter:
           layers_per_executable=self.config.backward_layers_per_executable,
           pipeline_collectives=mode == "fsdp_pipeline",
           pipeline_kinds=self.config.pipeline_kinds or ("ag", "rs"),
+          pipeline_min_gather_bytes=self.config.prefetch_min_gather_bytes,
+          defer_reduction_max_bytes=(
+              self.config.backward_defer_reduction_max_bytes
+          ),
           cpu_offload_prefetch_executables=(
               self.config.cpu_offload_prefetch_executables
           ),
@@ -558,13 +590,43 @@ def _preserves_numel(view: torch.fx.Node) -> bool:
   )
 
 
+def _gathered_bytes(launch: torch.fx.Node) -> int:
+  """Bytes of a collective's output."""
+  val = launch.meta["val"]
+  values = val if isinstance(val, (tuple, list)) else (val,)
+  return sum(v.numel() * v.element_size() for v in values)
+
+
+def _reduced_bytes(launch: torch.fx.Node) -> int:
+  """Bytes of a reduction's (unreduced) inputs.
+
+  A reduce-scatter's output is a 1/N shard, so a large gradient can have a
+  small output; deferring it would keep the whole unreduced input alive.
+  """
+  return sum(
+      _gathered_bytes(node)
+      for node in launch.all_input_nodes
+      if isinstance(node.meta.get("val"), (torch.Tensor, tuple, list))
+  )
+
+
 def split_forward_graph_by_layer(
     gm: torch.fx.GraphModule,
     layers_per_executable: int,
     *,
     isolate_prefix: bool = False,
+    prefetch_parameter_gathers: bool = False,
+    prefetch_min_gather_bytes: int = 0,
+    prefetch_gathers_under_splash: int = 0,
 ) -> PartitionedGraph:
-  """Split forward into ascending, complete transformer-layer ranges."""
+  """Split forward into ascending, complete transformer-layer ranges.
+
+  With ``prefetch_parameter_gathers``, each parameter all-gather chain (fed
+  only by graph inputs, see ``classify_fsdp_roles``) moves to the executable
+  before the one holding its first consumer, so XLA can overlap it with that
+  executable's compute. Chains whose consumer is in the first executable stay
+  put.
+  """
   if layers_per_executable < 1:
     raise ValueError(
         "layers_per_executable must be at least 1, got "
@@ -574,8 +636,21 @@ def split_forward_graph_by_layer(
   body_nodes = _body_nodes(gm)
   ao_nodes = {node for node in body_nodes if is_ao_transfer(node)}
   view_nodes = {node for node in body_nodes if _is_view(node)}
+  # Parameter gather chains, keyed by launch; placed after the walk below.
+  gather_chains: dict[torch.fx.Node, set[torch.fx.Node]] = {}
+  if prefetch_parameter_gathers:
+    chains = collect_collective_chains(gm)
+    gather_chains = {
+        launch: chains[launch]
+        for launch, role in classify_fsdp_roles(chains).items()
+        if role == "ag"
+        and _gathered_bytes(launch) >= prefetch_min_gather_bytes
+    }
+  gather_chain_nodes: set[torch.fx.Node] = set().union(
+      *gather_chains.values()
+  )
   node_layer_ids, layer_nodes = _group_nodes_by_layer(
-      body_nodes, excluded=ao_nodes | view_nodes
+      body_nodes, excluded=ao_nodes | view_nodes | gather_chain_nodes
   )
   layer_ids = sorted(layer_nodes)
   if not layer_ids:
@@ -609,7 +684,7 @@ def split_forward_graph_by_layer(
   pending_collectives: dict[torch.fx.Node, int] = {}
   spmd_safe_depth = 0
   for node in body_nodes:
-    if node in ao_nodes:
+    if node in ao_nodes or node in gather_chain_nodes:
       continue
     layer_id = node_layer_ids[node]
     starts_layer = layer_id >= 0 and layer_id != current_layer_id
@@ -656,6 +731,31 @@ def split_forward_graph_by_layer(
   if spmd_safe_depth:
     raise ValueError("Unbalanced TPU SPMD safe-region entry")
 
+  # Each parameter gather runs one executable ahead of its first consumer. Its
+  # chain reads only graph inputs, so moving it earlier keeps every dependency
+  # forward.
+  num_prefetched = 0
+  for launch, chain_nodes in gather_chains.items():
+    _, users = chain_boundary(chain_nodes)
+    consumer = min(
+        (partition_map[user] for user in users if user in partition_map),
+        default=0,
+    )
+    partition = max(consumer - 1, 0)
+    num_prefetched += partition < consumer
+    partition_map.update(dict.fromkeys(chain_nodes, partition))
+  if gather_chains:
+    logger.info(
+        "Prefetching %d of %d forward parameter all-gathers one executable "
+        "ahead",
+        num_prefetched,
+        len(gather_chains),
+    )
+  if prefetch_gathers_under_splash > 0 and gather_chains:
+    _join_prefetched_gathers_with_splash(
+        gm, gather_chains, partition_map, prefetch_gathers_under_splash
+    )
+
   # A view left with its producer layer becomes a second executable output
   # beside its base, which XLA must materialize as a copy. Place each
   # size-preserving view with its earliest consumer so only the base crosses
@@ -700,6 +800,92 @@ def split_forward_graph_by_layer(
       chunked.layer_to_partition,
   )
   return chunked
+
+
+def _join_prefetched_gathers_with_splash(
+    gm: torch.fx.GraphModule,
+    gather_chains: dict[torch.fx.Node, set[torch.fx.Node]],
+    partition_map: dict[torch.fx.Node, int],
+    per_partition: int,
+) -> None:
+  """Finish each forward executable's prefetched small gathers and its first
+  ``per_partition`` prefetched expert-bank gathers (>= 256 MiB) under its
+  Splash attention.
+
+  A prefetched gather is issued after the executable's own routed-token
+  gathers otherwise, and the SparseCore runs collectives in issue order, so
+  it idles through attention and then the next layer's weights arrive late.
+  Joining a gathered weight with the Splash output in an optimization barrier
+  makes the scheduler issue it before attention; the ones read first (the
+  next layer's attention and first expert weights) are picked.
+  """
+  order = {node: index for index, node in enumerate(gm.graph.nodes)}
+  splash: dict[int, torch.fx.Node] = {}
+  for node in gm.graph.nodes:
+    if node in partition_map and _is_splash_output(node):
+      splash.setdefault(partition_map[node], node)
+  candidates: dict[int, list] = defaultdict(list)
+  for launch, chain in gather_chains.items():
+    partition = partition_map[launch]
+    inputs, users = chain_boundary(chain)
+    consumers = [partition_map[user] for user in users if user in partition_map]
+    if not consumers or min(consumers) <= partition:
+      continue
+    anchor = splash.get(partition)
+    if anchor is None or any(order[node] > order[anchor] for node in inputs):
+      continue
+    outputs = sorted(
+        (node for node in chain if any(user not in chain for user in node.users)),
+        key=order.__getitem__,
+    )
+    first_use = min(order[user] for user in users)
+    # Expert banks (hundreds of MB gathered); the router gate and shared
+    # experts are small enough to count as dense here.
+    is_moe = _gathered_bytes(launch) >= (256 << 20)
+    candidates[partition].append((first_use, chain, outputs, is_moe))
+
+  joined = 0
+  for partition, items in candidates.items():
+    anchor = splash[partition]
+    items.sort(key=lambda item: item[0])
+    # Every dense (attention) gather -- small and read first -- and the first
+    # ``per_partition`` expert-weight gathers.
+    chosen = [item for item in items if not item[3]]
+    chosen += [item for item in items if item[3]][:per_partition]
+    # Hoist the chosen chains (fed only by nodes before the anchor) to right
+    # after it, keeping their order.
+    hoisted = sorted(
+        (
+            node
+            for _, chain, _, _ in chosen
+            for node in chain
+            if order[node] > order[anchor]
+        ),
+        key=order.__getitem__,
+    )
+    for node in reversed(hoisted):
+      anchor.append(node)
+    last = hoisted[-1] if hoisted else anchor
+    values = [anchor, *(out for _, _, outputs, _ in chosen for out in outputs)]
+    anchor_users = list(anchor.users)
+    with gm.graph.inserting_after(last):
+      barrier = gm.graph.call_function(_optimization_barrier, args=tuple(values))
+    barrier.meta = {**anchor.meta, "val": tuple(v.meta["val"] for v in values)}
+    with gm.graph.inserting_after(barrier):
+      anchor_out = gm.graph.call_function(operator.getitem, args=(barrier, 0))
+    anchor_out.meta = {**anchor.meta}
+    partition_map[barrier] = partition
+    partition_map[anchor_out] = partition
+    for user in anchor_users:
+      if user is not barrier:
+        user.replace_input_with(anchor, anchor_out)
+    joined += len(chosen)
+  gm.graph.lint()
+  logger.info(
+      "Joined %d prefetched forward gathers with their executable's Splash "
+      "output",
+      joined,
+  )
 
 
 def _collect_backward_collective_owners(
@@ -777,6 +963,8 @@ def split_backward_graph_by_layer(
     layers_per_executable: int = 1,
     pipeline_collectives: bool = False,
     pipeline_kinds: tuple[str, ...] = ("ag", "rs"),
+    pipeline_min_gather_bytes: int = 0,
+    defer_reduction_max_bytes: int = 0,
     cpu_offload_prefetch_executables: int = 0,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
@@ -786,6 +974,10 @@ def split_backward_graph_by_layer(
   stay with their inputs. Pipelining moves the collectives of
   ``pipeline_kinds`` and requires their ownership for every layer so it can
   safely form fill, overlap, and drain stages; the rest stay with their layer.
+  Gradient reductions whose unreduced input is smaller than
+  ``defer_reduction_max_bytes`` move to the last backward executable, so tiny
+  per-layer reductions (lowered as synchronous all-reduces) don't make every
+  layer wait for the slowest rank.
   CPU-offload reload pairs may be placed a configured number of complete child
   executables before their first consumer; zero keeps the pair in the consumer
   child.
@@ -871,8 +1063,14 @@ def split_backward_graph_by_layer(
       "ag": {},
       "rs": {},
   }
+  last_partition = max(collective_partition("rs", l) for l in layer_ids)
   for launch, (kind, layer_id) in owners.items():
-    partition = collective_partition(kind, layer_id)
+    if kind == "ag" and _gathered_bytes(launch) < pipeline_min_gather_bytes:
+      partition = raw_layer_to_partition[layer_id]
+    elif kind == "rs" and _reduced_bytes(launch) < defer_reduction_max_bytes:
+      partition = last_partition
+    else:
+      partition = collective_partition(kind, layer_id)
     _assign_partition(
         partition_map,
         collective_chains[launch],

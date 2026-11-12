@@ -1,3 +1,4 @@
+from collections import defaultdict
 import itertools
 from types import SimpleNamespace
 from unittest import mock
@@ -812,6 +813,41 @@ class GraphSplitTest(absltest.TestCase):
     self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
     self.assertEmpty(barriers)
 
+  def test_forward_prefetched_gathers_join_splash(self):
+    """Prefetched gathers finish under their executable's Splash output."""
+    split = self._trace_simple_fsdp(n_layers=3, model_cls=_AttentionMoEToy)
+    graph = split.forward_graph
+    chunked = split_forward_graph_by_layer(
+        graph,
+        1,
+        isolate_prefix=True,
+        prefetch_parameter_gathers=True,
+        prefetch_gathers_under_splash=1,
+    )
+    barriers = [
+        node for node in graph.graph.nodes if node.target is _optimization_barrier
+    ]
+    # Layers 0 and 1 prefetch layer 1 and 2's gathers; layer 2 has none.
+    self.assertLen(barriers, 2)
+    for barrier in barriers:
+      anchor, *values = barrier.args
+      self.assertTrue(under_splash_lib._is_splash_output(anchor))
+      self.assertNotEmpty(values)
+      partition = chunked.partition_map[barrier]
+      self.assertEqual(chunked.partition_map[anchor], partition)
+      for value in values:
+        self.assertEqual(chunked.partition_map[value], partition)
+        # The gathered weight is read in the next executable.
+        self.assertGreater(
+            min(
+                chunked.partition_map[user]
+                for user in value.users
+                if user is not barrier
+            ),
+            partition,
+        )
+    self._assert_collective_chains_are_atomic(graph, chunked.partition_map)
+
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.
 
@@ -849,6 +885,50 @@ class GraphSplitTest(absltest.TestCase):
             isolate_prefix=isolate_prefix,
         )
         self.assertEqual(chunked.layer_to_partition, expected)
+
+    # Prefetch: [prefix,AG0] [L0,AG1] [L1,AG2] [L2,AG3] [L3]. Each layer's
+    # parameter gathers run one executable before the layer.
+    for graph in (forward, dim_split.forward_graph):
+      with self.subTest(direction="forward", prefetch=True):
+        chunked = split_forward_graph_by_layer(
+            graph, 1, isolate_prefix=True, prefetch_parameter_gathers=True
+        )
+        self.assertEqual(
+            chunked.layer_to_partition, {0: 1, 1: 2, 2: 3, 3: 4}
+        )
+        self._assert_collective_chains_are_atomic(
+            graph, chunked.partition_map
+        )
+        chains = collectives_lib.collect_collective_chains(graph)
+        gathered_layers = defaultdict(set)
+        for launch, nodes in chains.items():
+          if not collectives_lib.is_gather(launch):
+            continue
+          _, users = collectives_lib.chain_boundary(nodes)
+          layer = min(
+              chunked.layer_to_partition[i]
+              for i in map(_get_layer_id, users)
+              if i >= 0
+          )
+          gathered_layers[layer].add(chunked.partition_map[launch])
+        self.assertEqual(
+            dict(gathered_layers), {1: {0}, 2: {1}, 3: {2}, 4: {3}}
+        )
+        # Gathers below the size threshold stay with their layer.
+        in_place = split_forward_graph_by_layer(
+            graph,
+            1,
+            isolate_prefix=True,
+            prefetch_parameter_gathers=True,
+            prefetch_min_gather_bytes=1 << 40,
+        )
+        unprefetched = split_forward_graph_by_layer(
+            graph, 1, isolate_prefix=True
+        )
+        self.assertEqual(
+            {n.name: p for n, p in in_place.partition_map.items()},
+            {n.name: p for n, p in unprefetched.partition_map.items()},
+        )
 
     by_layer_one = (1, 2, 3, 4)
     by_layer_three = (1, 1, 1, 2)
@@ -929,6 +1009,30 @@ class GraphSplitTest(absltest.TestCase):
             self.assertEqual(
                 chunked.partition_map[cast], chunked.partition_map[node]
             )
+
+    # Deferred small reductions all land in the last executable, in by-layer
+    # and pipelined modes; everything else keeps its place.
+    for pipeline in (False, True):
+      with self.subTest("defer-small-reductions", pipeline=pipeline):
+        baseline = split_backward_graph_by_layer(
+            backward, n_layers=4, pipeline_collectives=pipeline
+        )
+        deferred = split_backward_graph_by_layer(
+            backward,
+            n_layers=4,
+            pipeline_collectives=pipeline,
+            defer_reduction_max_bytes=1 << 40,
+        )
+        last = max(deferred.partition_map.values())
+        self.assertEqual(
+            set(deferred.collective_layer_to_partition["rs"].values()), {last}
+        )
+        self.assertEqual(
+            deferred.layer_to_partition, baseline.layer_to_partition
+        )
+        self._assert_collective_chains_are_atomic(
+            backward, deferred.partition_map
+        )
 
     # Pipelining only RS keeps each AG with its layer's compute.
     rs_only = split_backward_graph_by_layer(

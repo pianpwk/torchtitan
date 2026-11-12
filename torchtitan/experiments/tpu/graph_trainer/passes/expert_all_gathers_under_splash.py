@@ -64,6 +64,16 @@ _PARAMETER_PREP_OPS = frozenset({
 })
 
 
+# Gathered weights at least this large are expert banks (hundreds of MB at
+# DeepSeek-V3 scale); smaller MoE gathers are the router gate and shared experts.
+_MIN_BANK_BYTES = 256 << 20
+
+
+def _nbytes(node: torch.fx.Node) -> int:
+    val = node.meta.get("val")
+    return val.numel() * val.element_size() if isinstance(val, torch.Tensor) else 0
+
+
 def _gathers_parameters(launch: torch.fx.Node) -> bool:
     """Whether an all-gather's operand is graph inputs through prep ops only.
 
@@ -132,7 +142,21 @@ def _layer_copy(node: torch.fx.Node) -> tuple[int, bool, bool]:
     )
 
 
-def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def apply_expert_all_gathers_under_splash(
+    gm: torch.fx.GraphModule,
+    *,
+    recomputed_only: bool = False,
+    max_gathers_per_layer: int = 0,
+) -> torch.fx.GraphModule:
+    """Join gathered expert weights with their layer copy's Splash output.
+
+    ``recomputed_only`` limits the barriers to the backward copies that
+    recompute Splash (the forward's gathers may already be prefetched by the
+    graph split). ``max_gathers_per_layer > 0`` joins only that many gathers per
+    layer copy, the ones whose first reader comes earliest: the rest stay free
+    to queue behind the routed-token gathers, so the barrier only holds the
+    TensorCore for gathers that fit under attention.
+    """
     gathered: dict[tuple, list[torch.fx.Node]] = defaultdict(list)
     splash: dict[tuple, torch.fx.Node] = {}
     for node in gm.graph.nodes:
@@ -147,8 +171,17 @@ def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.
     barriers = 0
     for layer_copy, weights in gathered.items():
         anchor = splash.get(layer_copy)
-        if anchor is None:
+        if anchor is None or (recomputed_only and not layer_copy[1]):
             continue
+        if max_gathers_per_layer > 0:
+            # The expert banks (not the router gate or shared experts), in
+            # the order they are read.
+            banks = [w for w in weights if _nbytes(w) >= _MIN_BANK_BYTES]
+            small = [w for w in weights if _nbytes(w) < _MIN_BANK_BYTES]
+            weights = small + sorted(
+                banks,
+                key=lambda w: min((order[u] for u in w.users), default=len(order)),
+            )[:max_gathers_per_layer]
         values = [anchor, *weights]
         users = {value: list(value.users) for value in values}
         with gm.graph.inserting_after(anchor):

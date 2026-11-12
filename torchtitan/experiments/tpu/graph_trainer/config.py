@@ -87,6 +87,28 @@ class GraphSplitterConfig:
   forward_layers_per_executable: int = -1
   # Assign non-layer work before the first transformer layer to its own partition.
   forward_isolate_prefix: bool = False
+  # Issue each forward executable's parameter all-gathers (FSDP weight gathers
+  # fed only by graph inputs) in the previous executable, so they overlap that
+  # executable's compute instead of being waited on at the top of their own.
+  # Costs one executable's gathered parameters of extra HBM. Requires
+  # ``forward_layers_per_executable > 0``.
+  forward_prefetch_parameter_gathers: bool = False
+  # Parameter all-gathers with a smaller gathered output stay with their layer
+  # under ``forward_prefetch_parameter_gathers`` and the backward "ag"
+  # pipeline. Moved ahead, tiny gathers (norm weights) queue behind the large
+  # prefetched ones and, lowered as synchronous all-reduces, stall the
+  # TensorCore until the queue drains; in place they cost almost nothing.
+  prefetch_min_gather_bytes: int = 0
+  # ``forward_prefetch_parameter_gathers`` only: per forward executable, join
+  # this many prefetched gathers (those read first) with the executable's
+  # Splash output, so they run on the SparseCore during attention instead of
+  # queueing behind the routed-token gathers. 0 leaves them to the scheduler.
+  forward_prefetch_gathers_under_splash: int = 0
+  # Backward gradient reductions with a smaller unreduced input (norm weights)
+  # run in the last backward executable instead of with their layer. In
+  # place, each is a synchronous all-reduce over every rank, so each layer
+  # waits there for the slowest rank.
+  backward_defer_reduction_max_bytes: int = 0
   # Backward subdivision applied after the top-level forward/backward split.
   # ``by_layer`` groups adjacent layer backward computations and co-locates any
   # attributable FSDP collective chains with their layer. ``fsdp_pipeline``
@@ -112,6 +134,15 @@ class GraphSplitterConfig:
   # the routed-token gathers. Values are unchanged. Applies to layers that
   # have both an MoE and Splash; raises if no layer does.
   expert_all_gathers_under_splash: bool = False
+  # ``expert_all_gathers_under_splash`` only: apply it to the backward copies
+  # that recompute Splash and leave the forward alone (for use with
+  # ``forward_prefetch_parameter_gathers``).
+  expert_all_gathers_under_splash_recomputed_only: bool = False
+  # ``expert_all_gathers_under_splash`` only: join at most this many gathers
+  # per layer copy, those read first (0 joins all). Each expert gather is
+  # ~5 ms at EP 8 x expert FSDP 16, so only one fits under the ~9 ms of
+  # recomputed attention; joining all three makes the TensorCore wait for them.
+  expert_all_gathers_under_splash_max_gathers: int = 0
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``
