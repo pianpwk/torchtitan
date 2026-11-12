@@ -143,6 +143,12 @@ class GraphSplitterConfig:
   # ~5 ms at EP 8 x expert FSDP 16, so only one fits under the ~9 ms of
   # recomputed attention; joining all three makes the TensorCore wait for them.
   expert_all_gathers_under_splash_max_gathers: int = 0
+  # ``fsdp_pipeline`` with "rs" only: give this many of each backward
+  # executable's deferred expert-gradient reductions (largest first) a
+  # deadline inside it -- the dX gather-reduce, then the Splash backward --
+  # so they are issued while the SparseCores are free instead of piling up at
+  # the end of the executable. 0 leaves them to the scheduler.
+  deferred_reduction_deadlines: int = 0
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``

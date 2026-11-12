@@ -413,6 +413,9 @@ class GraphSplitter:
           cpu_offload_prefetch_executables=(
               self.config.cpu_offload_prefetch_executables
           ),
+          deferred_reduction_deadlines=(
+              self.config.deferred_reduction_deadlines
+          ),
       )
       split.backward_graph = backward.module
       split.module.backward_graph = backward.module
@@ -888,6 +891,92 @@ def _join_prefetched_gathers_with_splash(
   )
 
 
+# Backward ops that each deferred expert-gradient reduce-scatter is joined with,
+# in order: the routed experts' gather-reduce (dX, ~40% into the layer) and the
+# Splash backward (~60%).
+_DEFERRED_REDUCTION_ANCHOR_OPS = (
+    "tt_moe::ragged_gather_reduce_tc",
+    "pallas::mla_splash_attn_bwd",
+)
+
+
+def _join_deferred_reductions_with_anchors(
+    gm: torch.fx.GraphModule,
+    collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
+    partition_map: dict[torch.fx.Node, int],
+    deferred: dict[torch.fx.Node, int],
+    max_per_partition: int,
+) -> None:
+  """Give each backward executable's deferred expert-gradient reductions
+  deadlines inside it.
+
+  A reduction deferred from the previous executable reads only that
+  executable's outputs, yet the TPU scheduler issues it late and the
+  executable ends waiting for it while the SparseCores idled earlier. Joining
+  the first ``max_per_partition`` of them (largest first) with an early
+  compute value of this executable (``_DEFERRED_REDUCTION_ANCHOR_OPS``, in
+  order) in an optimization barrier makes the scheduler issue each one in time
+  to finish before that value is read. Values are unchanged.
+  """
+  order = {node: index for index, node in enumerate(gm.graph.nodes)}
+  anchors: dict[int, list[torch.fx.Node]] = defaultdict(list)
+  for op_name in _DEFERRED_REDUCTION_ANCHOR_OPS:
+    seen: set[int] = set()
+    for node in gm.graph.nodes:
+      if (
+          node.op == "call_function"
+          and isinstance(node.target, torch._ops.OpOverload)
+          and node.target.name() == op_name
+          and node in partition_map
+          and partition_map[node] not in seen
+      ):
+        seen.add(partition_map[node])
+        value = node
+        if isinstance(node.meta.get("val"), (tuple, list)):
+          value = next(
+              (u for u in node.users if u.target is operator.getitem and u.args[1] == 0),
+              None,
+          )
+        if value is not None:
+          anchors[partition_map[node]].append(value)
+  by_partition: dict[int, list[torch.fx.Node]] = defaultdict(list)
+  for launch, partition in deferred.items():
+    by_partition[partition].append(launch)
+  joined = 0
+  for partition, launches in by_partition.items():
+    launches.sort(key=lambda launch: (-_reduced_bytes(launch), order[launch]))
+    for launch, anchor in zip(launches[:max_per_partition], anchors.get(partition, [])):
+      chain = collective_chains[launch]
+      if any(order[node] > order[anchor] for node in chain):
+        continue
+      outputs = sorted(
+          (node for node in chain if any(user not in chain for user in node.users)),
+          key=order.__getitem__,
+      )
+      anchor_users = list(anchor.users)
+      with gm.graph.inserting_after(anchor):
+        barrier = gm.graph.call_function(
+            _optimization_barrier, args=(anchor, *outputs)
+        )
+      barrier.meta = {
+          **anchor.meta,
+          "val": tuple(v.meta["val"] for v in (anchor, *outputs)),
+      }
+      with gm.graph.inserting_after(barrier):
+        anchor_out = gm.graph.call_function(operator.getitem, args=(barrier, 0))
+      anchor_out.meta = {**anchor.meta}
+      partition_map[barrier] = partition
+      partition_map[anchor_out] = partition
+      for user in anchor_users:
+        user.replace_input_with(anchor, anchor_out)
+      joined += 1
+  gm.graph.lint()
+  logger.info(
+      "Joined %d deferred expert-gradient reductions with backward deadlines",
+      joined,
+  )
+
+
 def _collect_backward_collective_owners(
     collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
     n_layers: int,
@@ -966,6 +1055,7 @@ def split_backward_graph_by_layer(
     pipeline_min_gather_bytes: int = 0,
     defer_reduction_max_bytes: int = 0,
     cpu_offload_prefetch_executables: int = 0,
+    deferred_reduction_deadlines: int = 0,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
 
@@ -1064,6 +1154,7 @@ def split_backward_graph_by_layer(
       "rs": {},
   }
   last_partition = max(collective_partition("rs", l) for l in layer_ids)
+  deferred_expert_reductions: dict[torch.fx.Node, int] = {}
   for launch, (kind, layer_id) in owners.items():
     if kind == "ag" and _gathered_bytes(launch) < pipeline_min_gather_bytes:
       partition = raw_layer_to_partition[layer_id]
@@ -1071,6 +1162,12 @@ def split_backward_graph_by_layer(
       partition = last_partition
     else:
       partition = collective_partition(kind, layer_id)
+      if (
+          kind == "rs"
+          and partition != raw_layer_to_partition[layer_id]
+          and _reduced_bytes(launch) >= (256 << 20)
+      ):
+        deferred_expert_reductions[launch] = partition
     _assign_partition(
         partition_map,
         collective_chains[launch],
@@ -1120,6 +1217,14 @@ def split_backward_graph_by_layer(
       partition_map,
       backward_prefetch_executables=cpu_offload_prefetch_executables,
   )
+  if deferred_reduction_deadlines and deferred_expert_reductions:
+    _join_deferred_reductions_with_anchors(
+        gm,
+        collective_chains,
+        partition_map,
+        deferred_expert_reductions,
+        deferred_reduction_deadlines,
+    )
   _validate_backward_partitions(partition_map, collective_chains)
   chunked = _materialize_partitioned_graph(
       gm,
