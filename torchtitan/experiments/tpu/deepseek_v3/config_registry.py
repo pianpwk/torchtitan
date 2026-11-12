@@ -728,3 +728,16 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_defer() -> (
   config.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
   config.compile.graph_split.pipeline_kinds = ("rs",)
   return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._tuned_bf16_adam_rs_defer`` with two of each backward executable's
+  deferred expert-gradient reduce-scatters given deadlines (the dX
+  gather-reduce, the Splash backward), so they run while the SparseCores are
+  free instead of after the TensorCore has finished: 7.11 -> 6.61 s / step
+  (30.2% MFU), loss bit-identical."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_defer()
+  config.compile.graph_split.deferred_reduction_deadlines = 2
+  return config
