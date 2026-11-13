@@ -261,6 +261,23 @@ class Fp8ExpertWeights:
       out.append(g.to(shard.dtype))
     return tuple(out)
 
+  def reduce_joint_grad(self, grad: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """`reduce_grad` for the gradient of the concatenated weight
+    ``[E, K, sum N]``, e.g. from a kernel that computes ``[dW1 | dW3]`` at
+    once: one reduce-scatter of the whole gradient, then the (``group``-times
+    smaller) reduced shard is split per weight."""
+    if self.reduce_dtype is not None:
+      grad = grad.to(self.reduce_dtype)
+    if self.group_name is not None:
+      grad = funcol.reduce_scatter_single(
+          grad.contiguous(), reduceOp="sum", scatter_dim=0, group=self.group_name
+      )
+    widths = [shard.shape[-1] for shard in self.shards]
+    return tuple(
+        g.contiguous().to(shard.dtype)
+        for g, shard in zip(torch.split(grad, widths, dim=-1), self.shards)
+    )
+
 
 def _gather_fp8(
     shards: tuple[torch.Tensor, ...], group_name: str | None

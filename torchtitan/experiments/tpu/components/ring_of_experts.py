@@ -347,7 +347,8 @@ def ring_of_experts_dispatch(
     ep_mesh,
     capacity_factor: float | None,
     fp8_tokens: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, RingOfExpertsMetadata]:
+    gather_tokens: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor, RingOfExpertsMetadata]:
   """Gather this EP rank's expert rows from all ranks of `ep_mesh`.
 
   Args:
@@ -361,6 +362,8 @@ def ring_of_experts_dispatch(
       static scale (``TpuGroupedExperts.Config.use_fp8_grouped_mm``). The
       returned rows are those values dequantized, which those GEMMs quantize
       back exactly; other consumers see the FP8 rounding.
+    gather_tokens: gather the routed rows. Without, only the routing is
+      computed (``routed_RD`` is None), for `ring_of_experts_fp8_experts`.
 
   Returns:
     `(routed_RD, group_sizes_e, metadata)`: expert-major rows for the local
@@ -421,10 +424,12 @@ def ring_of_experts_dispatch(
         row_bytes=x_TD.shape[-1] * x_TD.element_size(),
     )
 
-  routed_RD = _GatherTokens.apply(
-      x_TD, token_ids_R, valid_count_1, reduce_metadata, top_k, ep_mesh,
-      fp8_tokens,
-  )
+  routed_RD = None
+  if gather_tokens:
+    routed_RD = _GatherTokens.apply(
+        x_TD, token_ids_R, valid_count_1, reduce_metadata, top_k, ep_mesh,
+        fp8_tokens,
+    )
   scores_R = _SelectScores.apply(scores_N, slots_R, perm_N, valid_count_1)
   metadata = RingOfExpertsMetadata(
       token_ids_R=token_ids_R,
@@ -473,10 +478,159 @@ def ring_of_experts_combine(
   )
 
 
+def _fp8_rowwise_all_gather(x_TD: torch.Tensor, ep_mesh) -> torch.Tensor:
+  """All-gather ``x_TD`` over ``ep_mesh`` as e4m3 with one absmax scale per
+  row (half the bytes of BF16), dequantized to BF16 ``[N, D // 128, 128]``."""
+  fmax = torch.finfo(torch.float8_e4m3fn).max
+  x_f32 = x_TD.float()
+  scale_T = torch.clamp(
+      x_f32.abs().amax(dim=-1) / fmax, min=torch.finfo(torch.float32).tiny
+  )
+  x_q_T3 = to_token_3d(
+      (x_f32 / scale_T.unsqueeze(-1)).clamp(-fmax, fmax).to(torch.float8_e4m3fn)
+  )
+  x_q_N3 = funcol.all_gather_tensor(x_q_T3, gather_dim=0, group=ep_mesh)
+  scale_N = funcol.all_gather_tensor(scale_T, gather_dim=0, group=ep_mesh)
+  return (x_q_N3.float() * scale_N.reshape(-1, 1, 1)).to(torch.bfloat16)
+
+
+class _Fp8Experts(torch.autograd.Function):
+  """EP token all-gather, the fused FP8 expert MLP of
+  ``kernels/fp8_roe_experts.py`` and the combine reduce-scatter.
+
+  The tokens travel and are gathered by the kernels as e4m3 (static scale),
+  so no routed-row buffer is written in the forward. Backward all-gathers the
+  output gradient (BF16), runs the fused backward kernels, sums each token's
+  row gradients and reduce-scatters them; the expert-weight gradients go to
+  the `Fp8ExpertWeights`' ``reduce_joint_grad``.
+  """
+
+  @staticmethod
+  def forward(ctx, x_TD, scores_R, token_ids_R, valid_count_1, group_sizes_E,
+              reduce_metadata, top_k, ep_mesh, fp8_grad_all_gather, w13, w2,
+              *weight_shards):
+    from torchtitan.experiments.tpu.kernels.fp8_roe_experts import fp8_experts_fwd_op  # pylint: disable=g-import-not-at-top
+
+    ctx.set_materialize_grads(False)
+    ctx.top_k = top_k
+    ctx.ep_mesh = ep_mesh
+    ctx.fp8_grad_all_gather = fp8_grad_all_gather
+    ctx.w13, ctx.w2 = w13, w2
+    ctx.num_w13 = len(w13.shards)
+    x_ag_N3 = funcol.all_gather_tensor(
+        to_token_3d(_fp8_static_quantize(x_TD)), gather_dim=0, group=ep_mesh
+    )
+    y_N3, gate_out_RF2 = fp8_experts_fwd_op(
+        x_ag_N3, token_ids_R, group_sizes_E, scores_R, w13.weight_q,
+        w2.weight_q,
+    )
+    ctx.save_for_backward(
+        x_ag_N3, scores_R, token_ids_R, valid_count_1, group_sizes_E,
+        gate_out_RF2, w13.weight_q, w2.weight_q, *reduce_metadata,
+    )
+    # In the token layout: the same reduce-scatter on the flattened [N, D]
+    # rows crashed a SparseCore (UserFatal) on the 671B run.
+    out_T3 = funcol.reduce_scatter_tensor(
+        y_N3, "sum", scatter_dim=0, group=ep_mesh
+    )
+    return out_T3.reshape(out_T3.shape[0], -1).to(x_TD.dtype)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_TD):
+    from torchtitan.experiments.tpu.kernels.fp8_roe_experts import fp8_experts_bwd_op  # pylint: disable=g-import-not-at-top
+
+    (x_ag_N3, scores_R, token_ids_R, valid_count_1, group_sizes_E,
+     gate_out_RF2, w13_q, w2_q, *reduce_metadata) = ctx.saved_tensors
+    num_weights = ctx.num_w13 + len(ctx.w2.shards)
+    if grad_TD is None:
+      return (None,) * (11 + num_weights)
+    if ctx.fp8_grad_all_gather:
+      dy_N3 = _fp8_rowwise_all_gather(grad_TD, ctx.ep_mesh)
+    else:
+      dy_N3 = funcol.all_gather_tensor(
+          to_token_3d(grad_TD.to(torch.bfloat16).contiguous()),
+          gather_dim=0,
+          group=ctx.ep_mesh,
+      )
+    dx_R3, dscores_R, dw13, dw2 = fp8_experts_bwd_op(
+        dy_N3, x_ag_N3, token_ids_R, group_sizes_E, scores_R, w13_q, w2_q,
+        gate_out_RF2,
+    )
+    grad_global_T3 = ragged_gather_reduce(
+        dx_R3.reshape(dx_R3.shape[0], -1),
+        None,
+        valid_count_1,
+        tuple(reduce_metadata),
+        num_out_tokens=x_ag_N3.shape[0],
+        top_k=ctx.top_k,
+    )
+    grad_T3 = funcol.reduce_scatter_tensor(
+        grad_global_T3, "sum", scatter_dim=0, group=ctx.ep_mesh
+    )
+    valid_R = (
+        torch.arange(dscores_R.shape[0], device=dscores_R.device)
+        < valid_count_1.reshape(1)
+    )
+    dscores_R = torch.where(valid_R, dscores_R, torch.zeros_like(dscores_R))
+    return (
+        grad_T3.reshape(grad_TD.shape).to(grad_TD.dtype),
+        dscores_R.to(scores_R.dtype),
+        *(None,) * 9,
+        *ctx.w13.reduce_joint_grad(dw13),
+        *ctx.w2.reduce_joint_grad(dw2),
+    )
+
+
+def ring_of_experts_fp8_experts(
+    x_TD: torch.Tensor,
+    group_sizes_E: torch.Tensor,
+    metadata: RingOfExpertsMetadata,
+    w13,
+    w2,
+    *,
+    fp8_grad_all_gather: bool = False,
+) -> torch.Tensor:
+  """The routed experts of `ring_of_experts_dispatch(..., gather_tokens=
+  False)` routing as the fused FP8 kernels of ``kernels/fp8_roe_experts.py``
+  (MaxText ``fp8_full`` numerics): EP token all-gather in e4m3, the W1|W3
+  GEMM with the ``silu(g) * u * score`` epilogue, the W2 GEMM fused with the
+  per-token combine, and the combine reduce-scatter.
+
+  Args:
+    x_TD: local tokens.
+    group_sizes_E: local-expert group sizes from the dispatch.
+    metadata: the dispatch state.
+    w13: `Fp8ExpertWeights` of ``[W1 | W3]`` (``[E, D, 2F]``).
+    w2: `Fp8ExpertWeights` of W2 (``[E, F, D]``).
+    fp8_grad_all_gather: all-gather the output gradient in backward as e4m3
+      with per-token scales instead of BF16 (changes numerics).
+
+  Returns:
+    `[T, D]` combined local tokens, the scores applied.
+  """
+  return _Fp8Experts.apply(
+      x_TD,
+      metadata.scores_R,
+      metadata.token_ids_R,
+      metadata.valid_count_1,
+      group_sizes_E.to(torch.int32),
+      metadata.reduce_metadata,
+      metadata.top_k,
+      metadata.ep_mesh,
+      fp8_grad_all_gather,
+      w13,
+      w2,
+      *w13.shards,
+      *w2.shards,
+  )
+
+
 __all__ = [
     "CAPACITY_TILE",
     "RingOfExpertsMetadata",
     "ring_of_experts_capacity",
     "ring_of_experts_combine",
     "ring_of_experts_dispatch",
+    "ring_of_experts_fp8_experts",
 ]

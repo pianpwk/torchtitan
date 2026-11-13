@@ -538,6 +538,25 @@ def deepseek_v3_671b_smoke_mla_ep4_fp8_dense() -> TpuGraphTrainer.Config:
   return config
 
 
+def deepseek_v3_671b_smoke_mla_ep4_fp8_fused() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep4_fp8_tokens`` on the fused gmmv2 expert
+  kernels (``_use_fp8_fused_roe_kernels``)."""
+  config = deepseek_v3_671b_smoke_mla_ep4_fp8_tokens()
+  _use_fp8_fused_roe_kernels(config)
+  return config
+
+
+def deepseek_v3_671b_smoke_mla_ep4_fp8_fused_grad_ag() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep4_fp8_fused`` with FP8 gradient
+  all-gathers in the fused experts' backward."""
+  config = deepseek_v3_671b_smoke_mla_ep4_fp8_fused()
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.fp8_fused_roe_grad_all_gather = True
+  return config
+
+
 def deepseek_v3_671b_smoke_mla_ep4_fp8_tokens() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_smoke_mla_ep4_fp8`` with FP8 token all-gathers;
   loss should match it bit for bit."""
@@ -752,6 +771,15 @@ def _use_fp8_static_dense(
   ).convert(config.model_spec.model)
 
 
+def _use_fp8_fused_roe_kernels(config: TPUTrainerConfig) -> None:
+  """MaxText's fused gmmv2 expert kernels for the FP8 Ring-of-Experts
+  experts (``TpuGroupedExperts.Config.use_fp8_fused_roe_kernels``)."""
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_fp8_fused_roe_kernels = True
+
+
 def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_4x4x4_mla_ep8_cf125_by_layer_prefetch`` tuned:
   7.83 s / step, 25.5% MFU (vs 10.0 s, 19.9%).
@@ -886,4 +914,35 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac_fp8_dense_down() -> (
   _use_fp8_static_dense(
       config, _FP8_DENSE_FQNS + ("attention.wq_a", "attention.wkv_a")
   )
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_fused() -> TpuGraphTrainer.Config:
+  """``..._fp8_experts_sac_fp8_dense`` on MaxText's fused gmmv2 expert kernels
+  (``_use_fp8_fused_roe_kernels``): 4.92 -> 4.83 s / step. The expert compute
+  per MoE layer drops by ~3 ms forward and ~8 ms backward, but the backward
+  becomes SparseCore bound (one SparseCore busy ~42 of 53 ms)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac_fp8_dense()
+  _use_fp8_fused_roe_kernels(config)
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_fused_grad_ag() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._fp8_fused`` all-gathering the combine's output gradient in FP8
+  (``fp8_fused_roe_grad_all_gather``): 4.83 -> 4.56 s / step (43.8% MFU)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_fused()
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.fp8_fused_roe_grad_all_gather = True
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full() -> TpuGraphTrainer.Config:
+  """``..._fp8_fused_grad_ag`` with the MLA down-projections in FP8 too (4.56
+  s / step either way; the step is SparseCore bound)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_fused_grad_ag()
+  _use_fp8_static_dense(config, ("attention.wq_a", "attention.wkv_a"))
   return config

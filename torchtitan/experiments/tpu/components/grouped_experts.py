@@ -147,6 +147,15 @@ class TpuGroupedExperts(GroupedExperts):
         # MaxText does, instead of FSDP's ``reduce_dtype``: halves their bytes
         # and skips widening each full dW to FP32 before the collective.
         fp8_bf16_gradient_reduce_scatter: bool = False
+        # With Ring-of-Experts EP (and ``scale_before_down_proj``): run the
+        # FP8 experts as MaxText's fused gmmv2 kernels, which gather the
+        # routed rows from the all-gathered FP8 tokens and combine their
+        # outputs in-kernel (``ring_of_experts_fp8_experts``). Implies FP8
+        # token all-gathers. Needs ``use_fp8_grouped_mm``.
+        use_fp8_fused_roe_kernels: bool = False
+        # With ``use_fp8_fused_roe_kernels``: all-gather the combine's output
+        # gradient as e4m3 with per-token scales (half the bytes).
+        fp8_fused_roe_grad_all_gather: bool = False
         # ``(forward, dInput, dWeight)`` tilings, each ``(tile_m, tile_k,
         # tile_n)`` in that kernel's operand order (see
         # `fp8_qrhs_segment_matmul`); measured on TPU7x at DeepSeek-V3 671B's
@@ -205,6 +214,10 @@ class TpuGroupedExperts(GroupedExperts):
         self.fp8_bf16_gradient_reduce_scatter = (
             config.fp8_bf16_gradient_reduce_scatter
         )
+        self.use_fp8_fused_roe_kernels = config.use_fp8_fused_roe_kernels
+        self.fp8_fused_roe_grad_all_gather = config.fp8_fused_roe_grad_all_gather
+        if self.use_fp8_fused_roe_kernels and not config.use_fp8_grouped_mm:
+            raise ValueError("use_fp8_fused_roe_kernels needs use_fp8_grouped_mm")
         self.fp8_w13_tilings = config.fp8_w13_tilings
         self.fp8_w2_tilings = config.fp8_w2_tilings
         if self.use_fp8_grouped_mm:
@@ -453,6 +466,28 @@ class TpuGroupedExperts(GroupedExperts):
             ),
             gather_fp8_expert_weights(self, ("w2_EFD",), reduce_dtype=reduce_dtype),
         )
+
+    def fp8_fused_roe_forward(
+        self,
+        x_TD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+        metadata,
+    ) -> torch.Tensor:
+        """Combined routed-expert output of the local tokens; see
+        ``use_fp8_fused_roe_kernels``."""
+        if self._use_transposed_w2_rhs:
+            raise ValueError("FP8 grouped matmul needs W2 sharded on its expert dim")
+        from torchtitan.experiments.tpu.components.ring_of_experts import ring_of_experts_fp8_experts  # pylint: disable=g-import-not-at-top
+
+        w13, w2 = self._gather_fp8_weights()
+        return ring_of_experts_fp8_experts(
+            x_TD.bfloat16(),
+            num_tokens_per_expert_E,
+            metadata,
+            w13,
+            w2,
+            fp8_grad_all_gather=self.fp8_fused_roe_grad_all_gather,
+        ).type_as(x_TD)
 
     def _fp8_forward(
         self,
