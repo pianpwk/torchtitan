@@ -789,3 +789,16 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines_fp8_expert
   config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines()
   _use_fp8_experts(config)
   return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v2() -> TpuGraphTrainer.Config:
+  """``..._rs_deadlines_fp8_experts`` with BF16 expert-gradient
+  reduce-scatters (``fp8_bf16_gradient_reduce_scatter``): 6.31 -> 5.80 s /
+  step (34.4% MFU). (Also measured: the FP8 GEMMs taking FP8 rather than
+  int8-bit operands, which removed full copies of each gathered bank.)"""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines_fp8_experts()
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.fp8_bf16_gradient_reduce_scatter = True
+  return config

@@ -143,6 +143,10 @@ class TpuGroupedExperts(GroupedExperts):
         # multiplied as one ``[E, D, 2F]`` weight. Needs the kernel-native
         # layout; replaces the BF16 Pallas path.
         use_fp8_grouped_mm: bool = False
+        # Reduce-scatter the FP8 path's expert-weight gradients in BF16, as
+        # MaxText does, instead of FSDP's ``reduce_dtype``: halves their bytes
+        # and skips widening each full dW to FP32 before the collective.
+        fp8_bf16_gradient_reduce_scatter: bool = False
         # ``(forward, dInput, dWeight)`` tilings, each ``(tile_m, tile_k,
         # tile_n)`` in that kernel's operand order (see
         # `fp8_qrhs_segment_matmul`); measured on TPU7x at DeepSeek-V3 671B's
@@ -198,6 +202,9 @@ class TpuGroupedExperts(GroupedExperts):
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self.use_fp8_grouped_mm = config.use_fp8_grouped_mm
+        self.fp8_bf16_gradient_reduce_scatter = (
+            config.fp8_bf16_gradient_reduce_scatter
+        )
         self.fp8_w13_tilings = config.fp8_w13_tilings
         self.fp8_w2_tilings = config.fp8_w2_tilings
         if self.use_fp8_grouped_mm:
@@ -437,9 +444,14 @@ class TpuGroupedExperts(GroupedExperts):
         # Imported here so that only FP8 runs load the FP8 kernels.
         from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import gather_fp8_expert_weights  # pylint: disable=g-import-not-at-top
 
+        reduce_dtype = (
+            torch.bfloat16 if self.fp8_bf16_gradient_reduce_scatter else None
+        )
         return (
-            gather_fp8_expert_weights(self, ("w1_EDF", "w3_EDF")),
-            gather_fp8_expert_weights(self, ("w2_EFD",)),
+            gather_fp8_expert_weights(
+                self, ("w1_EDF", "w3_EDF"), reduce_dtype=reduce_dtype
+            ),
+            gather_fp8_expert_weights(self, ("w2_EFD",), reduce_dtype=reduce_dtype),
         )
 
     def _fp8_forward(
