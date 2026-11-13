@@ -136,6 +136,27 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
+        # Run the expert GEMMs in FP8 with MaxText's `fp8_full` numerics
+        # (static per-tensor e4m3 scales for weights and activations, one
+        # absmax e5m2 scale per gradient tensor). Each weight is quantized on
+        # its FSDP shard and all-gathered as FP8; W1 and W3 are gathered and
+        # multiplied as one ``[E, D, 2F]`` weight. Needs the kernel-native
+        # layout; replaces the BF16 Pallas path.
+        use_fp8_grouped_mm: bool = False
+        # ``(forward, dInput, dWeight)`` tilings, each ``(tile_m, tile_k,
+        # tile_n)`` in that kernel's operand order (see
+        # `fp8_qrhs_segment_matmul`); measured on TPU7x at DeepSeek-V3 671B's
+        # 81,920 rows x 32 experts (D = 7168, F = 2048).
+        fp8_w13_tilings: tuple[tuple[int, int, int], ...] = (
+            (512, 1024, 4096),
+            (512, 4096, 512),
+            (512, 1024, 2048),
+        )
+        fp8_w2_tilings: tuple[tuple[int, int, int], ...] = (
+            (512, 2048, 3584),
+            (512, 3584, 1024),
+            (512, 1024, 1792),
+        )
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -176,6 +197,24 @@ class TpuGroupedExperts(GroupedExperts):
             config.pallas_grouped_mm_w2_transposed_tgmm_tiling
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
+        self.use_fp8_grouped_mm = config.use_fp8_grouped_mm
+        self.fp8_w13_tilings = config.fp8_w13_tilings
+        self.fp8_w2_tilings = config.fp8_w2_tilings
+        if self.use_fp8_grouped_mm:
+            if not self.use_kernel_native_weight_layout:
+                raise ValueError(
+                    "FP8 grouped matmul requires the kernel-native layout"
+                )
+            # Rows are padded to pallas_grouped_mm_tile_m, so every FP8
+            # kernel's row tile must match it.
+            for tilings in (self.fp8_w13_tilings, self.fp8_w2_tilings):
+                if len(tilings) != 3 or any(
+                    t[0] != config.pallas_grouped_mm_tile_m for t in tilings
+                ):
+                    raise ValueError(
+                        "FP8 tilings must be (forward, dInput, dWeight) with "
+                        f"tile_m = pallas_grouped_mm_tile_m, got {tilings}"
+                    )
         self._use_transposed_w2_rhs = False
         self._native_sharding_applied = False
 
@@ -302,6 +341,9 @@ class TpuGroupedExperts(GroupedExperts):
             if self.activation == "silu":
                 return super().forward(x_RD, num_tokens_per_expert_E)
             return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
+        if self.use_fp8_grouped_mm:
+            return self._fp8_forward(x_RD, num_tokens_per_expert_E, row_scale_R)
+
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
@@ -388,6 +430,71 @@ class TpuGroupedExperts(GroupedExperts):
             tile_n=w2_tile_n,
             tgmm_tiling=w2_tgmm_tiling,
             transpose_rhs=self._use_transposed_w2_rhs,
+        )[:num_rows].type_as(x_RD)
+
+    def _gather_fp8_weights(self):
+        """``([W1 | W3], W2)`` as `Fp8ExpertWeights`."""
+        # Imported here so that only FP8 runs load the FP8 kernels.
+        from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import gather_fp8_expert_weights  # pylint: disable=g-import-not-at-top
+
+        return (
+            gather_fp8_expert_weights(self, ("w1_EDF", "w3_EDF")),
+            gather_fp8_expert_weights(self, ("w2_EFD",)),
+        )
+
+    def _fp8_forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+        row_scale_R: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The Pallas expert path with FP8 GEMMs; see ``use_fp8_grouped_mm``."""
+        if self._use_transposed_w2_rhs:
+            raise ValueError("FP8 grouped matmul needs W2 sharded on its expert dim")
+        # Imported here so that only FP8 runs load the FP8 kernels.
+        from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import fp8_qrhs_segment_matmul  # pylint: disable=g-import-not-at-top
+
+        # [E, D, 2F] = [W1 | W3], and [E, F, D], gathered as FP8.
+        w13, w2 = self._gather_fp8_weights()
+
+        x_bf16 = x_RD.bfloat16()
+        num_rows = x_bf16.shape[0]
+        pad_rows = -num_rows % self.pallas_grouped_mm_tile_m
+        if pad_rows:
+            # As in the BF16 path: zero rows on the last expert, sliced off.
+            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
+            num_tokens_per_expert_E = torch.cat(
+                [num_tokens_per_expert_E[:-1], num_tokens_per_expert_E[-1:] + pad_rows]
+            )
+        fwd, dlhs, drhs = self.fp8_w13_tilings
+        gate_up_RF2 = fp8_qrhs_segment_matmul(
+            x_bf16,
+            w13.weight_q,
+            num_tokens_per_expert_E,
+            weight_inputs=w13.shards,
+            reduce_grad=w13.reduce_grad,
+            fwd_tiling=fwd,
+            dlhs_tiling=dlhs,
+            drhs_tiling=drhs,
+        )
+        gate_RF, up_RF = gate_up_RF2.chunk(2, dim=-1)
+        hidden_RF = self._activation_fn(gate_RF) * up_RF
+        if row_scale_R is not None:
+            if pad_rows:
+                row_scale_R = F.pad(row_scale_R, (0, pad_rows))
+            hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
+                hidden_RF.dtype
+            )
+        fwd, dlhs, drhs = self.fp8_w2_tilings
+        return fp8_qrhs_segment_matmul(
+            hidden_RF,
+            w2.weight_q,
+            num_tokens_per_expert_E,
+            weight_inputs=w2.shards,
+            reduce_grad=w2.reduce_grad,
+            fwd_tiling=fwd,
+            dlhs_tiling=dlhs,
+            drhs_tiling=drhs,
         )[:num_rows].type_as(x_RD)
 
 

@@ -1,5 +1,6 @@
 """TPU-local SimpleFSDP support for native non-leading collectives."""
 
+import dataclasses
 from typing import Any
 
 import torch
@@ -7,6 +8,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation
 from torchtitan.tools.logging import logger
@@ -203,8 +205,153 @@ def install_tpu_replicate_computation(model: nn.Module) -> None:
   )
 
 
+def _simple_fsdp_computation(
+    module: nn.Module, name: str
+) -> ReplicateComputation | None:
+  """The SimpleFSDP computation that gathers ``module.<name>``, if any.
+
+  SimpleFSDP exposes each parameter as a property reading
+  ``_simple_fsdp_parametrization_list[i]``, with ``(i, name)`` bound as the
+  getter's defaults; read the index from there rather than assuming it
+  follows parameter order (ignored parameters are skipped).
+  """
+  prop = type(module).__dict__.get(name)
+  if not isinstance(prop, property) or prop.fget is None:
+    return None
+  defaults = prop.fget.__defaults__
+  if not (defaults and len(defaults) == 2 and defaults[1] == name):
+    raise RuntimeError(
+        f"{type(module).__name__}.{name} is not a SimpleFSDP property; "
+        "SimpleFSDP's parametrization internals changed"
+    )
+  return module._simple_fsdp_parametrization_list[defaults[0]]
+
+
+@dataclasses.dataclass(frozen=True)
+class Fp8ExpertWeights:
+  """Expert weights gathered as FP8; see `gather_fp8_expert_weights`.
+
+  ``weight_q`` holds the e4m3 values of the weights concatenated on
+  their last dim, ``[E, K, sum N]``. Pass ``shards`` and ``reduce_grad`` to
+  the FP8 GEMM: its backward hands ``reduce_grad`` the full ``dW``, which
+  becomes one gradient per shard.
+  """
+
+  weight_q: torch.Tensor
+  shards: tuple[torch.Tensor, ...]
+  group_name: str | None
+  reduce_dtype: torch.dtype | None
+
+  def reduce_grad(
+      self, grads: tuple[torch.Tensor, ...]
+  ) -> tuple[torch.Tensor, ...]:
+    """FSDP's backward for each weight's full ``dW`` (the GEMM's backward
+    splits ``[W1 | W3]``): cast to ``reduce_dtype``, reduce-scatter over the
+    shard group. Per weight, as the BF16 path does: widening the joint
+    gradient would hold both FP32 copies at once."""
+    if len(grads) != len(self.shards):
+      raise ValueError(f"Expected {len(self.shards)} gradients, got {len(grads)}")
+    out = []
+    for g, shard in zip(grads, self.shards):
+      g = g.to(self.reduce_dtype) if self.reduce_dtype is not None else g
+      if self.group_name is not None:
+        g = funcol.reduce_scatter_single(
+            g.contiguous(), reduceOp="sum", scatter_dim=0, group=self.group_name
+        )
+      out.append(g.to(shard.dtype))
+    return tuple(out)
+
+
+def _gather_fp8(
+    shards: tuple[torch.Tensor, ...], group_name: str | None
+) -> torch.Tensor:
+  from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import fp8_quantize_expert_weight  # pylint: disable=g-import-not-at-top
+
+  # The static scale makes quantization elementwise, so a shard quantizes
+  # exactly as the gathered weight would. Nothing here is differentiable; the
+  # GEMM routes the gradient to the shards.
+  weight_q = torch.cat(
+      [fp8_quantize_expert_weight(shard.detach()) for shard in shards], dim=-1
+  )
+  if group_name is not None:
+    weight_q = funcol.all_gather_single(weight_q, gather_dim=0, group=group_name)
+  return weight_q
+
+
+def gather_fp8_expert_weights(
+    module: nn.Module,
+    names: tuple[str, ...],
+    *,
+    reduce_dtype: torch.dtype | None = None,
+) -> Fp8ExpertWeights:
+  """FP8 replicas of ``module``'s expert weights ``names``, concatenated.
+
+  Each weight is ``[E, K, N]`` and, under SimpleFSDP, sharded on ``E`` over a
+  1D mesh; the static-scale quantization is elementwise, so it runs on the
+  shard and the gather moves FP8. Without SimpleFSDP (or with it inactive)
+  the local weights are quantized as they are. Reads the sharded parameters
+  directly, so the module's SimpleFSDP properties -- and their BF16 gathers
+  -- never run.
+
+  Returns the gathered FP8 values with the shards that receive their gradient;
+  see `Fp8ExpertWeights`. The gradients are reduce-scattered in
+  ``reduce_dtype`` if given, else in SimpleFSDP's.
+  """
+  from torchtitan.experiments.graph_trainer import simple_fsdp as upstream_simple_fsdp  # pylint: disable=g-import-not-at-top
+
+  computations = [_simple_fsdp_computation(module, name) for name in names]
+  params = [module._parameters[name] for name in names]
+  if not upstream_simple_fsdp._active_parametrization or all(
+      c is None for c in computations
+  ):
+    shards = tuple(p.to_local() if isinstance(p, DTensor) else p for p in params)
+    return Fp8ExpertWeights(_gather_fp8(shards, None), shards, None, None)
+  if any(c is None for c in computations):
+    raise ValueError(
+        f"Expert weights {names} must all be SimpleFSDP-sharded or none"
+    )
+  first = computations[0]
+  for name, computation, param in zip(names, computations, params):
+    if computation.device_mesh is not first.device_mesh or (
+        computation.reduce_dtype != first.reduce_dtype
+    ):
+      raise ValueError(f"Expert weights {names} use different FSDP settings")
+    if computation.device_mesh.ndim != 1 or tuple(
+        computation.param_sharding
+    ) != (Shard(0),):
+      raise ValueError(
+          f"FP8 expert all-gather needs {name} sharded on its expert dim over "
+          f"a 1D FSDP mesh, got {computation.param_sharding} over "
+          f"{computation.device_mesh.ndim} dims"
+      )
+    # Under EP the FSDP placement is a ``_StridedShard`` of dim 0 (FSDP on
+    # top of the EP split); SimpleFSDP gathers its local tensor on dim 0 just
+    # as for ``Shard(0)``.
+    if not (
+        isinstance(param, DTensor)
+        and isinstance(param.placements[0], (Shard, _StridedShard))
+        and param.placements[0].dim == 0
+    ):
+      raise ValueError(
+          f"FP8 expert all-gather needs {name} sharded on dim 0 of its FSDP "
+          f"axis, got {getattr(param, 'placements', None)}"
+      )
+  # ``to_local``'s backward re-wraps the local gradient with the parameter's
+  # own (sharded) placements, so it adds no reduction of its own.
+  shards = tuple(p.to_local() for p in params)
+  group_name = first.device_mesh.get_group().group_name
+  return Fp8ExpertWeights(
+      _gather_fp8(shards, group_name),
+      shards,
+      group_name,
+      reduce_dtype or first.reduce_dtype,
+  )
+
+
 __all__ = [
     "TpuReplicateComputation",
+    "Fp8ExpertWeights",
+    "gather_fp8_expert_weights",
     "install_tpu_replicate_computation",
     "replicate_sharded_tensor",
 ]

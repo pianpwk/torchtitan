@@ -26,6 +26,14 @@ def _dequantized(x: torch.Tensor, dims, qdtype=torch.float8_e4m3fn):
     return (x / scale).to(qdtype).float() * scale
 
 
+def _static_dequantized(x: torch.Tensor) -> torch.Tensor:
+    """``x`` through MaxText's static ``fixed,-224,224`` e4m3 quantization."""
+    scale = fp8_esm.STATIC_SCALE
+    fmax = torch.finfo(torch.float8_e4m3fn).max
+    x = x.detach().float().cpu()
+    return (x / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
+
+
 def _grouped_reference(lhs, rhs, group_sizes):
     """FP32 ``lhs[rows of g] @ rhs[g]`` for every group ``g``."""
     out, start = [], 0
@@ -337,6 +345,108 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertLess(_rel_err(d_gu, want_dgu), 0.1)
         self.assertLess(_rel_err(d_w, want_dw), 0.1)
 
+    def _qrhs(self, rhs):
+        """``rhs`` quantized on device, and a leaf that receives its gradient."""
+        leaf = rhs.to(self.accelerator_device).requires_grad_()
+        return fp8_esm.fp8_quantize_expert_weight(leaf.detach()), leaf
+
+    def _qrhs_mm(self, lhs, q, leaf, sizes):
+        return fp8_esm.fp8_qrhs_segment_matmul(
+            lhs,
+            q,
+            sizes,
+            weight_inputs=(leaf,),
+            reduce_grad=lambda grads: grads,
+            **_TILINGS,
+        )
+
+    def test_quantize_expert_weight_is_static(self):
+        _, rhs, _, _ = self._operands()
+        q = self._qrhs(rhs)[0]
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        got = q.cpu().float() * fp8_esm.STATIC_SCALE
+        self.assertLess(_rel_err(got, _static_dequantized(rhs)), 1e-2)
+
+    def test_qrhs_forward_matches_dequantized_reference(self):
+        lhs, rhs, _, sizes = self._operands()
+        q, leaf = self._qrhs(rhs)
+        lhs_d, sizes_d = self._to_dev(lhs, sizes)
+        out = self._qrhs_mm(lhs_d, q, leaf, sizes_d)
+        want = _grouped_reference(
+            _static_dequantized(lhs), _static_dequantized(rhs), _GROUP_SIZES
+        )
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertLess(_rel_err(out, want), 1e-2)
+
+    def test_qrhs_backward_is_close_to_bf16(self):
+        lhs, rhs, dout, sizes = self._operands()
+        q, leaf = self._qrhs(rhs)
+        (lhs_d,) = self._to_dev(lhs, grad=True)
+        (sizes_d,) = self._to_dev(sizes)
+        out = self._qrhs_mm(lhs_d, q, leaf, sizes_d)
+        dlhs, drhs = torch.autograd.grad(
+            out, (lhs_d, leaf), dout.to(self.accelerator_device)
+        )
+        lhs_r = lhs.float().requires_grad_()
+        rhs_r = rhs.float().requires_grad_()
+        want = _grouped_reference(lhs_r, rhs_r, _GROUP_SIZES)
+        want_dlhs, want_drhs = torch.autograd.grad(
+            want, (lhs_r, rhs_r), dout.float()
+        )
+        self.assertEqual(drhs.dtype, torch.bfloat16)
+        self.assertEqual(drhs.shape, rhs.shape)
+        self.assertLess(_rel_err(dlhs, want_dlhs), 0.1)
+        self.assertLess(_rel_err(drhs, want_drhs), 0.1)
+        drhs = drhs.cpu()
+        for g, size in enumerate(_GROUP_SIZES):
+            if size == 0:
+                torch.testing.assert_close(drhs[g], torch.zeros_like(drhs[g]))
+
+    def test_qrhs_ignores_rows_outside_groups(self):
+        # Ring-of-Experts leaves rows past sum(group_sizes) unspecified. They
+        # must not reach dW, whose quantization takes a per-column amax over
+        # every row.
+        lhs, rhs, dout, sizes = self._operands()
+        q, leaf = self._qrhs(rhs)
+        pad = 128
+        lhs_pad = torch.cat([lhs, torch.full((pad, lhs.shape[1]), float("inf"))]).bfloat16()
+        dout_pad = torch.cat([dout, torch.full((pad, dout.shape[1]), float("nan"))]).bfloat16()
+        (lhs_d,) = self._to_dev(lhs_pad, grad=True)
+        out = self._qrhs_mm(lhs_d, q, leaf, sizes.to(self.accelerator_device))
+        dlhs, drhs = torch.autograd.grad(
+            out, (lhs_d, leaf), dout_pad.to(self.accelerator_device)
+        )
+        self.assertTrue(torch.isfinite(drhs.float()).all())
+        self.assertTrue(torch.isfinite(dlhs[: lhs.shape[0]].float()).all())
+        self.assertTrue(torch.isfinite(out[: lhs.shape[0]].float()).all())
+
+    def test_unsharded_expert_weight_gather_routes_gradients(self):
+        from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import gather_fp8_expert_weights  # pylint: disable=g-import-not-at-top
+
+        lhs, rhs_a, dout, sizes = self._operands()
+        rhs_b = rhs_a.flip(0) * 0.5
+        module = torch.nn.Module()
+        module.a = torch.nn.Parameter(rhs_a.float().to(self.accelerator_device))
+        module.b = torch.nn.Parameter(rhs_b.float().to(self.accelerator_device))
+        weights = gather_fp8_expert_weights(module, ("a", "b"))
+        self.assertEqual(tuple(weights.weight_q.shape), (len(_GROUP_SIZES), 256, 512))
+        (lhs_d,) = self._to_dev(lhs)
+        out = fp8_esm.fp8_qrhs_segment_matmul(
+            lhs_d,
+            weights.weight_q,
+            sizes.to(self.accelerator_device),
+            weight_inputs=weights.shards,
+            reduce_grad=weights.reduce_grad,
+            **_TILINGS,
+        )
+        dout2 = torch.cat([dout, dout.flip(0)], dim=-1)
+        out.backward(dout2.to(self.accelerator_device))
+        rhs_r = torch.cat([rhs_a, rhs_b], dim=-1).float().requires_grad_()
+        want = _grouped_reference(lhs.float(), rhs_r, _GROUP_SIZES)
+        (want_d,) = torch.autograd.grad(want, (rhs_r,), dout2.float())
+        self.assertEqual(module.a.grad.dtype, torch.float32)
+        self.assertLess(_rel_err(module.a.grad, want_d[..., :256]), 0.1)
+        self.assertLess(_rel_err(module.b.grad, want_d[..., 256:]), 0.1)
 
 
 if __name__ == "__main__":

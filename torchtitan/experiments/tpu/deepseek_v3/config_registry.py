@@ -514,6 +514,31 @@ def deepseek_v3_671b_smoke_mla_ep8() -> TpuGraphTrainer.Config:
   return config
 
 
+def deepseek_v3_671b_smoke_mla_ep8_fp8() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep8`` with FP8 routed experts. On 8 ranks
+  the expert banks are not FSDP-sharded, so the weights quantize locally."""
+  config = deepseek_v3_671b_smoke_mla_ep8()
+  _use_fp8_experts(config)
+  return config
+
+
+def deepseek_v3_671b_smoke_mla_ep4_fp8() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep8_fp8`` at 4-way EP, so each expert bank
+  is FSDP-sharded over 2 ranks and the FP8 weight all-gather runs."""
+  config = deepseek_v3_671b_smoke_mla_ep8_fp8()
+  _use_ring_of_experts(config, ep_degree=4)
+  return config
+
+
+def deepseek_v3_671b_smoke_mla_ep4() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep8`` at 4-way EP: the BF16 reference for
+  ``deepseek_v3_671b_smoke_mla_ep4_fp8``."""
+  config = deepseek_v3_671b_smoke_mla_ep8()
+  _use_ring_of_experts(config, ep_degree=4)
+  _use_671b_wide_expert_tiles(config)
+  return config
+
+
 def deepseek_v3_236b_fsdp_smoke_mla_ep8_chunk4() -> TpuGraphTrainer.Config:
   """``deepseek_v3_236b_fsdp_smoke_mla_ep8`` over 4 token chunks, so each
   chunk's EP all-gather and reduce-scatter can overlap the other chunks'
@@ -671,6 +696,18 @@ def _use_671b_wide_expert_tiles(config: TPUTrainerConfig) -> None:
     experts.pallas_grouped_mm_w2_tgmm_tiling = (512, 2048, 1024)
 
 
+def _use_fp8_experts(config: TPUTrainerConfig) -> None:
+  """FP8 routed-expert GEMMs with FP8 weight all-gathers (MaxText's QWAG):
+  each weight is quantized on its FSDP shard and gathered as FP8; see
+  ``TpuGroupedExperts.Config.use_fp8_grouped_mm``. The FP8 tilings assume
+  ``_use_671b_wide_expert_tiles``' 512-row tile."""
+  _use_671b_wide_expert_tiles(config)
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_fp8_grouped_mm = True
+
+
 def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_4x4x4_mla_ep8_cf125_by_layer_prefetch`` tuned:
   7.83 s / step, 25.5% MFU (vs 10.0 s, 19.9%).
@@ -740,4 +777,15 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines() -> (
   (30.2% MFU), loss bit-identical."""
   config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_defer()
   config.compile.graph_split.deferred_reduction_deadlines = 2
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines_fp8_experts() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._tuned_bf16_adam_rs_deadlines`` with FP8 routed-expert GEMMs and
+  FP8 expert-weight all-gathers (``_use_fp8_experts``): 6.61 -> 6.31 s / step
+  (31.6% MFU)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned_bf16_adam_rs_deadlines()
+  _use_fp8_experts(config)
   return config

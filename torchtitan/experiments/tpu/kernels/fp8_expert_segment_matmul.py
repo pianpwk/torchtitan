@@ -679,7 +679,274 @@ def fp8_swiglu_segment_matmul_pallas_2d(
     return out
 
 
+# ---------------------------------------------------------------------------
+# MaxText `fp8_full` numerics (maxtext/experimental/lineage/quantization.py):
+# weights and activations take one *static* per-tensor scale -- calibration
+# ``fixed,-224,224``, i.e. ``clip(x / 0.5)`` in e4m3 -- and output gradients
+# one dynamic absmax scale per tensor, so dInput and dWeight share a single
+# e5m2 copy of dY. A static weight scale makes quantization elementwise, so it
+# runs on the weight's FSDP shard and the all-gather moves FP8. The GEMM ops
+# below take the gathered FP8 weight instead of a BF16 one; its gradient goes
+# to the BF16 weights it was quantized from (see `fp8_qrhs_segment_matmul`),
+# as autograd would cast a gradient for the FP8 values to FP8.
+# ---------------------------------------------------------------------------
+
+# ``fixed,-224,224``: 224 / 448 (e4m3's largest finite value).
+STATIC_SCALE = 224.0 / float(jnp.finfo(FWD_DTYPE).max)
+
+
+def static_quantize(x: jax.Array) -> jax.Array:
+    """``clip(x / STATIC_SCALE)`` in e4m3; saturates, never inf / NaN."""
+    fmax = float(jnp.finfo(FWD_DTYPE).max)
+    return jnp.clip(x.astype(jnp.float32) / STATIC_SCALE, -fmax, fmax).astype(
+        FWD_DTYPE
+    )
+
+
+def _zero_rows_outside_groups(x: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    """``x`` with the rows past ``sum(group_sizes)`` zeroed.
+
+    Those rows belong to no group, and callers may leave them unspecified
+    (Ring-of-Experts capacity padding is the output of a GEMM that skipped
+    them); they must not reach a per-tensor absmax.
+    """
+    rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
+    return jnp.where(rows < jnp.sum(group_sizes), x, jnp.zeros((), x.dtype))
+
+
+def _row_scale(num_rows: int, scale: jax.Array | float) -> jax.Array:
+    """A per-tensor scale broadcast to tokamax's per-row ``[M, 1]`` layout."""
+    return jnp.broadcast_to(
+        jnp.asarray(scale, jnp.float32).reshape(1, 1), (num_rows, 1)
+    )
+
+
+@pallas.jax_op("tt_experts::fp8_quantize_expert_weight")
+def _fp8_quantize_expert_weight(rhs: jax.Array) -> jax.Array:
+    return static_quantize(rhs)
+
+
+@pallas.jax_op("tt_experts::fp8_grouped_mm_qrhs")
+def _fp8_grouped_mm_qrhs_fwd(
+    lhs: jax.Array,
+    rhs_q: jax.Array,
+    group_sizes: jax.Array,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Returns ``(out[M, N], lhs_q[M, K] (e4m3))``. Takes and returns FP8
+    arrays rather than int8 bits: an s8 -> f8 bitcast at the op boundary
+    lowers to a full copy of the gathered weight."""
+    _, k_dim, n_dim = rhs_q.shape
+    lhs_q = static_quantize(_zero_rows_outside_groups(lhs, group_sizes))
+    out = call_named(
+        tokamax_gmm.gmm,
+        "fp8_moe_gmm_fwd",
+        # Both static scales folded into the lhs's.
+        tokamax_gmm.QArray(
+            qvalue=lhs_q, scale=_row_scale(lhs.shape[0], STATIC_SCALE**2)
+        ),
+        rhs_q,
+        group_sizes,
+        precision=_PRECISION,
+        out_dtype=lhs.dtype,
+        tiling=_resolve((fwd_tm, fwd_tk, fwd_tn), k_dim, n_dim),
+    )
+    return out, lhs_q
+
+
+def _qrhs_bwd(
+    dout: jax.Array,
+    lhs_q: jax.Array,
+    rhs_q: jax.Array,
+    group_sizes: jax.Array,
+    dlhs_tiling: Tiling,
+    drhs_tiling: Tiling,
+    num_splits: int = 1,
+) -> tuple[jax.Array, ...]:
+    """Returns ``(dlhs[M, K], *drhs)`` from one e5m2 copy of dY, ``drhs`` the
+    ``num_splits`` equal column blocks of ``dW[G, K, N]``. Each block is its
+    own tgmm on the matching columns of dY, so no op splits the (large) dW:
+    slicing dY's columns fuses into its quantization."""
+    (dlhs_tm, dlhs_tk, dlhs_tn), (drhs_tm, drhs_tk, drhs_tn) = (
+        dlhs_tiling,
+        drhs_tiling,
+    )
+    num_groups, k_dim, n_dim = rhs_q.shape
+    dout = _zero_rows_outside_groups(dout, group_sizes)
+    amax = jnp.max(jnp.abs(dout.astype(jnp.float32)))
+    dout_scale = fp8_scale.scale_from_amax(amax, BWD_DTYPE)
+    fmax = float(jnp.finfo(BWD_DTYPE).max)
+    dout_q = jnp.clip(dout.astype(jnp.float32) / dout_scale, -fmax, fmax).astype(
+        BWD_DTYPE
+    )
+    # Each GEMM's output scale is dY's times its other operand's static one.
+    out_scale = dout_scale * STATIC_SCALE
+    grad_lhs = call_named(
+        tokamax_gmm.gmm,
+        "fp8_moe_gmm_dlhs",
+        tokamax_gmm.QArray(qvalue=dout_q, scale=_row_scale(dout.shape[0], out_scale)),
+        rhs_q,
+        group_sizes,
+        precision=_PRECISION,
+        out_dtype=dout.dtype,
+        tiling=_resolve((dlhs_tm, dlhs_tk, dlhs_tn), n_dim, k_dim),
+        transpose_rhs=True,
+    )
+    split_n = n_dim // num_splits
+    lhs_t = jnp.swapaxes(lhs_q, 0, 1)
+    grad_rhs = tuple(
+        call_named(
+            tokamax_gmm.tgmm,
+            "fp8_moe_tgmm_drhs",
+            lhs_t,
+            tokamax_gmm.QArray(
+                qvalue=dout_q[:, i * split_n : (i + 1) * split_n],
+                scale=jnp.broadcast_to(out_scale.reshape(1, 1), (1, split_n)),
+            ),
+            group_sizes,
+            precision=_PRECISION,
+            out_dtype=dout.dtype,
+            tiling=_resolve((drhs_tm, drhs_tk, drhs_tn), k_dim, split_n),
+            num_actual_groups=num_groups,
+        )
+        for i in range(num_splits)
+    )
+    return grad_lhs, *grad_rhs
+
+
+@pallas.jax_op("tt_experts::fp8_grouped_mm_qrhs_bwd")
+def _fp8_grouped_mm_qrhs_bwd(
+    dout: jax.Array,
+    lhs_q: jax.Array,
+    rhs_q: jax.Array,
+    group_sizes: jax.Array,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array]:
+    return _qrhs_bwd(
+        dout,
+        lhs_q,
+        rhs_q,
+        group_sizes,
+        (dlhs_tm, dlhs_tk, dlhs_tn),
+        (drhs_tm, drhs_tk, drhs_tn),
+    )
+
+
+@pallas.jax_op("tt_experts::fp8_grouped_mm_qrhs_bwd_paired")
+def _fp8_grouped_mm_qrhs_bwd_paired(
+    dout: jax.Array,
+    lhs_q: jax.Array,
+    rhs_q: jax.Array,
+    group_sizes: jax.Array,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_qrhs_bwd` for a ``[W_a | W_b]`` weight of equal halves, returning
+    ``(dlhs, dW_a, dW_b)``. A torch-side split of the joint dW is a strided
+    view that functionalization turns into full copies, and a split of it
+    here is one more copy of dW."""
+    return _qrhs_bwd(
+        dout,
+        lhs_q,
+        rhs_q,
+        group_sizes,
+        (dlhs_tm, dlhs_tk, dlhs_tn),
+        (drhs_tm, drhs_tk, drhs_tn),
+        num_splits=2,
+    )
+
+
+class _Fp8QuantizedRhsGroupedMm(torch.autograd.Function):
+    """FP8 GEMM on a pre-quantized weight. The weight's gradient goes to
+    ``reduce_grad``, which turns the full ``dW`` into gradients for
+    ``weight_inputs`` -- e.g. FSDP's reduce-scatter and per-shard split."""
+
+    @staticmethod
+    def forward(ctx, lhs, rhs_q, group_sizes, static, reduce_grad, *weight_inputs):
+        if len(weight_inputs) not in (1, 2):
+            raise ValueError("FP8 expert GEMM takes one weight or an equal pair")
+        ctx.num_weights = len(weight_inputs)
+        out, lhs_q = _fp8_grouped_mm_qrhs_fwd(lhs, rhs_q, group_sizes, *static[:3])
+        ctx.save_for_backward(lhs_q, rhs_q, group_sizes)
+        ctx.bwd_static = static[3:]
+        ctx.reduce_grad = reduce_grad
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if ctx.num_weights == 2:
+            grad_lhs, *grad_rhs = _fp8_grouped_mm_qrhs_bwd_paired(
+                grad_out, *ctx.saved_tensors, *ctx.bwd_static
+            )
+        else:
+            grad_lhs, grad_rhs = _fp8_grouped_mm_qrhs_bwd(
+                grad_out, *ctx.saved_tensors, *ctx.bwd_static
+            )
+            grad_rhs = [grad_rhs]
+        return (
+            grad_lhs,
+            None,
+            None,
+            None,
+            None,
+            *ctx.reduce_grad(tuple(grad_rhs)),
+        )
+
+
+def fp8_quantize_expert_weight(rhs: torch.Tensor) -> torch.Tensor:
+    """``rhs`` in e4m3 with the static scale. Elementwise, so a shard
+    quantizes exactly as the gathered weight would. Not differentiable."""
+    with torch.no_grad():
+        return _fp8_quantize_expert_weight(rhs)
+
+
+def fp8_qrhs_segment_matmul(
+    lhs: torch.Tensor,
+    rhs_q: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    weight_inputs: tuple[torch.Tensor, ...],
+    reduce_grad,
+    fwd_tiling: Tiling = (512, 0, 0),
+    dlhs_tiling: Tiling = (512, 0, 0),
+    drhs_tiling: Tiling = (512, 0, 0),
+) -> torch.Tensor:
+    """``lhs[M, K] @ W[G, K, N]`` per group with MaxText `fp8_full` numerics,
+    ``W`` given as `fp8_quantize_expert_weight`'s e4m3 values (e.g. gathered
+    from quantized FSDP shards).
+
+    ``weight_inputs`` are the one or two equal-width tensors W was concatenated
+    from on its last dim (e.g. W1's and W3's FSDP shards), which receive its
+    gradient: ``reduce_grad`` maps the full BF16 dW of each -- split inside
+    the backward kernel op -- to that input's gradient. No tensor of W's full
+    shape enters autograd.
+    Rows past ``sum(group_sizes)`` are ignored. Tilings are as in
+    `fp8_segment_matmul_pallas_2d`.
+    """
+    return _Fp8QuantizedRhsGroupedMm.apply(
+        lhs,
+        rhs_q,
+        _int32(group_sizes),
+        _static(fwd_tiling, dlhs_tiling, drhs_tiling),
+        reduce_grad,
+        *weight_inputs,
+    )
+
+
 __all__ = [
+    "fp8_qrhs_segment_matmul",
+    "fp8_quantize_expert_weight",
     "fp8_gmm_bwd",
     "fp8_gmm_bwd_quantized",
     "fp8_gmm_fwd",
