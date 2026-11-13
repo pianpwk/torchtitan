@@ -946,3 +946,42 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full() -> TpuGraphTrainer.Config:
   config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_fused_grad_ag()
   _use_fp8_static_dense(config, ("attention.wq_a", "attention.wkv_a"))
   return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full_defer_norms() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._fp8_full`` reducing the norm-weight gradients (KiB) in the last
+  backward executable: in each layer they are a synchronous all-reduce that
+  stalls the TensorCore until the SparseCore queue drains."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full()
+  config.compile.graph_split.backward_defer_reduction_max_bytes = 1 << 20
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full_bwd_prefetch() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._fp8_full`` issuing each backward layer's FP8 expert-bank gathers in
+  the previous backward executable (only those: smaller gathers stay, see
+  ``prefetch_min_gather_bytes``). With Splash saved for backward, the bank
+  gathers have no recompute left to hide under: 4.56 -> 4.42 s / step (45.2%
+  MFU). (Prefetching every gather, norm weights included, was slower.)"""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full()
+  split = config.compile.graph_split
+  split.pipeline_kinds = ("ag", "rs")
+  split.expert_all_gathers_under_splash = False
+  split.prefetch_min_gather_bytes = 256 << 20
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_best() -> TpuGraphTrainer.Config:
+  """``..._fp8_full_bwd_prefetch`` with the norm-weight gradient reductions
+  deferred to the last backward executable (see ``..._fp8_full_defer_norms``).
+
+  4.42-4.46 s / step (45.2% MFU), the same as ``..._fp8_full_bwd_prefetch``;
+  50-step loss 2.842 vs 2.838 for ``..._tuned_bf16_adam_rs_deadlines``
+  (6.60 s / step)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_full_bwd_prefetch()
+  config.compile.graph_split.backward_defer_reduction_max_bytes = 1 << 20
+  return config
