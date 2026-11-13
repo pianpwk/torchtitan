@@ -530,6 +530,14 @@ def deepseek_v3_671b_smoke_mla_ep4_fp8() -> TpuGraphTrainer.Config:
   return config
 
 
+def deepseek_v3_671b_smoke_mla_ep4_fp8_dense() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep4_fp8_tokens`` with FP8 static-scale
+  dense linears (``_use_fp8_static_dense``)."""
+  config = deepseek_v3_671b_smoke_mla_ep4_fp8_tokens()
+  _use_fp8_static_dense(config)
+  return config
+
+
 def deepseek_v3_671b_smoke_mla_ep4_fp8_tokens() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_smoke_mla_ep4_fp8`` with FP8 token all-gathers;
   loss should match it bit for bit."""
@@ -725,6 +733,25 @@ def _use_fp8_token_all_gather(config: TPUTrainerConfig) -> None:
     dispatcher.fp8_token_all_gather = True
 
 
+# Dense linears that MaxText's DeepSeek-V3 recipe runs in FP8: the MLA
+# output and q up-projections and the dense and shared-expert MLPs. The k/v
+# up-projection, the small down-projections, the router and lm_head stay BF16.
+_FP8_DENSE_FQNS = ("attention.wo", "attention.wq_b", "feed_forward", "shared_experts")
+
+
+def _use_fp8_static_dense(
+    config: TPUTrainerConfig, fqns: tuple[str, ...] = _FP8_DENSE_FQNS
+) -> None:
+  """FP8 dense linears with MaxText's static-scale numerics
+  (``Fp8StaticLinear``)."""
+  # Imported here so that other recipes do not load the FP8 kernels.
+  from torchtitan.experiments.tpu.components.fp8_static_linear import Fp8StaticLinearConverter  # pylint: disable=g-import-not-at-top
+
+  config.model_spec.model = Fp8StaticLinearConverter(
+      Fp8StaticLinearConverter.Config(fqns=fqns)
+  ).convert(config.model_spec.model)
+
+
 def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_4x4x4_mla_ep8_cf125_by_layer_prefetch`` tuned:
   7.83 s / step, 25.5% MFU (vs 10.0 s, 19.9%).
@@ -836,4 +863,27 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac() -> TpuGraphTrainer.Co
   config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v3()
   config.compile.memory_policy = "tpu_selective_and_offload"
   config.compile.save_regions = ("attention.inner_attention", "moe.routing")
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac_fp8_dense() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._fp8_experts_sac`` with FP8 static-scale dense linears
+  (``_use_fp8_static_dense``): 5.17 -> 4.92 s / step (40.6% MFU)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac()
+  _use_fp8_static_dense(config)
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac_fp8_dense_down() -> (
+    TpuGraphTrainer.Config
+):
+  """``..._fp8_experts_sac_fp8_dense`` with the MLA down-projections (wq_a,
+  wkv_a) in FP8 too: 4.92 -> 4.83 s / step. (Also converting the k/v up-projection wkv_b, which
+  MaxText keeps BF16, measured 4.86 s with a visibly higher loss.)"""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac()
+  _use_fp8_static_dense(
+      config, _FP8_DENSE_FQNS + ("attention.wq_a", "attention.wkv_a")
+  )
   return config
