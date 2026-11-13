@@ -827,3 +827,13 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v3() -> TpuGraphTrainer.Con
   config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v2()
   _use_fp8_token_all_gather(config)
   return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_sac() -> TpuGraphTrainer.Config:
+  """``..._fp8_experts_v3`` saving each layer's Splash output and routing for
+  backward instead of recomputing them (MaxText remats far less than our
+  full remat): 5.61 -> 5.17 s / step (38.6% MFU)."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v3()
+  config.compile.memory_policy = "tpu_selective_and_offload"
+  config.compile.save_regions = ("attention.inner_attention", "moe.routing")
+  return config
