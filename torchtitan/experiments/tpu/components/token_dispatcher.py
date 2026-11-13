@@ -264,6 +264,10 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     # gradients) are kept; only which expert each route goes to is forced.
     # Isolates the transport and kernel cost from routing skew.
     debug_force_balanced_routing: bool = False
+    # Ring-of-Experts only: all-gather the routed tokens in FP8 with the FP8
+    # expert GEMMs' static scale (see ``ring_of_experts_dispatch``). Exact
+    # for ``TpuGroupedExperts.Config.use_fp8_grouped_mm`` experts.
+    fp8_token_all_gather: bool = False
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -273,6 +277,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     self.ep_transport = config.ep_transport
     self.capacity_factor = config.capacity_factor
     self.debug_force_balanced_routing = config.debug_force_balanced_routing
+    self.fp8_token_all_gather = config.fp8_token_all_gather
 
   @property
   def uses_ring_of_experts(self) -> bool:
@@ -334,6 +339,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         num_experts=self.num_experts,
         ep_mesh=self.ep_mesh,
         capacity_factor=self.capacity_factor,
+        fp8_tokens=self.fp8_token_all_gather,
     )
 
   def combine(

@@ -530,6 +530,14 @@ def deepseek_v3_671b_smoke_mla_ep4_fp8() -> TpuGraphTrainer.Config:
   return config
 
 
+def deepseek_v3_671b_smoke_mla_ep4_fp8_tokens() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_smoke_mla_ep4_fp8`` with FP8 token all-gathers;
+  loss should match it bit for bit."""
+  config = deepseek_v3_671b_smoke_mla_ep4_fp8()
+  _use_fp8_token_all_gather(config)
+  return config
+
+
 def deepseek_v3_671b_smoke_mla_ep4() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_smoke_mla_ep8`` at 4-way EP: the BF16 reference for
   ``deepseek_v3_671b_smoke_mla_ep4_fp8``."""
@@ -708,6 +716,15 @@ def _use_fp8_experts(config: TPUTrainerConfig) -> None:
     experts.use_fp8_grouped_mm = True
 
 
+def _use_fp8_token_all_gather(config: TPUTrainerConfig) -> None:
+  """Ring-of-Experts token all-gathers in FP8; exact with
+  ``_use_fp8_experts``."""
+  for _, dispatcher, _, _ in config.model_spec.model.traverse(
+      TpuAllToAllTokenDispatcher.Config
+  ):
+    dispatcher.fp8_token_all_gather = True
+
+
 def deepseek_v3_671b_4x4x4_mla_ep8_cf125_tuned() -> TpuGraphTrainer.Config:
   """``deepseek_v3_671b_4x4x4_mla_ep8_cf125_by_layer_prefetch`` tuned:
   7.83 s / step, 25.5% MFU (vs 10.0 s, 19.9%).
@@ -801,4 +818,12 @@ def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v2() -> TpuGraphTrainer.Con
       TpuGroupedExperts.Config
   ):
     experts.fp8_bf16_gradient_reduce_scatter = True
+  return config
+
+
+def deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v3() -> TpuGraphTrainer.Config:
+  """``..._fp8_experts_v2`` with FP8 Ring-of-Experts token all-gathers:
+  5.80 -> 5.61 s / step, loss bit-identical."""
+  config = deepseek_v3_671b_4x4x4_mla_ep8_cf125_fp8_experts_v2()
+  _use_fp8_token_all_gather(config)
   return config

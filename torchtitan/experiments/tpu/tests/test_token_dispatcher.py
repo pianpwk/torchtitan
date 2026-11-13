@@ -400,6 +400,7 @@ def test_ep_dispatch_uses_ring_of_experts_by_default():
         num_experts=4,
         ep_mesh=mock.sentinel.ep_mesh,
         capacity_factor=1.5,
+        fp8_tokens=False,
     )
 
 

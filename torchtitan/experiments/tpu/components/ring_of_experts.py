@@ -122,8 +122,33 @@ def _packed_stable_argsort(keys: torch.Tensor, max_key: int) -> torch.Tensor:
   return torch.sort(packed).values & ((1 << pos_bits) - 1)
 
 
+def _fp8_static_quantize(x: torch.Tensor) -> torch.Tensor:
+  """``x`` in e4m3 with the FP8 expert GEMMs' static scale."""
+  from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import STATIC_SCALE  # pylint: disable=g-import-not-at-top
+
+  fmax = torch.finfo(torch.float8_e4m3fn).max
+  return (
+      (x.float() * (1.0 / STATIC_SCALE))
+      .clamp(-fmax, fmax)
+      .to(torch.float8_e4m3fn)
+  )
+
+
+def _fp8_static_dequantize(x_q: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+  from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import STATIC_SCALE  # pylint: disable=g-import-not-at-top
+
+  return (x_q.float() * STATIC_SCALE).to(dtype)
+
+
 class _GatherTokens(torch.autograd.Function):
   """EP all-gather of local tokens, then gather this rank's expert rows.
+
+  With ``fp8``, the tokens travel as e4m3 with the FP8 expert GEMMs' static
+  scale (half the bytes) and are dequantized once gathered. The scale is a
+  power of two, so the GEMM's own quantization of the rows recovers the same
+  e4m3 values exactly. (Viewing the FP8 bytes as BF16 pairs to keep the BF16
+  row-copy kernel lowers to slow relayouts on TPU, so the dequantization runs
+  on the gathered tokens instead.)
 
   Backward is the transpose: an FP32 per-token sum of the row gradients, then
   a reduce-scatter back to the token owners.
@@ -131,16 +156,24 @@ class _GatherTokens(torch.autograd.Function):
 
   @staticmethod
   def forward(ctx, x_TD, token_ids_R, valid_count_1, reduce_metadata, top_k,
-              ep_mesh):
+              ep_mesh, fp8):
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(valid_count_1, *reduce_metadata)
     ctx.top_k = top_k
     ctx.ep_mesh = ep_mesh
     ctx.local_shape = tuple(x_TD.shape)
     # Relayout the local shard, not the ep_size-times larger gathered tensor.
-    x_global_T3 = funcol.all_gather_tensor(
-        to_token_3d(x_TD), gather_dim=0, group=ep_mesh
-    )
+    if fp8:
+      x_global_T3 = _fp8_static_dequantize(
+          funcol.all_gather_tensor(
+              to_token_3d(_fp8_static_quantize(x_TD)), gather_dim=0, group=ep_mesh
+          ),
+          x_TD.dtype,
+      )
+    else:
+      x_global_T3 = funcol.all_gather_tensor(
+          to_token_3d(x_TD), gather_dim=0, group=ep_mesh
+      )
     ctx.num_out_tokens = int(x_global_T3.shape[0])
     return ragged_gather(x_global_T3, token_ids_R, valid_count_1)
 
@@ -148,7 +181,7 @@ class _GatherTokens(torch.autograd.Function):
   @once_differentiable
   def backward(ctx, grad_RD):
     if grad_RD is None or not ctx.needs_input_grad[0]:
-      return (None,) * 6
+      return (None,) * 7
     valid_count_1, *reduce_metadata = ctx.saved_tensors
     grad_global_T3 = ragged_gather_reduce(
         grad_RD,
@@ -161,7 +194,7 @@ class _GatherTokens(torch.autograd.Function):
     grad_T3 = funcol.reduce_scatter_tensor(
         grad_global_T3, "sum", scatter_dim=0, group=ctx.ep_mesh
     )
-    return (grad_T3.reshape(ctx.local_shape),) + (None,) * 5
+    return (grad_T3.reshape(ctx.local_shape),) + (None,) * 6
 
 
 class _GatherRoutes(torch.autograd.Function):
@@ -313,6 +346,7 @@ def ring_of_experts_dispatch(
     num_experts: int,
     ep_mesh,
     capacity_factor: float | None,
+    fp8_tokens: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, RingOfExpertsMetadata]:
   """Gather this EP rank's expert rows from all ranks of `ep_mesh`.
 
@@ -323,6 +357,10 @@ def ring_of_experts_dispatch(
     num_experts: number of global experts, divisible by the EP degree.
     ep_mesh: 1-D EP device mesh.
     capacity_factor: see `ring_of_experts_capacity`.
+    fp8_tokens: all-gather the tokens in e4m3 with the FP8 expert GEMMs'
+      static scale (``TpuGroupedExperts.Config.use_fp8_grouped_mm``). The
+      returned rows are those values dequantized, which those GEMMs quantize
+      back exactly; other consumers see the FP8 rounding.
 
   Returns:
     `(routed_RD, group_sizes_e, metadata)`: expert-major rows for the local
@@ -384,7 +422,8 @@ def ring_of_experts_dispatch(
     )
 
   routed_RD = _GatherTokens.apply(
-      x_TD, token_ids_R, valid_count_1, reduce_metadata, top_k, ep_mesh
+      x_TD, token_ids_R, valid_count_1, reduce_metadata, top_k, ep_mesh,
+      fp8_tokens,
   )
   scores_R = _SelectScores.apply(scores_N, slots_R, perm_N, valid_count_1)
   metadata = RingOfExpertsMetadata(
