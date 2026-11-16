@@ -277,6 +277,13 @@ class GraphSplitter:
       raise ValueError(
           "forward_layers_per_executable must be -1 or positive"
       )
+    if split_config.forward_prefetch_parameter_gathers and (
+        not enabled or split_config.forward_layers_per_executable < 1
+    ):
+      raise ValueError(
+          "forward_prefetch_parameter_gathers requires a split forward graph "
+          "(compile.graph_split.enabled and forward_layers_per_executable > 0)"
+      )
     if split_config.backward_partition_mode not in (
         "none",
         "by_layer",
@@ -355,6 +362,10 @@ class GraphSplitter:
           split.forward_graph,
           self.config.forward_layers_per_executable,
           isolate_prefix=self.config.forward_isolate_prefix,
+          prefetch_parameter_gathers=(
+              self.config.forward_prefetch_parameter_gathers
+          ),
+          prefetch_min_gather_bytes=self.config.prefetch_min_gather_bytes,
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
@@ -558,13 +569,29 @@ def _preserves_numel(view: torch.fx.Node) -> bool:
   )
 
 
+def _gathered_bytes(launch: torch.fx.Node) -> int:
+  """Bytes of a collective's output."""
+  val = launch.meta["val"]
+  values = val if isinstance(val, (tuple, list)) else (val,)
+  return sum(v.numel() * v.element_size() for v in values)
+
+
 def split_forward_graph_by_layer(
     gm: torch.fx.GraphModule,
     layers_per_executable: int,
     *,
     isolate_prefix: bool = False,
+    prefetch_parameter_gathers: bool = False,
+    prefetch_min_gather_bytes: int = 0,
 ) -> PartitionedGraph:
-  """Split forward into ascending, complete transformer-layer ranges."""
+  """Split forward into ascending, complete transformer-layer ranges.
+
+  With ``prefetch_parameter_gathers``, each parameter all-gather chain (fed
+  only by graph inputs, see ``classify_fsdp_roles``) moves to the executable
+  before the one holding its first consumer, so XLA can overlap it with that
+  executable's compute. Chains whose consumer is in the first executable stay
+  put.
+  """
   if layers_per_executable < 1:
     raise ValueError(
         "layers_per_executable must be at least 1, got "
@@ -574,8 +601,21 @@ def split_forward_graph_by_layer(
   body_nodes = _body_nodes(gm)
   ao_nodes = {node for node in body_nodes if is_ao_transfer(node)}
   view_nodes = {node for node in body_nodes if _is_view(node)}
+  # Parameter gather chains, keyed by launch; placed after the walk below.
+  gather_chains: dict[torch.fx.Node, set[torch.fx.Node]] = {}
+  if prefetch_parameter_gathers:
+    chains = collect_collective_chains(gm)
+    gather_chains = {
+        launch: chains[launch]
+        for launch, role in classify_fsdp_roles(chains).items()
+        if role == "ag"
+        and _gathered_bytes(launch) >= prefetch_min_gather_bytes
+    }
+  gather_chain_nodes: set[torch.fx.Node] = set().union(
+      *gather_chains.values()
+  )
   node_layer_ids, layer_nodes = _group_nodes_by_layer(
-      body_nodes, excluded=ao_nodes | view_nodes
+      body_nodes, excluded=ao_nodes | view_nodes | gather_chain_nodes
   )
   layer_ids = sorted(layer_nodes)
   if not layer_ids:
@@ -609,7 +649,7 @@ def split_forward_graph_by_layer(
   pending_collectives: dict[torch.fx.Node, int] = {}
   spmd_safe_depth = 0
   for node in body_nodes:
-    if node in ao_nodes:
+    if node in ao_nodes or node in gather_chain_nodes:
       continue
     layer_id = node_layer_ids[node]
     starts_layer = layer_id >= 0 and layer_id != current_layer_id
@@ -655,6 +695,27 @@ def split_forward_graph_by_layer(
     )
   if spmd_safe_depth:
     raise ValueError("Unbalanced TPU SPMD safe-region entry")
+
+  # Each parameter gather runs one executable ahead of its first consumer. Its
+  # chain reads only graph inputs, so moving it earlier keeps every dependency
+  # forward.
+  num_prefetched = 0
+  for launch, chain_nodes in gather_chains.items():
+    _, users = chain_boundary(chain_nodes)
+    consumer = min(
+        (partition_map[user] for user in users if user in partition_map),
+        default=0,
+    )
+    partition = max(consumer - 1, 0)
+    num_prefetched += partition < consumer
+    partition_map.update(dict.fromkeys(chain_nodes, partition))
+  if gather_chains:
+    logger.info(
+        "Prefetching %d of %d forward parameter all-gathers one executable "
+        "ahead",
+        num_prefetched,
+        len(gather_chains),
+    )
 
   # A view left with its producer layer becomes a second executable output
   # beside its base, which XLA must materialize as a copy. Place each
@@ -711,9 +772,10 @@ def _collect_backward_collective_owners(
 
   A parameter gather is owned by the layer of its first consumer, a gradient
   reduction by the layer that produced its input (``classify_fsdp_roles``).
-  Collectives with neither role stay with their inputs. An all-gather or
-  reduce-scatter of a ``pipelined_kinds`` kind that has neither role raises,
-  since pipelining it as FSDP traffic would be wrong.
+  Collectives with neither role stay with their inputs and are never
+  pipelined: activation collectives such as expert-parallel token exchanges
+  (Ring-of-Experts' all-gather / reduce-scatter and their transposes) depend on
+  the layer's compute.
   """
   owners: dict[torch.fx.Node, tuple[str, int]] = {}
   for launch, role in classify_fsdp_roles(collective_chains).items():
@@ -721,9 +783,10 @@ def _collect_backward_collective_owners(
       if (is_gather(launch) and "ag" in pipelined_kinds) or (
           is_reduce_scatter(launch) and "rs" in pipelined_kinds
       ):
-        raise ValueError(
-            f"Backward collective {launch.name!r} is neither a parameter "
-            "gather nor a gradient reduction, so fsdp_pipeline cannot move it"
+        logger.debug(
+            "Backward collective %s is neither a parameter gather nor a "
+            "gradient reduction; fsdp_pipeline leaves it in place",
+            launch.name,
         )
       continue
     inputs, users = chain_boundary(collective_chains[launch])

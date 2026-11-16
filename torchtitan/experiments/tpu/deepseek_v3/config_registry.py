@@ -345,20 +345,23 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
 
 
 def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
-  """DeepSeek-V3 671B on a TPU7x 4x4x4 slice (BF16).
+  """DeepSeek-V3 671B on a TPU7x 4x4x4 slice: 8.9 s / step, 22.4% MFU (BF16).
 
-  ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus, as in MaxText's
-  DeepSeek-V3 recipe:
+  ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus:
 
-  * Routed experts over 8-way Ring-of-Experts EP (each EP group is one host's
-    4 chips, 2 cores each) times 16-way expert FSDP; dense weights stay FSDP
-    over all 128 ranks. Each EP rank's routed rows are capped at 1.25x the
-    routes it expects (routes past it are dropped).
-  * BF16 gradient reductions and BF16 Adam moments (FP32 parameters kept).
+  * As in MaxText's DeepSeek-V3 recipe: routed experts over 8-way
+    Ring-of-Experts EP (each EP group is one host's 4 chips, 2 cores each)
+    times 16-way expert FSDP, dense weights FSDP over all 128 ranks; each EP
+    rank's routed rows capped at 1.25x the routes it expects (routes past it
+    are dropped); BF16 gradient reductions and BF16 Adam moments (FP32
+    parameters kept).
   * Routing scores applied before W2 (``scale_before_down_proj``), so the
     backward does not recompute the W2 forward. Same math, different rounding.
-
-  Each layer's gradient reductions run in its own backward executable.
+  * Forward: each layer's parameter all-gathers are issued in the previous
+    executable. Backward: each layer's gradient reduce-scatters are waited on
+    in the next executable. The latency-hiding layer scheduler is off: it
+    pairs the deferred reduce-scatter waits with fusions right after the
+    forward gathers, exposing them.
   """
   config = _deepseek_v3_4x4x4("671B", tokens_per_rank=8192)
   config.optimizer.implementation = "fused_opt_states_bf16"
@@ -389,9 +392,16 @@ def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
     experts.pallas_grouped_mm_w2_tgmm_tiling = (512, 2048, 1024)
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 1024)
 
-  config.compile.graph_split.backward_partition_mode = "by_layer"
+  split = config.compile.graph_split
+  split.forward_prefetch_parameter_gathers = True
+  split.backward_partition_mode = "fsdp_pipeline"
+  split.pipeline_kinds = ("rs",)
+  # The norm-weight gathers (KiB) stay in place: moved ahead they queue
+  # behind the expert gathers as synchronous all-reduces (~10 ms / layer).
+  split.prefetch_min_gather_bytes = 1 << 20
   config.libtpu_init_flags = tpu_flags.merge_flags(
       config.libtpu_init_flags,
       tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+      xla_tpu_enable_latency_hiding_layer_scheduler=tpu_flags.REMOVE,
   )
   return config

@@ -87,6 +87,17 @@ class GraphSplitterConfig:
   forward_layers_per_executable: int = -1
   # Assign non-layer work before the first transformer layer to its own partition.
   forward_isolate_prefix: bool = False
+  # Issue each forward executable's parameter all-gathers (FSDP weight gathers
+  # fed only by graph inputs) in the previous executable, so they overlap that
+  # executable's compute instead of being waited on at the top of their own.
+  # Costs one executable's gathered parameters of extra HBM. Requires
+  # ``forward_layers_per_executable > 0``.
+  forward_prefetch_parameter_gathers: bool = False
+  # Parameter all-gathers with a smaller gathered output stay with their layer
+  # under ``forward_prefetch_parameter_gathers``. Moved ahead, tiny gathers (norm weights) queue behind the large
+  # prefetched ones and, lowered as synchronous all-reduces, stall the
+  # TensorCore until the queue drains; in place they cost almost nothing.
+  prefetch_min_gather_bytes: int = 0
   # Backward subdivision applied after the top-level forward/backward split.
   # ``by_layer`` groups adjacent layer backward computations and co-locates any
   # attributable FSDP collective chains with their layer. ``fsdp_pipeline``

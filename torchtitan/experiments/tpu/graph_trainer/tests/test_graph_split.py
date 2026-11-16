@@ -1,3 +1,4 @@
+from collections import defaultdict
 import itertools
 from types import SimpleNamespace
 from unittest import mock
@@ -849,6 +850,50 @@ class GraphSplitTest(absltest.TestCase):
         )
         self.assertEqual(chunked.layer_to_partition, expected)
 
+    # Prefetch: [prefix,AG0] [L0,AG1] [L1,AG2] [L2,AG3] [L3]. Each layer's
+    # parameter gathers run one executable before the layer.
+    for graph in (forward, dim_split.forward_graph):
+      with self.subTest(direction="forward", prefetch=True):
+        chunked = split_forward_graph_by_layer(
+            graph, 1, isolate_prefix=True, prefetch_parameter_gathers=True
+        )
+        self.assertEqual(
+            chunked.layer_to_partition, {0: 1, 1: 2, 2: 3, 3: 4}
+        )
+        self._assert_collective_chains_are_atomic(
+            graph, chunked.partition_map
+        )
+        chains = collectives_lib.collect_collective_chains(graph)
+        gathered_layers = defaultdict(set)
+        for launch, nodes in chains.items():
+          if not collectives_lib.is_gather(launch):
+            continue
+          _, users = collectives_lib.chain_boundary(nodes)
+          layer = min(
+              chunked.layer_to_partition[i]
+              for i in map(_get_layer_id, users)
+              if i >= 0
+          )
+          gathered_layers[layer].add(chunked.partition_map[launch])
+        self.assertEqual(
+            dict(gathered_layers), {1: {0}, 2: {1}, 3: {2}, 4: {3}}
+        )
+        # Gathers below the size threshold stay with their layer.
+        in_place = split_forward_graph_by_layer(
+            graph,
+            1,
+            isolate_prefix=True,
+            prefetch_parameter_gathers=True,
+            prefetch_min_gather_bytes=1 << 40,
+        )
+        unprefetched = split_forward_graph_by_layer(
+            graph, 1, isolate_prefix=True
+        )
+        self.assertEqual(
+            {n.name: p for n, p in in_place.partition_map.items()},
+            {n.name: p for n, p in unprefetched.partition_map.items()},
+        )
+
     by_layer_one = (1, 2, 3, 4)
     by_layer_three = (1, 1, 1, 2)
     backward_scenarios = (
@@ -942,19 +987,17 @@ class GraphSplitTest(absltest.TestCase):
     )
 
     # A reduce-scatter that is not a gradient reduction (like a TP activation
-    # reduce-scatter): truncating a reduction's chain to its launch makes its
-    # consumer ordinary compute. It stays with its inputs unless RS are
-    # pipelined, which cannot move it.
+    # reduce-scatter or an EP token exchange): truncating a reduction's chain
+    # to its launch makes its consumer ordinary compute. It stays with its
+    # inputs, whichever kinds are pipelined.
     chains = collectives_lib.collect_collective_chains(backward)
     launch = next(n for n in chains if collectives_lib.is_reduce_scatter(n))
     chains[launch] = {launch}
-    for pipelined_kinds in ((), ("ag",)):
+    for pipelined_kinds in ((), ("ag",), ("rs",), ("ag", "rs")):
       owners = graph_split_lib._collect_backward_collective_owners(
           chains, 4, pipelined_kinds
       )
       self.assertNotIn(launch, owners)
-    with self.assertRaisesRegex(ValueError, "neither a parameter gather"):
-      graph_split_lib._collect_backward_collective_owners(chains, 4, ("rs",))
     with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
       split_backward_graph_by_layer(
           backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=()
@@ -1141,8 +1184,7 @@ class GraphSplitTest(absltest.TestCase):
     self.assertNotIn(cast, chain)
     with self.assertRaisesRegex(
         ValueError,
-        "reverse dependency|neither a parameter gather nor a gradient"
-        " reduction",
+        "reverse dependency|requires AG and RS ownership for every layer",
     ):
       split_backward_graph_by_layer(gm, n_layers=2, pipeline_collectives=True)
 
