@@ -363,7 +363,11 @@ def ring_of_experts_dispatch(
       slots_R = torch.nn.functional.pad(perm_N, (0, max_R - num_global_routes))
     token_ids_R = slots_R // top_k
     reduce_metadata = ragged_gather_reduce_metadata(
-        token_ids_R, valid_count_1, top_k=top_k, num_out_tokens=num_out_tokens
+        token_ids_R,
+        valid_count_1,
+        top_k=top_k,
+        num_out_tokens=num_out_tokens,
+        row_bytes=x_TD.shape[-1] * x_TD.element_size(),
     )
 
   routed_RD = _GatherTokens.apply(
