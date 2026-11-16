@@ -390,6 +390,47 @@ class TpuRoutedExperts(RoutedExperts):
           " scale_before_down_proj removes; enable only one"
       )
 
+  def _scaled_forward(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+  ) -> torch.Tensor:
+    """Dispatch, experts with the scores applied before W2, combine."""
+    routed_input_RD, num_tokens_per_expert_e, metadata = (
+        self.token_dispatcher.dispatch(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+        )
+    )
+    if isinstance(metadata, RingOfExpertsMetadata):
+      with maybe_set_sparse_mesh():
+        routed_output_RD = self.inner_experts(
+            routed_input_RD,
+            num_tokens_per_expert_e,
+            row_scale_R=metadata.scores_R,
+        )
+      return ring_of_experts_combine(routed_output_RD, metadata, pre_scaled=True)
+    if not isinstance(metadata, LocalDispatchMetadata):
+      raise ValueError(
+          "scale_before_down_proj requires EP=1 local dispatch or"
+          " Ring-of-Experts"
+      )
+    with maybe_set_sparse_mesh():
+      routed_output_RD = self.inner_experts(
+          routed_input_RD,
+          num_tokens_per_expert_e,
+          row_scale_R=metadata.topk_scores_experts_sorted_N,
+      )
+    return stable_grouped_reduce(
+        routed_output_RD,
+        metadata.token_indices_experts_sorted_N,
+        self.token_dispatcher.top_k,
+    )
+
   def forward(
       self,
       x_TD: torch.Tensor,
@@ -397,29 +438,9 @@ class TpuRoutedExperts(RoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
-    if self.scale_before_down_proj:
-      routed_input_RD, num_tokens_per_expert_e, metadata = (
-          self.token_dispatcher.dispatch(
-              x_TD,
-              topk_scores_TK,
-              topk_expert_ids_TK,
-              num_local_tokens_per_expert_E,
-          )
-      )
-      if not isinstance(metadata, LocalDispatchMetadata):
-        raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
-      with maybe_set_sparse_mesh():
-        routed_output_RD = self.inner_experts(
-            routed_input_RD,
-            num_tokens_per_expert_e,
-            row_scale_R=metadata.topk_scores_experts_sorted_N,
-        )
-      return stable_grouped_reduce(
-          routed_output_RD,
-          metadata.token_indices_experts_sorted_N,
-          self.token_dispatcher.top_k,
-      )
-
+    one_chunk = (
+        self._scaled_forward if self.scale_before_down_proj else super().forward
+    )
     n = self.num_moe_token_chunks
     num_tokens = int(x_TD.shape[0])
     dispatcher = self.token_dispatcher
@@ -428,7 +449,7 @@ class TpuRoutedExperts(RoutedExperts):
         or not isinstance(dispatcher, TpuAllToAllTokenDispatcher)
         or not dispatcher.uses_ring_of_experts
     ):
-      return super().forward(
+      return one_chunk(
           x_TD,
           topk_scores_TK,
           topk_expert_ids_TK,
@@ -446,7 +467,7 @@ class TpuRoutedExperts(RoutedExperts):
       # Ring-of-Experts counts each chunk's routes from its gathered expert
       # ids, so the whole-batch counts are passed through unused.
       outs.append(
-          super().forward(
+          one_chunk(
               x_TD[rows],
               topk_scores_TK[rows],
               topk_expert_ids_TK[rows],

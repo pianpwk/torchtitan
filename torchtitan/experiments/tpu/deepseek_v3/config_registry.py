@@ -27,6 +27,7 @@ from torchtitan.experiments.tpu.components.grouped_experts import (
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
     TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
 )
@@ -354,6 +355,8 @@ def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
     over all 128 ranks. Each EP rank's routed rows are capped at 1.25x the
     routes it expects (routes past it are dropped).
   * BF16 gradient reductions and BF16 Adam moments (FP32 parameters kept).
+  * Routing scores applied before W2 (``scale_before_down_proj``), so the
+    backward does not recompute the W2 forward. Same math, different rounding.
 
   Each layer's gradient reductions run in its own backward executable.
   """
@@ -367,6 +370,10 @@ def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
   ):
     dispatcher.ep_transport = "ring_of_experts"
     dispatcher.capacity_factor = 1.25
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuRoutedExperts.Config
+  ):
+    experts.scale_before_down_proj = True
   for _, experts, _, _ in config.model_spec.model.traverse(
       TpuGroupedExperts.Config
   ):
