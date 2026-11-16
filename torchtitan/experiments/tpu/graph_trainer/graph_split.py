@@ -389,6 +389,10 @@ class GraphSplitter:
           layers_per_executable=self.config.backward_layers_per_executable,
           pipeline_collectives=mode == "fsdp_pipeline",
           pipeline_kinds=self.config.pipeline_kinds or ("ag", "rs"),
+          pipeline_min_gather_bytes=self.config.prefetch_min_gather_bytes,
+          defer_reduction_max_bytes=(
+              self.config.backward_defer_reduction_max_bytes
+          ),
           cpu_offload_prefetch_executables=(
               self.config.cpu_offload_prefetch_executables
           ),
@@ -574,6 +578,19 @@ def _gathered_bytes(launch: torch.fx.Node) -> int:
   val = launch.meta["val"]
   values = val if isinstance(val, (tuple, list)) else (val,)
   return sum(v.numel() * v.element_size() for v in values)
+
+
+def _reduced_bytes(launch: torch.fx.Node) -> int:
+  """Bytes of a reduction's (unreduced) inputs.
+
+  A reduce-scatter's output is a 1/N shard, so a large gradient can have a
+  small output; deferring it would keep the whole unreduced input alive.
+  """
+  return sum(
+      _gathered_bytes(node)
+      for node in launch.all_input_nodes
+      if isinstance(node.meta.get("val"), (torch.Tensor, tuple, list))
+  )
 
 
 def split_forward_graph_by_layer(
@@ -828,6 +845,8 @@ def split_backward_graph_by_layer(
     layers_per_executable: int = 1,
     pipeline_collectives: bool = False,
     pipeline_kinds: tuple[str, ...] = ("ag", "rs"),
+    pipeline_min_gather_bytes: int = 0,
+    defer_reduction_max_bytes: int = 0,
     cpu_offload_prefetch_executables: int = 0,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
@@ -837,6 +856,10 @@ def split_backward_graph_by_layer(
   stay with their inputs. Pipelining moves the collectives of
   ``pipeline_kinds`` and requires their ownership for every layer so it can
   safely form fill, overlap, and drain stages; the rest stay with their layer.
+  Gradient reductions whose unreduced input is smaller than
+  ``defer_reduction_max_bytes`` move to the last backward executable, so tiny
+  per-layer reductions (lowered as synchronous all-reduces) don't make every
+  layer wait for the slowest rank.
   CPU-offload reload pairs may be placed a configured number of complete child
   executables before their first consumer; zero keeps the pair in the consumer
   child.
@@ -922,8 +945,14 @@ def split_backward_graph_by_layer(
       "ag": {},
       "rs": {},
   }
+  last_partition = max(collective_partition("rs", l) for l in layer_ids)
   for launch, (kind, layer_id) in owners.items():
-    partition = collective_partition(kind, layer_id)
+    if kind == "ag" and _gathered_bytes(launch) < pipeline_min_gather_bytes:
+      partition = raw_layer_to_partition[layer_id]
+    elif kind == "rs" and _reduced_bytes(launch) < defer_reduction_max_bytes:
+      partition = last_partition
+    else:
+      partition = collective_partition(kind, layer_id)
     _assign_partition(
         partition_map,
         collective_chains[launch],

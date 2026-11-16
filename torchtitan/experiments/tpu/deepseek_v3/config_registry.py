@@ -347,8 +347,8 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
 def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   """DeepSeek-V3 671B on a TPU7x 4x4x4 slice.
 
-  FP8 (the default): 7.03 s / step, 28.4% MFU. ``fp8=False`` drops the FP8
-  parts below.
+  FP8 (the default): 6.04 s / step, 33.0% MFU. ``fp8=False`` drops the FP8
+  and selective-checkpointing parts below.
 
   ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus:
 
@@ -378,6 +378,11 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   * Dense linears MaxText runs in FP8 (``Fp8FullLinear``): the MLA q up-,
     down- and output projections, the kv down-projection and the dense and
     shared-expert MLPs. The k/v up-projection, router and lm_head stay BF16.
+  * Selective activation checkpointing: each layer's Splash output and routing
+    are saved for backward instead of recomputed. With no recompute left to
+    hide them under, each backward layer's expert-bank gathers are issued in
+    the previous backward executable, and the norm-weight gradient
+    reductions are deferred to the last one.
   """
   config = _deepseek_v3_4x4x4("671B", tokens_per_rank=8192)
   config.optimizer.implementation = "fused_opt_states_bf16"
@@ -434,6 +439,14 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   # The norm-weight gathers (KiB) stay in place: moved ahead they queue
   # behind the expert gathers as synchronous all-reduces (~10 ms / layer).
   split.prefetch_min_gather_bytes = 1 << 20
+  if fp8:
+    config.compile.memory_policy = "tpu_selective_and_offload"
+    config.compile.save_regions = ("attention.inner_attention", "moe.routing")
+    # Prefetch only the expert banks, forward and backward: smaller gathers
+    # moved ahead queue behind them as synchronous all-reduces.
+    split.pipeline_kinds = ("ag", "rs")
+    split.prefetch_min_gather_bytes = 256 << 20
+    split.backward_defer_reduction_max_bytes = 1 << 20
   config.libtpu_init_flags = tpu_flags.merge_flags(
       config.libtpu_init_flags,
       tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
