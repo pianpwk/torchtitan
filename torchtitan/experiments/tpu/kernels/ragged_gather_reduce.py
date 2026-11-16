@@ -33,8 +33,29 @@ _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
 _RAGGED_GATHER_REDUCE_TC_VMEM_LIMIT = 64 * 1024 * 1024
 
-# Rows per grid step of the gather-reduce kernel.
+# Rows per grid step of the gather-reduce kernel, for rows of up to
+# `_REDUCE_BLOCK_ROW_BYTES` bytes (D = 4096 in bf16).
 REDUCE_BLOCK_SIZE = 1792
+_REDUCE_BLOCK_ROW_BYTES = 4096 * 2
+# VMEM the row buffers of wider rows may take (num_buffers x block x row
+# bytes). The default block uses 56 MiB at D = 4096; the rest of the kernel's
+# scratch grows with the row width too, so wider rows keep 48 MiB of the 64 MiB.
+_REDUCE_BLOCK_VMEM_BYTES = 48 * 1024 * 1024
+
+
+def reduce_block_size(row_bytes: int | None = None) -> int:
+  """Rows per grid step for rows of `row_bytes` bytes (`D * itemsize`).
+
+  `REDUCE_BLOCK_SIZE` up to D = 4096 in bf16; wider rows (DeepSeek-V3's
+  D = 5120 / 7168) get the largest multiple of 128 rows whose buffers fit in
+  48 MiB of VMEM. The metadata and the kernel must agree.
+  """
+  if row_bytes is None or row_bytes <= _REDUCE_BLOCK_ROW_BYTES:
+    return REDUCE_BLOCK_SIZE
+  rows = _REDUCE_BLOCK_VMEM_BYTES // (
+      _RAGGED_GATHER_REDUCE_TC_NUM_BUFFERS * row_bytes
+  )
+  return max(_RAGGED_GATHER_REDUCE_TC_ALIGN, rows // 128 * 128)
 
 
 def ragged_gather_reduce_tc_layout(
@@ -435,7 +456,7 @@ def _scale_unflatten_tc(
     x_RD: jax.Array,
     scale_R1: jax.Array | None,
     num_rows: jax.Array,
-    block: int = _SCALE_UNFLATTEN_BLOCK,
+    block: int | None = None,
 ) -> jax.Array:
   """`(R, D) -> (R, D // 128, 128)` over the first `num_rows` rows.
 
@@ -445,6 +466,11 @@ def _scale_unflatten_tc(
   lower the reshape to a full-size layout copy and the scale to another pass.)
   """
   rows, d = x_RD.shape
+  if block is None:
+    # 1024 rows up to D = 4096 (double-buffered in and out windows plus the
+    # FP32 product, ~48 MiB); proportionally fewer for wider rows.
+    block = max(128, _SCALE_UNFLATTEN_BLOCK * min(1, 4096 / d) // 128 * 128)
+    block = int(block)
   block = min(block, rows)
   n = jnp.reshape(jnp.asarray(num_rows, jnp.int32), (1,))
   has_scale = scale_R1 is not None
@@ -526,13 +552,16 @@ def ragged_gather_reduce_metadata(
     *,
     top_k: int,
     num_out_tokens: int,
+    row_bytes: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Routing metadata `(src_rows, tokens, blocks)` for `ragged_gather_reduce`.
 
   Each valid row `i < valid_count` contributes to token `token_ids_R[i]`, and a
   token receives at most `top_k` rows. Compute once per dispatch and reuse in
-  the combine forward and the dispatch backward.
+  the combine forward and the dispatch backward. `row_bytes` (`D * itemsize`
+  of the rows to reduce) picks the block size; see `reduce_block_size`.
   """
+  block_size = reduce_block_size(row_bytes)
   if token_ids_R.ndim != 1 or valid_count_1.numel() != 1:
     raise ValueError(
         "ragged_gather_reduce_metadata expects token_ids_R[R] and"
@@ -543,14 +572,14 @@ def ragged_gather_reduce_metadata(
         token_ids_R.to(torch.int32),
         valid_count_1.reshape(1).to(torch.int32),
         int(top_k),
-        REDUCE_BLOCK_SIZE,
+        block_size,
         int(num_out_tokens),
     )
   # The reference path only needs (src_rows, tokens); `blocks` is a TPU
   # scheduling table, so return a correctly sized placeholder.
   num_indices = int(token_ids_R.shape[0])
   max_blocks, _, slots_len = ragged_gather_reduce_tc_layout(
-      num_indices, int(top_k), REDUCE_BLOCK_SIZE, num_out_tokens=num_out_tokens
+      num_indices, int(top_k), block_size, num_out_tokens=num_out_tokens
   )
   positions = torch.arange(num_indices, device=token_ids_R.device)
   valid = positions < valid_count_1.reshape(1)
@@ -613,7 +642,7 @@ def ragged_gather_reduce(
         blocks.to(torch.int32),
         int(num_out_tokens),
         int(top_k),
-        REDUCE_BLOCK_SIZE,
+        reduce_block_size(d * x_RD.element_size()),
         int(has_scale),
     )
   if scale_R is not None:
@@ -631,6 +660,7 @@ def ragged_gather_reduce(
 
 __all__ = [
     "REDUCE_BLOCK_SIZE",
+    "reduce_block_size",
     "ragged_gather_reduce",
     "ragged_gather_reduce_metadata",
 ]
