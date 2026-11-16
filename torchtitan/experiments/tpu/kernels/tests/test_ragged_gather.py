@@ -51,6 +51,26 @@ class RaggedGatherTest(
 
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
+  def test_block_size_follows_row_bytes(self):
+    self.assertEqual(rg.gather_block_size(4096 * 2), rg.GATHER_BLOCK_SIZE)
+    self.assertEqual(rg.gather_block_size(5120 * 2), 1152)
+    self.assertEqual(rg.gather_block_size(7168 * 2), 768)
+
+  @parameterized.parameters(5120, 7168)
+  def test_wide_rows(self, dim):
+    # DeepSeek-V3 widths take a smaller block: several blocks plus a remainder.
+    g = torch.Generator().manual_seed(3)
+    num_tokens, rows, valid = 2048, 4608, 4321
+    x = torch.randn(num_tokens, dim, generator=g).to(torch.bfloat16)
+    token_ids, valid_1 = _routing(g, num_tokens, rows, valid)
+    expected = x[token_ids.long()]
+    expected[valid:] = 0
+
+    x_d, ids_d, valid_d = self._to(x, token_ids, valid_1)
+    out = rg.ragged_gather(rg.to_token_3d(x_d), ids_d, valid_d)
+
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
   def test_inverse_permute_scatter(self):
     g = torch.Generator().manual_seed(2)
     n, r, valid = 2048, 640, 500
