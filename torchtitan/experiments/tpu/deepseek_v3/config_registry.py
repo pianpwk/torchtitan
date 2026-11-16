@@ -32,6 +32,9 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.deepseek_v3 import model_registry
+from torchtitan.experiments.tpu.deepseek_v3.mla_attention import (
+    TpuMLAAttentionConverter,
+)
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
 )
@@ -347,11 +350,12 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
 def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   """DeepSeek-V3 671B on a TPU7x 4x4x4 slice.
 
-  FP8 (the default): 6.04 s / step, 33.0% MFU. ``fp8=False`` drops the FP8
+  FP8 (the default): 4.40 s / step, 45.4% MFU. ``fp8=False`` drops the FP8
   and selective-checkpointing parts below.
 
   ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus:
 
+  * MLA attention on the MLA Splash kernel (``TpuMLAAttention``).
   * As in MaxText's DeepSeek-V3 recipe: routed experts over 8-way
     Ring-of-Experts EP (each EP group is one host's 4 chips, 2 cores each)
     times 16-way expert FSDP, dense weights FSDP over all 128 ranks; each EP
@@ -387,6 +391,9 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   config = _deepseek_v3_4x4x4("671B", tokens_per_rank=8192)
   config.optimizer.implementation = "fused_opt_states_bf16"
   config.training.mixed_precision_reduce = "bfloat16"
+  config.model_spec.model = TpuMLAAttentionConverter(
+      TpuMLAAttentionConverter.Config()
+  ).convert(config.model_spec.model)
 
   config.parallelism.expert_parallel_degree = 8
   for _, dispatcher, _, _ in config.model_spec.model.traverse(
