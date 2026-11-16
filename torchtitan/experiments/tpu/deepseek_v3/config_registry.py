@@ -344,7 +344,7 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
 
 
 def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
-  """DeepSeek-V3 671B on a TPU7x 4x4x4 slice: 10.9 s / step, 18.3% MFU (BF16).
+  """DeepSeek-V3 671B on a TPU7x 4x4x4 slice (BF16).
 
   ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus, as in MaxText's
   DeepSeek-V3 recipe:
@@ -370,13 +370,16 @@ def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
   for _, experts, _, _ in config.model_spec.model.traverse(
       TpuGroupedExperts.Config
   ):
-    # One whole 7168 x 2048 expert weight, double-buffered, overflows VMEM:
-    # tile K and N to 1024.
-    experts.pallas_grouped_mm_tile_m = 256
+    # MegaBlox tiles for D = 7168, F = 2048, measured at 81,920 routed rows x
+    # 32 local experts: 512 rows with a whole-F tile on W1/W3 and (2048, 1792)
+    # on W2 run the grouped matmuls at 750-850 TF/s (vs ~380 with 256-row,
+    # 1024 x 1024 tiles).
+    experts.pallas_grouped_mm_tile_m = 512
     experts.pallas_grouped_mm_tile_k = 1024
-    experts.pallas_grouped_mm_tile_n = 1024
+    experts.pallas_grouped_mm_tile_n = 2048
+    experts.pallas_grouped_mm_w2_tiling = (2048, 1792)
     experts.pallas_grouped_mm_tgmm_tiling = (512, 1024, 0)
-    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 512, 1024)
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (512, 2048, 1024)
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 1024)
 
   config.compile.graph_split.backward_partition_mode = "by_layer"
