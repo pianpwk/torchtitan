@@ -344,8 +344,10 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
   return config
 
 
-def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
-  """DeepSeek-V3 671B on a TPU7x 4x4x4 slice: 8.9 s / step, 22.4% MFU (BF16).
+def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
+  """DeepSeek-V3 671B on a TPU7x 4x4x4 slice.
+
+  ``fp8=False`` drops the FP8 parts below.
 
   ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus:
 
@@ -362,6 +364,13 @@ def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
     in the next executable. The latency-hiding layer scheduler is off: it
     pairs the deferred reduce-scatter waits with fusions right after the
     forward gathers, exposing them.
+
+  With ``fp8``, MaxText's ``fp8_full`` numerics (static e4m3 scale for
+  weights and activations, absmax e5m2 for output gradients):
+
+  * Dense linears MaxText runs in FP8 (``Fp8FullLinear``): the MLA q up-,
+    down- and output projections, the kv down-projection and the dense and
+    shared-expert MLPs. The k/v up-projection, router and lm_head stay BF16.
   """
   config = _deepseek_v3_4x4x4("671B", tokens_per_rank=8192)
   config.optimizer.implementation = "fused_opt_states_bf16"
@@ -391,6 +400,22 @@ def deepseek_v3_671b_4x4x4() -> TpuGraphTrainer.Config:
     experts.pallas_grouped_mm_tgmm_tiling = (512, 1024, 0)
     experts.pallas_grouped_mm_w2_tgmm_tiling = (512, 2048, 1024)
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 1024)
+  if fp8:
+    # Imported here so that other recipes do not load the FP8 kernels.
+    from torchtitan.experiments.tpu.components.fp8_full_linear import Fp8FullLinearConverter  # pylint: disable=g-import-not-at-top
+
+    config.model_spec.model = Fp8FullLinearConverter(
+        Fp8FullLinearConverter.Config(
+            fqns=(
+                "attention.wo",
+                "attention.wq_a",
+                "attention.wq_b",
+                "attention.wkv_a",
+                "feed_forward",
+                "shared_experts",
+            )
+        )
+    ).convert(config.model_spec.model)
 
   split = config.compile.graph_split
   split.forward_prefetch_parameter_gathers = True
