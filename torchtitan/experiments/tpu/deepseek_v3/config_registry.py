@@ -347,7 +347,8 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
 def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   """DeepSeek-V3 671B on a TPU7x 4x4x4 slice.
 
-  ``fp8=False`` drops the FP8 parts below.
+  FP8 (the default): 7.03 s / step, 28.4% MFU. ``fp8=False`` drops the FP8
+  parts below.
 
   ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus:
 
@@ -366,8 +367,14 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
     forward gathers, exposing them.
 
   With ``fp8``, MaxText's ``fp8_full`` numerics (static e4m3 scale for
-  weights and activations, absmax e5m2 for output gradients):
+  weights and activations, absmax e5m2 for output gradients) and kernels:
 
+  * Routed experts on MaxText's fused gmmv2 FP8 kernels: the W1|W3 GEMM
+    gathers its rows from the all-gathered tokens in-kernel, the W2 GEMM
+    combines in its epilogue. Expert weights are quantized on their FSDP shard
+    and all-gathered as FP8; the routed tokens and the combine's output
+    gradient are all-gathered as FP8; expert gradients are reduce-scattered in
+    BF16.
   * Dense linears MaxText runs in FP8 (``Fp8FullLinear``): the MLA q up-,
     down- and output projections, the kv down-projection and the dense and
     shared-expert MLPs. The k/v up-projection, router and lm_head stay BF16.
@@ -400,6 +407,9 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
     experts.pallas_grouped_mm_tgmm_tiling = (512, 1024, 0)
     experts.pallas_grouped_mm_w2_tgmm_tiling = (512, 2048, 1024)
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 1024)
+    experts.fp8_bf16_gradient_reduce_scatter = fp8
+    experts.use_fp8_fused_roe_kernels = fp8
+    experts.fp8_fused_roe_grad_all_gather = fp8
   if fp8:
     # Imported here so that other recipes do not load the FP8 kernels.
     from torchtitan.experiments.tpu.components.fp8_full_linear import Fp8FullLinearConverter  # pylint: disable=g-import-not-at-top

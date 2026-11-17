@@ -136,6 +136,23 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
+        # Ring-of-Experts EP only: run the routed experts in FP8 on MaxText's
+        # fused gmmv2 kernels with its ``fp8_full`` numerics
+        # (``kernels/fp8_full.py``), which gather the routed rows from the
+        # all-gathered FP8 tokens and combine their outputs in-kernel
+        # (``ring_of_experts_fp8_experts``). Each weight is quantized on its
+        # FSDP shard and all-gathered as FP8; W1 and W3 are gathered and
+        # multiplied as one ``[E, D, 2F]`` weight. The routing scores are
+        # applied before W2. Needs the kernel-native layout.
+        use_fp8_fused_roe_kernels: bool = False
+        # With ``use_fp8_fused_roe_kernels``: reduce-scatter the expert-weight
+        # gradients in BF16, as MaxText does, instead of FSDP's
+        # ``reduce_dtype``: halves their bytes and skips widening each full dW
+        # to FP32 before the collective.
+        fp8_bf16_gradient_reduce_scatter: bool = False
+        # With ``use_fp8_fused_roe_kernels``: all-gather the combine's output
+        # gradient as e4m3 with per-token scales (half the bytes).
+        fp8_fused_roe_grad_all_gather: bool = False
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -176,6 +193,18 @@ class TpuGroupedExperts(GroupedExperts):
             config.pallas_grouped_mm_w2_transposed_tgmm_tiling
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
+        self.use_fp8_fused_roe_kernels = config.use_fp8_fused_roe_kernels
+        self.fp8_bf16_gradient_reduce_scatter = (
+            config.fp8_bf16_gradient_reduce_scatter
+        )
+        self.fp8_fused_roe_grad_all_gather = config.fp8_fused_roe_grad_all_gather
+        if (
+            self.use_fp8_fused_roe_kernels
+            and not self.use_kernel_native_weight_layout
+        ):
+            raise ValueError(
+                "use_fp8_fused_roe_kernels requires the kernel-native layout"
+            )
         self._use_transposed_w2_rhs = False
         self._native_sharding_applied = False
 
@@ -293,6 +322,13 @@ class TpuGroupedExperts(GroupedExperts):
         ``row_scale_R``, if given, multiplies each row's hidden activation
         before the down projection (W2).
         """
+        if self.use_fp8_fused_roe_kernels:
+            # TpuRoutedExperts calls `fp8_fused_roe_forward` instead under
+            # Ring-of-Experts; anything else would silently run in BF16.
+            raise ValueError(
+                "use_fp8_fused_roe_kernels needs Ring-of-Experts EP "
+                "(expert parallelism with ep_transport='ring_of_experts')"
+            )
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
@@ -389,6 +425,43 @@ class TpuGroupedExperts(GroupedExperts):
             tgmm_tiling=w2_tgmm_tiling,
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
+
+    def _gather_fp8_weights(self):
+        """``([W1 | W3], W2)`` as `Fp8ExpertWeights`."""
+        # Imported here so that only FP8 runs load the FP8 kernels.
+        from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import gather_fp8_expert_weights  # pylint: disable=g-import-not-at-top
+
+        reduce_dtype = (
+            torch.bfloat16 if self.fp8_bf16_gradient_reduce_scatter else None
+        )
+        return (
+            gather_fp8_expert_weights(
+                self, ("w1_EDF", "w3_EDF"), reduce_dtype=reduce_dtype
+            ),
+            gather_fp8_expert_weights(self, ("w2_EFD",), reduce_dtype=reduce_dtype),
+        )
+
+    def fp8_fused_roe_forward(
+        self,
+        x_TD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+        metadata,
+    ) -> torch.Tensor:
+        """Combined routed-expert output of the local tokens; see
+        ``use_fp8_fused_roe_kernels``."""
+        if self._use_transposed_w2_rhs:
+            raise ValueError("FP8 grouped matmul needs W2 sharded on its expert dim")
+        from torchtitan.experiments.tpu.components.ring_of_experts import ring_of_experts_fp8_experts  # pylint: disable=g-import-not-at-top
+
+        w13, w2 = self._gather_fp8_weights()
+        return ring_of_experts_fp8_experts(
+            x_TD.bfloat16(),
+            num_tokens_per_expert_E,
+            metadata,
+            w13,
+            w2,
+            fp8_grad_all_gather=self.fp8_fused_roe_grad_all_gather,
+        ).type_as(x_TD)
 
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):

@@ -18,6 +18,8 @@ gathered weight would, so the all-gather can move FP8.
 
 import jax
 import jax.numpy as jnp
+import torch
+from torch_tpu._internal import pallas
 
 FWD_DTYPE = jnp.float8_e4m3fn
 BWD_DTYPE = jnp.float8_e5m2
@@ -34,9 +36,22 @@ def static_quantize(x: jax.Array) -> jax.Array:
     )
 
 
+@pallas.jax_op("tt_fp8::quantize_expert_weight")
+def _quantize_expert_weight(w: jax.Array) -> jax.Array:
+    return static_quantize(w)
+
+
+def quantize_expert_weight(w: torch.Tensor) -> torch.Tensor:
+    """``w`` in e4m3 with the static scale. Elementwise, so a shard
+    quantizes exactly as the gathered weight would. Not differentiable."""
+    with torch.no_grad():
+        return _quantize_expert_weight(w)
+
+
 __all__ = [
     "BWD_DTYPE",
     "FWD_DTYPE",
     "STATIC_SCALE",
+    "quantize_expert_weight",
     "static_quantize",
 ]

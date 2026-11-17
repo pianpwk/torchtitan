@@ -290,12 +290,16 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       topk_scores_TK: torch.Tensor,
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
+      *,
+      gather_tokens: bool = True,
   ) -> tuple[
-      torch.Tensor,
+      torch.Tensor | None,
       torch.Tensor,
       AllToAllDispatchMetadata | LocalDispatchMetadata | RingOfExpertsMetadata,
   ]:
     if not self.uses_ring_of_experts:
+      if not gather_tokens:
+        raise ValueError("gather_tokens=False needs Ring-of-Experts EP")
       return super().dispatch(
           x_TD,
           topk_scores_TK,
@@ -311,6 +315,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         num_experts=self.num_experts,
         ep_mesh=self.ep_mesh,
         capacity_factor=self.capacity_factor,
+        gather_tokens=gather_tokens,
     )
 
   def combine(
@@ -398,6 +403,21 @@ class TpuRoutedExperts(RoutedExperts):
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
     """Dispatch, experts with the scores applied before W2, combine."""
+    if getattr(self.inner_experts, "use_fp8_fused_roe_kernels", False) and (
+        self.token_dispatcher.uses_ring_of_experts
+    ):
+      # The fused kernels gather, run and combine the routed rows themselves.
+      _, num_tokens_per_expert_e, metadata = self.token_dispatcher.dispatch(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+          gather_tokens=False,
+      )
+      with maybe_set_sparse_mesh():
+        return self.inner_experts.fp8_fused_roe_forward(
+            x_TD, num_tokens_per_expert_e, metadata
+        )
     routed_input_RD, num_tokens_per_expert_e, metadata = (
         self.token_dispatcher.dispatch(
             x_TD,
@@ -438,9 +458,11 @@ class TpuRoutedExperts(RoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
-    one_chunk = (
-        self._scaled_forward if self.scale_before_down_proj else super().forward
+    # The fused FP8 expert kernels always apply the scores before W2.
+    scaled = self.scale_before_down_proj or getattr(
+        self.inner_experts, "use_fp8_fused_roe_kernels", False
     )
+    one_chunk = self._scaled_forward if scaled else super().forward
     n = self.num_moe_token_chunks
     num_tokens = int(x_TD.shape[0])
     dispatcher = self.token_dispatcher
