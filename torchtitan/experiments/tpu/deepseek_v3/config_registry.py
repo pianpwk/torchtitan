@@ -347,8 +347,10 @@ def deepseek_v3_236b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
 def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
   """DeepSeek-V3 671B on a TPU7x 4x4x4 slice.
 
-  FP8 (the default): 6.04 s / step, 33.0% MFU. ``fp8=False`` drops the FP8
-  and selective-checkpointing parts below.
+  FP8 (the default): 6.04 s / step, 33.0% MFU, measured before the MaxText
+  MLA attention below (not yet measured on the 4x4x4; one 671B MLA layer, fwd
+  + bwd on one core: 53.3 -> 31.9 ms). ``fp8=False`` drops the FP8 and
+  selective-checkpointing parts below.
 
   ``_deepseek_v3_4x4x4`` at 8192 tokens per rank, plus:
 
@@ -375,9 +377,13 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
     and all-gathered as FP8; the routed tokens and the combine's output
     gradient are all-gathered as FP8; expert gradients are reduce-scattered in
     BF16.
-  * Dense linears MaxText runs in FP8 (``Fp8FullLinear``): the MLA q up-,
-    down- and output projections, the kv down-projection and the dense and
-    shared-expert MLPs. The k/v up-projection, router and lm_head stay BF16.
+  * MLA attention as in MaxText's Lineage DeepSeek-V3
+    (``TpuMaxTextMLAAttention``): the q / kv up projections in its fused FP8
+    kernel, which writes q / k / v in the layouts Tokamax Splash reads (no
+    concat, k_pe broadcast or transposes), then Tokamax Splash.
+  * Dense linears MaxText runs in FP8 (``Fp8FullLinear``): the MLA q down-
+    and output projections, the kv down-projection and the dense and
+    shared-expert MLPs. The router and lm_head stay BF16.
   * Selective activation checkpointing: each layer's Splash output and routing
     are saved for backward instead of recomputed. With no recompute left to
     hide them under, each backward layer's expert-bank gathers are issued in
@@ -419,17 +425,22 @@ def deepseek_v3_671b_4x4x4(*, fp8: bool = True) -> TpuGraphTrainer.Config:
     # Imported here so that other recipes do not load the FP8 kernels.
     from torchtitan.experiments.tpu.components.fp8_full_linear import Fp8FullLinearConverter  # pylint: disable=g-import-not-at-top
 
+    from torchtitan.experiments.tpu.deepseek_v3.maxtext_mla_attention import TpuMaxTextMLAAttentionConverter  # pylint: disable=g-import-not-at-top
+
+    # wq_b / wkv_b run inside TpuMaxTextMLAAttention's fused FP8 kernel.
     config.model_spec.model = Fp8FullLinearConverter(
         Fp8FullLinearConverter.Config(
             fqns=(
                 "attention.wo",
                 "attention.wq_a",
-                "attention.wq_b",
                 "attention.wkv_a",
                 "feed_forward",
                 "shared_experts",
             )
         )
+    ).convert(config.model_spec.model)
+    config.model_spec.model = TpuMaxTextMLAAttentionConverter(
+        TpuMaxTextMLAAttentionConverter.Config()
     ).convert(config.model_spec.model)
 
   split = config.compile.graph_split

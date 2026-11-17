@@ -162,9 +162,13 @@ ROUTING_REGION = SaveRegion(name=MOE_ROUTING, select=select_routing)
 # (``kernels/splash_attention.py``) registers one op per kernel configuration,
 # ``pallas::splash_attn_fwd_<16 hex digits>``; Tokamax Splash
 # (``kernels/tokamax_splash_attention.py``) registers
-# ``pallas::tokamax_splash_attn_fwd``.
+# ``pallas::tokamax_splash_attn_fwd``; the MaxText Lineage MLA op
+# (``kernels/maxtext_lineage_mla_attention.py``) registers
+# ``pallas::maxtext_mla_attn_fwd`` and returns Tokamax's (model-layout output,
+# LSE) pair.
 _SPLASH_FORWARD_OP_NAME = re.compile(
-    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd)"
+    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd"
+    r"|maxtext_mla_attn_fwd)"
 )
 
 
