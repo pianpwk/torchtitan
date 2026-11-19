@@ -253,11 +253,9 @@ class TpuGroupedExperts(GroupedExperts):
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        h_RF = self._activation_fn(
-            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
-        )
-        h_RF = h_RF * self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
+        h_RF = self._glu(
+            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E),
+            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E),
         )
         return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
@@ -265,6 +263,10 @@ class TpuGroupedExperts(GroupedExperts):
         if self.activation == "gelu_tanh":
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
+
+    def _glu(self, gate_RF: torch.Tensor, up_RF: torch.Tensor) -> torch.Tensor:
+        """Gated hidden activation from the W1 (gate) and W3 (up) outputs."""
+        return self._activation_fn(gate_RF) * up_RF
 
     def forward(
         self,
@@ -364,7 +366,7 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
             )
-        hidden_RF = self._activation_fn(gate_RF) * up_RF
+        hidden_RF = self._glu(gate_RF, up_RF)
         if row_scale_R is not None:
             if pad_rows:
                 row_scale_R = F.pad(row_scale_R, (0, pad_rows))
@@ -394,8 +396,21 @@ class TpuGroupedExpertsConverter(ModelConfigConverter):
         pass
 
     def convert(self, model_config):
-        matches = list(model_config.traverse(GroupedExperts.Config))
+        matches = [
+            match
+            for match in model_config.traverse(GroupedExperts.Config)
+            # Already a TPU expert config (possibly a model's subclass).
+            if not isinstance(match[1], TpuGroupedExperts.Config)
+        ]
         for _, config, parent, field_name in matches:
+            if type(config) is not GroupedExperts.Config:
+                # `derive` would drop the subclass's fields, e.g. Kimi's SiTU
+                # activation, and silently run SiLU experts instead.
+                raise ValueError(
+                    "TpuGroupedExpertsConverter only replaces GroupedExperts"
+                    f" (SiLU); got {type(config).__qualname__}. Use a TPU"
+                    " subclass that keeps its activation."
+                )
             replacement = derive(config, TpuGroupedExperts.Config)
             if parent is None:
                 model_config = replacement
