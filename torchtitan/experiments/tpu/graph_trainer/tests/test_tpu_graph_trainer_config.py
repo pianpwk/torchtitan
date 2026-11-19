@@ -685,6 +685,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertFalse(
         config.splash_attention_kernel.sa_use_document_aware_block_skipping
     )
+    self.assertTrue(config.splash_attention_kernel.use_transposed_bwd)
 
   def test_unprotected_graph_trainer_zero3_is_rejected(self) -> None:
     config = qwen3_8b()
@@ -845,6 +846,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     splash = config.splash_attention_kernel
     self.assertTrue(splash.use_batch_loop_fwd)
     self.assertEqual(splash.sa_num_stacked_q_heads, 8)
+    self.assertTrue(splash.use_transposed_bwd)
     self.assertEqual(
         (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
         (256, 512, 512),
@@ -1047,6 +1049,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         self.assertFalse(splash.sa_use_document_aware_block_skipping)
         self.assertTrue(splash.use_batch_loop_fwd)
         self.assertEqual(splash.sa_num_stacked_q_heads, 16)
+        self.assertTrue(splash.use_transposed_bwd)
         self.assertEqual(
             (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
             (128, 512, 512),

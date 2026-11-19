@@ -616,6 +616,9 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
           sa_block_kv_dkv_compute=1024,
           sa_block_q_dq=1024,
           sa_block_kv_dq=1024,
+          # splash_tbwd backward (bwd kernel incl. glue, TPU7x: 6.92 -> 1.70 ms
+          # per layer at B6 S2048 32q/8kv, packed C4-like rows).
+          use_transposed_bwd=True,
       ),
       validator=Validator.Config(
           enable=False,
@@ -869,6 +872,10 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
       sa_block_kv_dkv_compute=1024,
       sa_block_q_dq=1024,
       sa_block_kv_dq=1024,
+      # splash_tbwd replaces the vmapped Tokamax backward (bwd kernel incl.
+      # glue, TPU7x: 3.22 -> 1.48 ms per layer at B6 S2048 32q/4kv, packed
+      # C4-like rows).
+      use_transposed_bwd=True,
   )
   cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
   cfg.metrics.log_freq = 1
@@ -950,6 +957,9 @@ def _use_q235_tokamax_attention(cfg: TPUTrainerConfig) -> None:
   splash.sa_block_q = 128
   splash.sa_block_kv = 512
   splash.sa_block_kv_compute = 512
+  # splash_tbwd backward: 4x4x4 step 24.58 -> 22.25 s in #151; bwd kernel incl.
+  # glue (TPU7x, B16 S4096 64q/4kv, packed C4-like rows) 43.8 -> 16.1 ms.
+  splash.use_transposed_bwd = True
 
 
 def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
