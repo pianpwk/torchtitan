@@ -38,6 +38,9 @@ upstream's ``common/moe``):
 * The fork's router names its score function by string, and its node-limited
   routing and ``_debug_force_load_balance`` bypass the quantile cutoff; the
   router rejects both.
+* ``TpuKimiLatentMoE`` routes a TP token shard with or without EP, so the hook
+  sums over the dense TP group whenever TP > 1 (upstream requires EP under TP
+  and sums over TP only with EP).
 * The fork's MoE has no ``freeze_expert_bias``.
 """
 
@@ -293,6 +296,9 @@ def register_moe_quantile_balancing_hook(
   @torch.no_grad()
   def _update_expert_bias() -> None:
     reduction_groups = []
+    # The router runs on a token shard per dense TP rank (TpuKimiLatentMoE).
+    if parallel_dims.tp > 1:
+      reduction_groups.append(parallel_dims.get_dense_tp_mesh().get_group())
     loss_mesh = parallel_dims.get_optional_mesh("loss")
     if loss_mesh is not None:
       reduction_groups.append(loss_mesh.get_group())

@@ -20,10 +20,11 @@ children:
 * ``TpuRoutedExperts``: optional Ring-of-Experts token chunking.
 """
 
-import dataclasses
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
+from torch.fx.traceback import annotate
 from torchtitan.config.override import derive, override
 
 # Before `torchtitan.models.kimi_k3`, which imports the CUDA-only `attn_gym`.
@@ -36,6 +37,8 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
 from torchtitan.experiments.tpu.kimi_k3.quantile_balance import (
     QuantileBalancedKimiLatentMoE,
 )
+from torchtitan.experiments.tpu.kimi_k3.sharding import reduce_tp_partial, tp_group
+from torchtitan.models.common.moe import _tokens_per_expert  # pylint: disable=protected-access
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.kimi_k3.moe import KimiLatentMoE
 
@@ -104,6 +107,88 @@ class TpuKimiGroupedExperts(TpuGroupedExperts):
     return _situ_glu(gate_RF, up_RF, self.beta, self.linear_beta)
 
 
+class TpuKimiLatentMoE(KimiLatentMoE):
+  """``KimiLatentMoE`` with the routed branch on a token shard under TP.
+
+  Without TP this is upstream's forward. With TP (layouts in
+  ``kimi_k3/sharding.py``) the two ranks of a TP group hold the same tokens,
+  so each routes and dispatches only its half (``I -> S(0)``; the backward
+  all-gathers the input gradient): the router, ``routed_down``, the routed
+  experts (Ring-of-Experts under EP), ``routed_norm`` and ``routed_up`` see
+  this rank's tokens only. The routed output is zero-filled to a TP partial
+  sum (``S(0) -> P``), added to the shared experts' rowwise partial sum, and
+  both are reduced with one all-reduce, as upstream torchtitan's MoE does
+  for EP x TP.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(KimiLatentMoE.Config):
+    pass
+
+  def forward(self, x_TD: torch.Tensor, **router_kwargs) -> torch.Tensor:
+    tp = tp_group()
+    routed_x_TD = x_TD
+    if tp is not None:
+      # "TP" marks the backward token all-gather as activation traffic for
+      # GraphSplitter's fsdp_pipeline (graph_trainer/graph_split.py).
+      with annotate({"TP": "token_shard"}):
+        routed_x_TD = spmd.redistribute(
+            x_TD,
+            tp,
+            src=spmd.I,
+            dst=spmd.S(0),
+            backward_options={"op_dtype": x_TD.dtype},
+        )
+    weights_TK, expert_ids_TK, routing_map_TE = self.router(
+        routed_x_TD, self.expert_bias_E, **router_kwargs
+    )
+    num_tokens_per_expert_E = (
+        routing_map_TE.sum(dim=0)
+        if routing_map_TE is not None
+        else _tokens_per_expert(expert_ids_TK, self.tokens_per_expert_E.numel())
+    )
+    if self.training:
+      with torch.no_grad():
+        self.tokens_per_expert_E.add_(num_tokens_per_expert_E)
+
+    routed_TD = self.routed_experts(
+        self.routed_down(routed_x_TD),
+        weights_TK,
+        expert_ids_TK,
+        num_tokens_per_expert_E,
+    )
+    out_TD = self.routed_up(self.routed_norm(routed_TD))
+    if tp is not None:
+      # Zero-fill the other ranks' tokens: no communication.
+      out_TD = spmd.convert(
+          out_TD, tp, src=spmd.S(0), dst=spmd.P, expert_mode=True
+      )
+    if self.shared_experts is not None:
+      out_TD = out_TD + self.shared_experts(x_TD)
+    if tp is not None:
+      out_TD = reduce_tp_partial(out_TD, tp)
+    return out_TD
+
+
+class TpuQuantileBalancedKimiLatentMoE(
+    TpuKimiLatentMoE, QuantileBalancedKimiLatentMoE
+):
+  """``TpuKimiLatentMoE`` with ``QuantileBalancedKimiLatentMoE``'s expert bias."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(TpuKimiLatentMoE.Config, QuantileBalancedKimiLatentMoE.Config):
+    pass
+
+
+# Source config type -> TPU config type.
+_TPU_LATENT_MOE = {
+    KimiLatentMoE.Config: TpuKimiLatentMoE.Config,
+    QuantileBalancedKimiLatentMoE.Config: (
+        TpuQuantileBalancedKimiLatentMoE.Config
+    ),
+}
+
+
 @override(
     target=KimiLatentMoE.Config,
     description="Kimi K3 LatentMoE on TPU: MegaBlox experts, Ring-of-Experts EP.",
@@ -113,20 +198,19 @@ def tpu_latent_moe(
     *,
     capacity_factor: float | None = None,
     num_moe_token_chunks: int = 1,
-) -> KimiLatentMoE.Config:
-  """K3 LatentMoE with TPU experts and the TPU dispatcher.
+) -> TpuKimiLatentMoE.Config:
+  """K3 LatentMoE with TPU experts and the TPU dispatcher (TP-aware).
 
-  Takes ``KimiLatentMoE`` and ``QuantileBalancedKimiLatentMoE`` and keeps the
-  layer's type.
+  ``KimiLatentMoE`` becomes ``TpuKimiLatentMoE`` and
+  ``QuantileBalancedKimiLatentMoE`` becomes ``TpuQuantileBalancedKimiLatentMoE``.
 
   ``capacity_factor`` (Ring-of-Experts rows per EP rank, in units of the local
   routes; None is drop-free) and ``num_moe_token_chunks`` (Ring-of-Experts
   token chunks) apply only under EP; see ``TpuAllToAllTokenDispatcher`` and
   ``TpuRoutedExperts``.
   """
-  if type(cfg) not in (
-      KimiLatentMoE.Config, QuantileBalancedKimiLatentMoE.Config
-  ):
+  tpu_config_cls = _TPU_LATENT_MOE.get(type(cfg))
+  if tpu_config_cls is None:
     raise ValueError(
         f"tpu_latent_moe does not support {type(cfg).__qualname__}"
     )
@@ -136,8 +220,9 @@ def tpu_latent_moe(
         "tpu_latent_moe replaces the standard dispatcher, got"
         f" {type(routed.token_dispatcher).__qualname__}"
     )
-  return dataclasses.replace(
+  return derive(
       cfg,
+      tpu_config_cls,
       routed_experts=derive(
           routed,
           TpuRoutedExperts.Config,
