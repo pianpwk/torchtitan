@@ -39,6 +39,7 @@ from torchtitan.config.override import derive, override
 # Before `torchtitan.models.kimi_k3`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.components import unflatten_shim
+from torchtitan.experiments.tpu.kimi_k3.sharding import enter_tp_region, reduce_tp_partial, tp_group
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import causal_conv_silu, per_row_segment_ids
 from torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta import (
     MIN_NUM_SEGMENTS,
@@ -218,10 +219,14 @@ class TpuInnerKDA(InnerKDA):
 
 
 class TpuKDA(KDA):
-  """``KDA`` that passes ``positions`` to ``TpuInnerKDA``.
+  """``KDA`` that passes ``positions`` to ``TpuInnerKDA``, with optional TP.
 
   Identical to upstream ``KDA.forward`` except that packed documents come from
-  ``positions`` instead of the varlen ``attention_masks``' ``cu_seqlens``.
+  ``positions`` instead of the varlen ``attention_masks``' ``cu_seqlens``, and
+  that heads may be TP shards (layouts in
+  ``kimi_k3/sharding.py``): the replicated input enters the TP region, the
+  head-sharded projections and the Tokamax kernel run on this rank's heads,
+  and the rowwise ``output_proj``'s partial sum is all-reduced.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -239,11 +244,24 @@ class TpuKDA(KDA):
       raise ValueError(
           f"KDA input must have shape [T, D], got {tuple(x_TD.shape)}."
       )
+    tp = tp_group()
+    if tp is not None:
+      x_TD = enter_tp_region(x_TD, tp)
+    raw_beta_TH, A_log_H, dt_bias_HK = self.beta(x_TD), self.A_log, self.dt_bias
+    if tp is not None:
+      # `beta`, A_log and dt_bias are replicated (kimi_k3/sharding.py); take
+      # this rank's heads.
+      num_local_heads = self.num_heads // tp.size()
+      heads = slice(
+          tp.rank() * num_local_heads, (tp.rank() + 1) * num_local_heads
+      )
+      raw_beta_TH = raw_beta_TH[:, heads]
+      A_log_H, dt_bias_HK = A_log_H[heads], dt_bias_HK[heads]
     num_tokens = x_TD.shape[0]
+    # -1: this rank's heads under TP.
     raw_gate_THK = self.forget_b(self.forget_a(x_TD)).reshape(
-        num_tokens, self.num_heads, self.head_dim
+        num_tokens, -1, self.head_dim
     )
-    raw_beta_TH = self.beta(x_TD).reshape(num_tokens, self.num_heads)
     out_THV = self.inner_kda(
         self.q_proj(x_TD),
         self.k_proj(x_TD),
@@ -253,14 +271,17 @@ class TpuKDA(KDA):
         self.q_conv.weight,
         self.k_conv.weight,
         self.v_conv.weight,
-        self.A_log,
-        self.dt_bias,
+        A_log_H,
+        dt_bias_HK,
         positions=positions,
     )
     output_gate_THV = self.output_gate(x_TD).view_as(out_THV)
-    return self.output_proj(
+    out_TD = self.output_proj(
         self.output_norm(out_THV, output_gate_THV).flatten(-2)
     )
+    if tp is not None:
+      out_TD = reduce_tp_partial(out_TD, tp)
+    return out_TD
 
 
 @override(
