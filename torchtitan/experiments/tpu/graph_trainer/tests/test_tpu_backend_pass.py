@@ -377,5 +377,38 @@ class PartitionDonationTest(absltest.TestCase):
 
     self.assertIs(gm._tpu_executable, executable)
 
+  def test_in_place_updates_of_graph_inputs_are_copied_back(self):
+    # An MoE layer's `tokens_per_expert_E.add_` in the traced step: a
+    # functional lowering only updates its own copy of the input.
+    def fn(buf, x):
+      buf.add_(x.sum(0))
+      buf.add_(buf)
+      return (x * 2,)
+
+    gm = make_fx(fn)(torch.zeros(3), torch.ones(2, 3))
+
+    class FunctionalStaticCompiler:
+
+      def __call__(self, gm, inputs, is_fwd=True):
+        del inputs, is_fwd
+        lowered = copy.deepcopy(gm)
+        return lambda *args: lowered(*(a.clone() for a in args))
+
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=FunctionalStaticCompiler,
+    ):
+      tpu_backend_pass.tpu_backend_compile_pass(
+          gm, (torch.zeros(3), torch.ones(2, 3))
+      )
+
+    buf = torch.zeros(3)
+    (out,) = gm(buf, torch.ones(2, 3))
+    torch.testing.assert_close(out, torch.full((2, 3), 2.0))
+    torch.testing.assert_close(buf, torch.full((3,), 4.0))
+    gm(buf, torch.ones(2, 3))
+    torch.testing.assert_close(buf, torch.full((3,), 12.0))
+
 if __name__ == "__main__":
   absltest.main()
