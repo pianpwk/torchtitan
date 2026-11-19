@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 GraphTrainerFSDPBarrierPolicy = Literal["none", "prefetch", "interleave"]
 BackwardPartitionMode = Literal["none", "by_layer", "fsdp_pipeline"]
 PipelinedCollective = Literal["ag", "rs"]
+FsdpReduceScatterBuckets = Literal["none", "padded_per_layer"]
 # This extends TPUTrainer's optimizer_compile modes with joint-graph execution.
 TpuGraphTrainerOptimizerCompileMode = Literal[
     "eager", "separate_graph", "in_graph"
@@ -175,6 +176,12 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+  # ``padded_per_layer``: one dense (SimpleFSDP mesh) gradient reduce-scatter
+  # per decoder layer, on a 2-D buffer whose per-rank part is padded to the
+  # shape TPU7x reduces with the multi-axis torus algorithm; parameter storage
+  # is unchanged. Validated numerically; its speedup is only predicted for
+  # 3-axis groups (8x8x8), see ``passes/fsdp_reduce_scatter_buckets.py``.
+  fsdp_reduce_scatter_buckets: FsdpReduceScatterBuckets = "none"
 
 
 def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:
@@ -305,6 +312,18 @@ def apply_tpu_graph_trainer_model_transforms(
     )
   if compile_config.optimizer_compile == "in_graph":
     aot_only_options.append("compile.optimizer_compile='in_graph'")
+  if compile_config.fsdp_reduce_scatter_buckets != "none":
+    aot_only_options.append("compile.fsdp_reduce_scatter_buckets")
+    if compile_config.fsdp_barrier_policy != "none":
+      # Those passes place each RS by its layer; bucketing would move them.
+      raise ValueError(
+          "compile.fsdp_reduce_scatter_buckets cannot be combined with "
+          "compile.fsdp_barrier_policy"
+      )
+    if not config.parallelism.use_simple_fsdp:
+      raise ValueError(
+          "compile.fsdp_reduce_scatter_buckets requires SimpleFSDP"
+      )
   if compile_config.mode != "aot_fx_trace" and aot_only_options:
     raise ValueError(
         "TPU joint-graph options require compile.mode='aot_fx_trace': "
