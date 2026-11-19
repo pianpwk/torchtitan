@@ -378,14 +378,19 @@ class PartitionDonationTest(absltest.TestCase):
     self.assertIs(gm._tpu_executable, executable)
 
   def test_in_place_updates_of_graph_inputs_are_copied_back(self):
-    # An MoE layer's `tokens_per_expert_E.add_` in the traced step: a
+    # An MoE layer's `tokens_per_expert_E.add_` and a quantile-balanced
+    # router's int32 histogram `scatter_add_` in the traced step: a
     # functional lowering only updates its own copy of the input.
-    def fn(buf, x):
+    def fn(buf, hist, x):
       buf.add_(x.sum(0))
       buf.add_(buf)
+      hist.scatter_add_(1, x.long(), torch.ones_like(hist[:, :3]))
       return (x * 2,)
 
-    gm = make_fx(fn)(torch.zeros(3), torch.ones(2, 3))
+    def inputs():
+      return torch.zeros(3), torch.zeros(2, 4, dtype=torch.int32)
+
+    gm = make_fx(fn)(*inputs(), torch.ones(2, 3))
 
     class FunctionalStaticCompiler:
 
@@ -400,15 +405,18 @@ class PartitionDonationTest(absltest.TestCase):
         return_value=FunctionalStaticCompiler,
     ):
       tpu_backend_pass.tpu_backend_compile_pass(
-          gm, (torch.zeros(3), torch.ones(2, 3))
+          gm, (*inputs(), torch.ones(2, 3))
       )
 
-    buf = torch.zeros(3)
-    (out,) = gm(buf, torch.ones(2, 3))
+    buf, hist = inputs()
+    (out,) = gm(buf, hist, torch.ones(2, 3))
     torch.testing.assert_close(out, torch.full((2, 3), 2.0))
     torch.testing.assert_close(buf, torch.full((3,), 4.0))
-    gm(buf, torch.ones(2, 3))
+    gm(buf, hist, torch.ones(2, 3))
     torch.testing.assert_close(buf, torch.full((3,), 12.0))
+    torch.testing.assert_close(
+        hist, torch.tensor([[0, 6, 0, 0]] * 2, dtype=torch.int32)
+    )
 
 if __name__ == "__main__":
   absltest.main()
