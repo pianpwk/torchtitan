@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
-from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35TransformerBlock
 
