@@ -32,6 +32,7 @@ from torchtitan.config.override import derive, override
 from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
+from torchtitan.experiments.tpu.kimi_k3.sharding import enter_tp_region, reduce_tp_partial, tp_group
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.kimi_k3.model import KimiMLAAttention
 from torchtitan.protocols.module import Module
@@ -41,7 +42,7 @@ from torchtitan.protocols.module import Module
 # H = heads, K = query/key head dimension, V = value head dimension.
 
 # Splash tiling for K3's head dims (K = 192, V = 128; debug flavor 96 / 64),
-# from a TPU7x sweep at 4 x 4096 tokens, 48 heads: 1024-token
+# from a TPU7x sweep at 4 x 4096 tokens, 48 heads (one TP2 shard): 1024-token
 # blocks and a vmapped backward take fwd+bwd from 30.1 to 19.4 ms without
 # documents and from 19.3 to 17.4 ms with 5 per row (512 blocks, scanned
 # backward; see NOTES). Tiles cover whole heads; the blocks are capped at the
@@ -148,7 +149,11 @@ class TpuKimiMLAAttention(KimiMLAAttention):
   Upstream's forward drops ``positions`` and hands ``attention_masks`` (a
   FlexAttention ``BlockMask``) to ``inner_attention``; here that slot carries
   the ``[T]`` document ids of ``positions`` (static shape) instead. The
-  projections, norms and output gate are upstream's.
+  projections are upstream's, with optional TP over heads (layouts in
+  ``kimi_k3/sharding.py``): the replicated input enters the TP region, the
+  LoRA down projections run whole, ``wq_b`` / ``wkv_b`` / ``gate`` and Splash
+  run on this rank's heads, and the rowwise ``wo``'s partial sum is
+  all-reduced.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -170,24 +175,29 @@ class TpuKimiMLAAttention(KimiMLAAttention):
             f" of shape {tuple(positions.shape)} for {x_TD.shape[0]} tokens."
         )
       document_ids_T = segment_ids_from_positions(positions.reshape(-1))
+    tp = tp_group()
+    if tp is not None:
+      x_TD = enter_tp_region(x_TD, tp)
 
-    # Upstream's KimiMLAAttention.forward.
+    # Upstream's KimiMLAAttention.forward with -1 (this rank's heads) for the
+    # head count.
     num_tokens = x_TD.shape[0]
     q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-        num_tokens, self.n_heads, self.q_head_dim
+        num_tokens, -1, self.q_head_dim
     )
     compressed_kv_TC = self.wkv_a(x_TD)
     kv_latent_TC, k_rope_TK = torch.split(
         compressed_kv_TC, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
     kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
-        num_tokens, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
+        num_tokens, -1, self.qk_nope_head_dim + self.v_head_dim
     )
     k_nope_THK, v_THV = torch.split(
         kv_THC, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
     )
+    num_local_heads = q_THK.shape[1]
     k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-        -1, self.n_heads, -1
+        -1, num_local_heads, -1
     )
     k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
     out_THV = self.inner_attention(
@@ -197,8 +207,11 @@ class TpuKimiMLAAttention(KimiMLAAttention):
         attention_masks=document_ids_T,
         scale=self.scale,
     )
-    out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
-    return self.wo(out_TD * torch.sigmoid(self.gate(x_TD)))
+    out_TD = out_THV.reshape(num_tokens, num_local_heads * self.v_head_dim)
+    out_TD = self.wo(out_TD * torch.sigmoid(self.gate(x_TD)))
+    if tp is not None:
+      out_TD = reduce_tp_partial(out_TD, tp)
+    return out_TD
 
 
 @override(
