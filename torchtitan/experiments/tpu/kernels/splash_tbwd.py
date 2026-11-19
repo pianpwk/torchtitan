@@ -103,9 +103,10 @@ Other limitations
 The transposed formulation does not depend on the mask: causality lives only
 in `build_schedule` (kj <= qi) and in the kernel's element mask. These are
 unimplemented, not fundamental:
-- Causal attention only. A sliding window needs a band condition in both
-  places; non-causal needs neither condition, and a schedule (SMEM) bound of
-  B * nb * nb tiles. VMEM does not depend on the mask.
+- Causal attention, optionally with a sliding window (band condition in
+  `build_schedule` and the element mask). Non-causal needs neither the causal
+  condition nor its schedule (SMEM) bound: B * nb * nb tiles. VMEM does not
+  depend on the mask, so a window does not lift the sequence-length bound.
 - No context parallelism (kv length must equal q length). The resident
   K / V / dK^T / dV^T and the VMEM estimate would scale with the kv length,
   and the schedule bound with nq * nk tiles; untested.
@@ -174,9 +175,13 @@ _SCHEDULE_KEYS = (
 
 
 def build_schedule(
-    segment_ids_BS: jax.Array, block: int
+    segment_ids_BS: jax.Array, block: int, window: int | None = None
 ) -> dict[str, jax.Array]:
   """Tile schedule [T] for `splash_tbwd_call` from (traced) segment ids [B, S].
+
+  `window`: sliding-window causal attention, each q attends to keys k with
+  q - window <= k <= q (Splash's LocalMask(window_size=(window, 0))); None is
+  plain causal.
 
   Returns:
     num_active: int32 scalar, the number of active tiles (the grid's steps).
@@ -203,16 +208,24 @@ def build_schedule(
   # A causal tile may hold a same-document pair when the [min, max] segment-id
   # ranges of its q block and kv block overlap (as Tokamax's
   # `_segment_block_overlap`; conservative, so ids need not be sorted).
+  in_band_IJ = kj_IJ <= qi_IJ
+  if window is not None:
+    # Some pair within the window: min(q - k) = (qi - kj - 1) * block + 1.
+    in_band_IJ &= (qi_IJ - kj_IJ - 1) * block + 1 <= window
   may_have_live_pairs_BIJ = (
       (max_seg_BI[:, :, None] >= min_seg_BI[:, None, :])
       & (max_seg_BI[:, None, :] >= min_seg_BI[:, :, None])
-      & (kj_IJ <= qi_IJ)
+      & in_band_IJ
   )
   # Every pair is live when both blocks lie inside the same single document,
   # strictly below the diagonal.
   single_doc_BI = min_seg_BI == max_seg_BI
+  fully_in_band_IJ = kj_IJ < qi_IJ
+  if window is not None:
+    # Every pair within the window: max(q - k) = (qi - kj + 1) * block - 1.
+    fully_in_band_IJ &= (qi_IJ - kj_IJ + 1) * block - 1 <= window
   all_pairs_live_BIJ = (
-      (kj_IJ < qi_IJ)
+      fully_in_band_IJ
       & single_doc_BI[:, :, None]
       & single_doc_BI[:, None, :]
       & (min_seg_BI[:, :, None] == min_seg_BI[:, None, :])
@@ -316,6 +329,7 @@ def _kernel(
     block: int,
     q_scale: float,
     q_ratio: float = 1.0,
+    window: int | None = None,
 ) -> None:
   del b_ref  # used by the index maps only
   lse2_rows = lse2_GQ if group_size % 8 else lse2_GQ_ref
@@ -368,6 +382,8 @@ def _kernel(
       k_pos = kv_start + lax.broadcasted_iota(jnp.int32, (block, block), 1)
       qseg_QC = jnp.tile(qseg_QL_ref[...], (1, block // NUM_LANES))
       mask_QC = (q_pos >= k_pos) & (qseg_QC == kvseg_8S_ref[0:1, kv])
+      if window is not None:
+        mask_QC &= q_pos - k_pos <= window
 
     tn = (((0,), (0,)), ((), ()))  # contract dim 0 of both: A^T @ B
     nn = (((1,), (0,)), ((), ()))  # A @ B
@@ -459,6 +475,7 @@ def splash_tbwd_call(
     single_buffer_kv: bool,
     q_scale: float,
     q_ratio: float = 1.0,
+    window: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """The pallas_call on kernel layouts.
 
@@ -562,6 +579,7 @@ def splash_tbwd_call(
           block=block,
           q_scale=q_scale,
           q_ratio=q_ratio,
+          window=window,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=len(_SCHEDULE_KEYS),
@@ -730,6 +748,7 @@ def transposed_attention_bwd(
     *,
     q_scale: float,
     q_ratio: float = 1.0,
+    window: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """dq, dk, dv of causal attention, in the model layout [B, S, heads, D].
 
@@ -739,6 +758,7 @@ def transposed_attention_bwd(
     lse2_BHS: the forward's log2-domain logsumexp (see `splash_tbwd_call`).
     segment_ids_BS: document id per token; None means one document per example.
     q_scale, q_ratio: see `splash_tbwd_call`.
+    window: sliding window (see `build_schedule`); None is plain causal.
 
   Raises:
     ValueError: for shapes outside "Supported shapes" (module docstring).
@@ -762,7 +782,7 @@ def transposed_attention_bwd(
       _vmem_bytes(d, num_h // num_kv, s, block, single_buffer_kv=False)
       > _vmem_limit_bytes()
   )
-  sched = build_schedule(segment_ids_BS, block)
+  sched = build_schedule(segment_ids_BS, block, window)
   seg_BS = segment_ids_BS.astype(jnp.int32)
   # The transposes to sequence-minor lower to bitcasts in the model graph,
   # where XLA already keeps q / k / v sequence-minor.
@@ -781,6 +801,7 @@ def transposed_attention_bwd(
       single_buffer_kv=single_buffer_kv,
       q_scale=q_scale,
       q_ratio=q_ratio,
+      window=window,
   )
   return (
       jnp.swapaxes(dq_BHSD, 1, 2),

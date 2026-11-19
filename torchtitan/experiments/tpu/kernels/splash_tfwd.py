@@ -105,6 +105,7 @@ def _kernel(
     block: int,
     q_scale: float,
     q_ratio: float,
+    window: int | None,
 ):
   del b_ref, b_bounds_start_ref, b_bounds_end_ref
   step = pl.program_id(1)
@@ -132,6 +133,8 @@ def _kernel(
       )
       kvseg_CQ = jnp.tile(kvseg_CL_ref[...], (1, block // NUM_LANES))
       mask_CQ = (q_pos >= k_pos) & (kvseg_CQ == qseg_8Q_ref[0:1, :])
+      if window is not None:
+        mask_CQ &= q_pos - k_pos <= window
     nn = (((1,), (0,)), ((), ()))
     for g in range(group_size):
       st_CQ = lax.dot_general(
@@ -182,6 +185,7 @@ def splash_tfwd_call(
     q_scale: float,
     q_ratio: float = 1.0,
     single_buffer_kv: bool = False,
+    window: int | None = None,
 ):
   """The pallas_call on kernel layouts.
 
@@ -195,6 +199,7 @@ def splash_tfwd_call(
     block: tile size (q block = kv block).
     q_scale, q_ratio: see `splash_tbwd.splash_tbwd_call`.
     single_buffer_kv: one VMEM buffer for the per-(example, kv head) K / V^T.
+    window: sliding window (`splash_tbwd.build_schedule`); None is causal.
 
   Returns:
     o^T [B, H, D, S] in q's dtype; lse2 [B, N, G, S] f32.
@@ -240,7 +245,8 @@ def splash_tfwd_call(
   ]
   return pl.pallas_call(
       functools.partial(
-          _kernel, group_size=g, block=block, q_scale=q_scale, q_ratio=q_ratio
+          _kernel, group_size=g, block=block, q_scale=q_scale,
+          q_ratio=q_ratio, window=window,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=len(splash_tbwd._SCHEDULE_KEYS),  # pylint: disable=protected-access
@@ -259,7 +265,8 @@ def splash_tfwd_call(
 
 
 def transposed_attention_fwd(
-    q_BSHD, k_BSND, v_BSND, segment_ids_BS, *, q_scale: float, q_ratio: float = 1.0
+    q_BSHD, k_BSND, v_BSND, segment_ids_BS, *, q_scale: float,
+    q_ratio: float = 1.0, window: int | None = None,
 ):
   """Causal attention forward in the model layout [B, S, heads, D].
 
@@ -267,6 +274,7 @@ def transposed_attention_fwd(
     q_BSHD, k_BSND, v_BSND: q (unscaled), k, v.
     segment_ids_BS: document id per token; None means one document per example.
     q_scale, q_ratio: see `splash_tbwd.splash_tbwd_call`.
+    window: sliding window (`splash_tbwd.build_schedule`); None is causal.
 
   Raises:
     ValueError: for shapes outside splash_tbwd's "Supported shapes".
@@ -285,7 +293,7 @@ def transposed_attention_fwd(
   if segment_ids_BS is None:
     segment_ids_BS = jnp.zeros((num_b, s), jnp.int32)
   block = splash_tbwd.block_size(s)
-  sched = splash_tbwd.build_schedule(segment_ids_BS, block)
+  sched = splash_tbwd.build_schedule(segment_ids_BS, block, window)
   seg = segment_ids_BS.astype(jnp.int32)
   ot_BHDS, lse2_BNGS = splash_tfwd_call(
       sched,
@@ -297,6 +305,7 @@ def transposed_attention_fwd(
       block=block,
       q_scale=q_scale,
       q_ratio=q_ratio,
+      window=window,
   )
   return (
       jnp.transpose(ot_BHDS, (0, 3, 1, 2)),
