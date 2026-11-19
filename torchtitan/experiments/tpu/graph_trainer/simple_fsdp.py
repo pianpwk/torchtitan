@@ -116,6 +116,25 @@ class TpuReplicateComputation(ReplicateComputation):
 
   def replicate_compute(self, x: DTensor) -> torch.Tensor:
     non_dp_mesh_dims = x._spec.mesh.ndim - self.device_mesh.ndim
+    if non_dp_mesh_dims > 0:
+      # With a TP/EP mesh, upstream re-wraps the local tensor on the FSDP mesh
+      # with the module-wide placements, but `data_parallel` replicates a
+      # parameter whose dim is smaller than the FSDP degree (e.g. K3's
+      # [1, dim] residual projections), which would then be all-gathered as if
+      # it were a shard. Re-wrap with the parameter's actual FSDP placements.
+      # TODO: fix in upstream graph_trainer SimpleFSDP.
+      dp_placements = x._spec.placements[: self.device_mesh.ndim]
+      actual = tuple(
+          Replicate() if placement.is_replicate() else template
+          for placement, template in zip(dp_placements, self.param_sharding)
+      )
+      if actual != tuple(self.param_sharding):
+        template = self.param_sharding
+        self.param_sharding = actual
+        try:
+          return super().replicate_compute(x)
+        finally:
+          self.param_sharding = template
     if non_dp_mesh_dims == 0:
       placements = x._spec.placements
       shard_mesh_dim: int | None = None
