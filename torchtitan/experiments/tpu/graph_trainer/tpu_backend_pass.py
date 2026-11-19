@@ -46,6 +46,7 @@ import torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy  # noqa: F401
 from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
+    from torchtitan.distributed import ParallelDims
     from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
     from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 
@@ -597,12 +598,16 @@ def tpu_backend_compile_partitioned_pass(
 def construct_tpu_transform_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
+    *,
+    parallel_dims: "ParallelDims | None" = None,
 ) -> list[Callable]:
     """Build transforms that must run on the complete joint FX graph.
 
     Graph splitting consumes remat and FSDP metadata produced here, so these
     transforms run once before partitioning. Compilation is deliberately absent:
     split mode compiles each resulting child graph independently.
+    ``parallel_dims`` names the SimpleFSDP mesh for
+    ``compile.fsdp_reduce_scatter_buckets``.
     """
     passes: list[Callable] = [remove_parameter_gradient_markers_pass]
 
@@ -715,16 +720,42 @@ def construct_tpu_transform_passes(
                 ),
             )
         )
+
+    if config.compile.fsdp_reduce_scatter_buckets != "none":
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            get_simple_fsdp_mesh,
+        )
+        from torchtitan.experiments.tpu.graph_trainer.passes.fsdp_reduce_scatter_buckets import (
+            apply_fsdp_reduce_scatter_bucketing_pass,
+        )
+
+        if parallel_dims is None:
+            raise ValueError(
+                "compile.fsdp_reduce_scatter_buckets needs parallel_dims to "
+                "find the SimpleFSDP mesh"
+            )
+        fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
+        if fsdp_mesh.size() > 1:
+            passes.append(
+                functools.partial(
+                    apply_fsdp_reduce_scatter_bucketing_pass,
+                    group_name=fsdp_mesh.get_group().group_name,
+                )
+            )
     return passes
 
 
 def construct_tpu_pass_pipeline(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
+    *,
+    parallel_dims: "ParallelDims | None" = None,
 ) -> list[Callable]:
     """Build the normal unsplit pipeline: joint transforms, then compilation."""
     return [
-        *construct_tpu_transform_passes(traced_result, config),
+        *construct_tpu_transform_passes(
+            traced_result, config, parallel_dims=parallel_dims
+        ),
         tpu_backend_compile_pass,
     ]
 

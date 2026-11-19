@@ -423,13 +423,19 @@ class TpuGraphTrainer(GraphTrainer):
                     # run before partitioning. The terminal compiler is omitted
                     # here because each child graph is compiled independently below.
                     passes = construct_tpu_transform_passes(
-                        self._traced_step, self.config
+                        self._traced_step,
+                        self.config,
+                        parallel_dims=self.parallel_dims,
                     )
                 else:
                     pipeline_fn = PASS_PIPELINE_REGISTRY[
                         self.config.compile.pass_pipeline
                     ]
-                    passes = pipeline_fn(self._traced_step, self.config)
+                    passes = pipeline_fn(
+                        self._traced_step,
+                        self.config,
+                        parallel_dims=self.parallel_dims,
+                    )
                 self._traced_step.gm = apply_graph_passes(
                     self._traced_step.gm,
                     self._traced_step.example_inputs,
@@ -543,7 +549,9 @@ class TpuGraphTrainer(GraphTrainer):
             pipeline_fn = PASS_PIPELINE_REGISTRY[
                 self.config.compile.pass_pipeline
             ]
-            passes = pipeline_fn(self._traced_step, self.config)
+            passes = pipeline_fn(
+                self._traced_step, self.config, parallel_dims=self.parallel_dims
+            )
             self._traced_step.gm = apply_graph_passes(
                 self._traced_step.gm,
                 self._traced_step.example_inputs,
