@@ -21,6 +21,7 @@ from torchtitan.experiments.tpu.distributed.headtail import (
     slice_cp_mask_info,
 )
 from torchtitan.experiments.tpu.kernels import splash_tbwd
+from torchtitan.experiments.tpu.kernels import splash_tfwd
 from torchtitan.tools.logging import logger
 
 try:
@@ -72,6 +73,7 @@ class TokamaxConfig:
   num_stacked_q_heads: int = 1
   use_batch_loop_fwd: bool = False
   use_transposed_bwd: bool = False
+  use_transposed_fwd: bool = False
 
   @classmethod
   def update(cls, **kwargs):
@@ -345,6 +347,7 @@ def jax_attention_fwd(
     num_stacked_q_heads: int,
     use_batch_loop_fwd: bool,
     use_transposed_bwd: bool,
+    use_transposed_fwd: bool,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward attention in JAX using Pallas.
 
@@ -352,8 +355,27 @@ def jax_attention_fwd(
   optional int32 ``segment_ids`` of shape (batch, kv_seq_len) for packed
   documents. The tiling/layout fields arrive as arguments (see
   _kernel_config_args) so they are part of the jax_op compile-cache key.
+
+  With ``use_transposed_fwd`` the output and logsumexp come from splash_tfwd
+  (one call for the whole batch, see splash_tfwd.py) instead of Tokamax's
+  forward; attention it does not support falls back with a warning.
   """
   del use_transposed_bwd  # backward only
+  if use_transposed_fwd:
+    tfwd_reason = _transposed_unsupported_reason(
+        q, k, v, is_causal,
+        local_window_size if local_window_size != -1 else None,
+    )
+    if tfwd_reason is not None:
+      _warn_transposed_fallback(
+          "use_transposed_fwd", "forward", "splash_tfwd", tfwd_reason
+      )
+    else:
+      return splash_tfwd.transposed_attention_fwd(
+          q, k, v, segment_ids,
+          q_scale=_forward_q_scale(q, scale),
+          q_ratio=_forward_q_ratio(q, scale),
+      )
   seq_len = q.shape[1]
   kv_seq_len = k.shape[1]
   n_heads = q.shape[2]
@@ -407,14 +429,14 @@ def jax_attention_fwd(
   return out, logsumexp
 
 
-def _transposed_bwd_unsupported_reason(
+def _transposed_unsupported_reason(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
     is_causal: bool,
     local_window_size: int | None,
 ) -> str | None:
-  """Why splash_tbwd cannot compute this backward, or None if it can."""
+  """Why splash_tbwd / splash_tfwd cannot compute this attention, or None if they can."""
   if not is_causal or local_window_size is not None:
     # Not fundamental (see "Other limitations" in splash_tbwd.py), but no
     # model needs it from splash_tbwd yet.
@@ -472,11 +494,11 @@ def _forward_q_ratio(q: jax.Array, scale: float) -> float:
 
 
 @functools.cache
-def _warn_transposed_bwd_fallback(reason: str) -> None:
+def _warn_transposed_fallback(flag: str, part: str, kernel: str, reason: str) -> None:
   logger.warning(
-      "use_transposed_bwd: using the Tokamax backward instead of splash_tbwd:"
-      f" {reason}."
+      f"{flag}: using the Tokamax {part} instead of {kernel}: {reason}."
   )
+
 
 
 def jax_attention_bwd(
@@ -507,6 +529,7 @@ def jax_attention_bwd(
     num_stacked_q_heads: int,
     use_batch_loop_fwd: bool,
     use_transposed_bwd: bool,
+    use_transposed_fwd: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Backward attention in JAX calling direct Pallas kernel backward.
 
@@ -515,6 +538,7 @@ def jax_attention_bwd(
   the forward residuals are the same. Attention splash_tbwd does not support
   falls back to the Tokamax backward with a warning.
   """
+  del use_transposed_fwd  # forward only (same residuals either way)
   seq_len = q.shape[1]
   kv_seq_len = k.shape[1]
   n_heads = q.shape[2]
@@ -523,14 +547,16 @@ def jax_attention_bwd(
   local_window_size_opt = local_window_size if local_window_size != -1 else None
 
   tbwd_reason = (
-      _transposed_bwd_unsupported_reason(
+      _transposed_unsupported_reason(
           q, k, v, is_causal, local_window_size_opt
       )
       if use_transposed_bwd
       else None
   )
   if tbwd_reason is not None:
-    _warn_transposed_bwd_fallback(tbwd_reason)
+    _warn_transposed_fallback(
+        "use_transposed_bwd", "backward", "splash_tbwd", tbwd_reason
+    )
   if use_transposed_bwd and tbwd_reason is None:
     # Tokamax's logsumexp residual is in the log2 domain splash_tbwd takes
     # (SplashConfig.use_base2_exp, the default). splash_tbwd rounds q as the
@@ -631,6 +657,7 @@ _KERNEL_CONFIG_FIELDS = (
     "num_stacked_q_heads",
     "use_batch_loop_fwd",
     "use_transposed_bwd",
+    "use_transposed_fwd",
 )
 
 

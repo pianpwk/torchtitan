@@ -133,6 +133,16 @@ class SplashAttentionKernelConfig:
   # (and 1 query head per KV head, where Tokamax is faster) warns and uses the
   # Tokamax backward.
   use_transposed_bwd: bool = False
+  # Tokamax only. Compute the forward with the transposed Splash kernel
+  # (kernels/splash_tfwd.py: one call for the whole batch over the tiles with
+  # a same-document pair, all query heads of a KV head per step, O produced
+  # transposed so P fills the MXU) instead of Tokamax's forward. It emits the
+  # same residuals (o, log2-domain logsumexp from q rounded as Tokamax rounds
+  # it), so either backward can follow; the sa_block_*, layout, stacking and
+  # use_batch_loop_fwd settings then apply to the Tokamax backward only.
+  # Supports what use_transposed_bwd supports; anything else warns and uses
+  # the Tokamax forward.
+  use_transposed_fwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

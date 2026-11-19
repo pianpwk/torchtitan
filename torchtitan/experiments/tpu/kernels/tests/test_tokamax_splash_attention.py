@@ -206,7 +206,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
     k = jax.ShapeDtypeStruct((1, 256, 1, 128), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 256, 1, v_head_dim), jnp.bfloat16)
     with mock.patch.object(splash_tbwd, "_tpu_info", return_value=info):
-      reason = tokamax_splash_attention._transposed_bwd_unsupported_reason(  # pylint: disable=protected-access
+      reason = tokamax_splash_attention._transposed_unsupported_reason(  # pylint: disable=protected-access
           q, k, v, is_causal=True, local_window_size=None
       )
     if expected is None:
@@ -804,7 +804,7 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
   def _assert_runs_transposed_bwd(self, q, k, v):
     """The wrapper routes these shapes to splash_tbwd on this device (else the test compares Tokamax with itself)."""
     as_jax = lambda x: types.SimpleNamespace(shape=tuple(x.shape), dtype=jnp.dtype(jnp.bfloat16))
-    reason = tokamax_splash_attention._transposed_bwd_unsupported_reason(  # pylint: disable=protected-access
+    reason = tokamax_splash_attention._transposed_unsupported_reason(  # pylint: disable=protected-access
         as_jax(q), as_jax(k), as_jax(v), is_causal=True, local_window_size=None
     )
     self.assertIsNone(reason)
@@ -913,10 +913,91 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     k, v = (torch.randn(2, 2048, n_kv_heads, 128, dtype=torch.bfloat16) for _ in range(2))
     tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
     self._set_tokamax_config(use_transposed_bwd=True)
-    tokamax_splash_attention._warn_transposed_bwd_fallback.cache_clear()
+    tokamax_splash_attention._warn_transposed_fallback.cache_clear()
     with self.assertLogs(level="WARNING") as logged:
       got = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
     self.assertIn("using the Tokamax backward instead of splash_tbwd", "\n".join(logged.output))
+    for g, t in zip(got, tokamax):
+      torch.testing.assert_close(g, t, rtol=0, atol=0)
+
+  def _packed_out_grads(self, q, k, v, grad_out, segment_ids, **attn):
+    """Output and dq, dk, dv (f32, CPU) of splash_sdpa under the current TokamaxConfig."""
+    q, k, v = (x.to(self.accelerator_device).requires_grad_(True) for x in (q, k, v))
+    out = tokamax_splash_attention.splash_sdpa(
+        q, k, v, segment_ids=segment_ids, enable_gqa=q.shape[2] != k.shape[2], **attn
+    )
+    out.backward(grad_out.to(self.accelerator_device))
+    return [out.detach().float().cpu()] + [x.grad.float().cpu() for x in (q, k, v)]
+
+  @parameterized.named_parameters(
+      dict(testcase_name="group16", n_heads=16, n_kv_heads=1, head_dim=128),
+      dict(testcase_name="group8_tbwd", n_heads=16, n_kv_heads=2, head_dim=128, tbwd=True),
+      dict(testcase_name="group2_dim64", n_heads=8, n_kv_heads=4, head_dim=64),
+      dict(testcase_name="group5_dim192_tbwd", n_heads=10, n_kv_heads=2, head_dim=192, tbwd=True),
+      dict(testcase_name="group16_no_segment_ids", n_heads=16, n_kv_heads=1, head_dim=128, packed=False),
+      dict(testcase_name="group8_scale", n_heads=16, n_kv_heads=2, head_dim=128, scale=0.05, tbwd=True),
+      dict(testcase_name="tile256", n_heads=8, n_kv_heads=2, head_dim=128,
+           documents=((300, 517, 77, 898), (1000, 48, 744)), block=256),
+      dict(testcase_name="tile128_dim96", n_heads=4, n_kv_heads=2, head_dim=96,
+           documents=((300, 517, 77, 1026), (1000, 48, 872)), block=128),
+  )
+  def test_transposed_fwd_matches_tokamax(
+      self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, scale=None, tbwd=False, block=None
+  ):
+    """use_transposed_fwd (splash_tfwd) gives Tokamax's output and residuals.
+
+    The output is no further from dense f32 attention than Tokamax's (TPU7x: equal to ~1e-6, >99.99% of elements
+    bitwise equal), and the gradients the backward computes from splash_tfwd's residuals match the ones it computes
+    from Tokamax's (the logsumexp agrees to ~2e-6 in the log2 domain).
+    """
+    torch.manual_seed(7)
+    if block is not None:
+      blocks = ("block_q", "block_kv", "block_kv_compute", "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute")
+      self._set_tokamax_config(**{name: block for name in blocks})
+    segment_ids = _packed_segment_ids(documents)
+    b, seq_len = segment_ids.shape
+    q, grad_out = (torch.randn(b, seq_len, n_heads, head_dim, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.bfloat16) for _ in range(2))
+    mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+    mask = (segment_ids[:, :, None] == segment_ids[:, None, :]) & mask if packed else mask.expand(b, seq_len, seq_len)
+    ref = [x.float().transpose(1, 2) for x in (q, k, v)]
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      out_ref = F.scaled_dot_product_attention(
+          ref[0], *(x.repeat_interleave(n_heads // n_kv_heads, dim=1) for x in ref[1:]),
+          attn_mask=mask[:, None], scale=scale,
+      ).transpose(1, 2)
+    segment_ids = segment_ids.to(self.accelerator_device) if packed else None
+    self._assert_runs_transposed_bwd(q, k, v)  # same gate as the forward's
+    if tbwd:
+      self._set_tokamax_config(use_transposed_bwd=True)
+    tokamax = self._packed_out_grads(q, k, v, grad_out, segment_ids, scale=scale)
+    self._set_tokamax_config(use_transposed_fwd=True)
+    got = self._packed_out_grads(q, k, v, grad_out, segment_ids, scale=scale)
+    error = ((got[0] - out_ref).norm() / out_ref.norm()).item()
+    tokamax_error = ((tokamax[0] - out_ref).norm() / out_ref.norm()).item()
+    self.assertLess(error, 1.01 * tokamax_error)
+    torch.testing.assert_close(got[0], tokamax[0], rtol=0, atol=2 ** -6)
+    for name, g, t in zip(("dq", "dk", "dv"), got[1:], tokamax[1:]):
+      self.assertLess(((g - t).norm() / t.norm()).item(), 1e-3, name)
+
+  @parameterized.named_parameters(
+      ("non_causal", dict(is_causal=False)),
+      ("window", dict(local_window_size=128)),
+      ("group32", dict(n_heads=32)),
+  )
+  def test_transposed_fwd_falls_back_to_tokamax(self, attn):
+    """Attention splash_tfwd does not support takes Tokamax's forward, with a warning."""
+    torch.manual_seed(7)
+    n_heads = attn.pop("n_heads", 16)
+    segment_ids = _packed_segment_ids(_DOCUMENTS).to(self.accelerator_device)
+    q, grad_out = (torch.randn(2, 2048, n_heads, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(2, 2048, 1, 128, dtype=torch.bfloat16) for _ in range(2))
+    tokamax = self._packed_out_grads(q, k, v, grad_out, segment_ids, **attn)
+    self._set_tokamax_config(use_transposed_fwd=True)
+    tokamax_splash_attention._warn_transposed_fallback.cache_clear()
+    with self.assertLogs(level="WARNING") as logged:
+      got = self._packed_out_grads(q, k, v, grad_out, segment_ids, **attn)
+    self.assertIn("using the Tokamax forward instead of splash_tfwd", "\n".join(logged.output))
     for g, t in zip(got, tokamax):
       torch.testing.assert_close(g, t, rtol=0, atol=0)
 
