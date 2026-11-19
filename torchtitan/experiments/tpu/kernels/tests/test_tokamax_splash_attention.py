@@ -132,6 +132,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("qwen3_235b", (16, 4096, 64, 4, 128)),
       ("group1_dim64", (2, 4096, 16, 16, 64)),
       ("group16_seq10240", (1, 10240, 32, 2, 128)),
+      ("muse_glimmer_seq16384", (1, 16384, 32, 2, 128)),
       ("tile256", (1, 4352, 8, 2, 128)),
       ("dim512_group1", (1, 4096, 4, 4, 512)),
   )
@@ -147,13 +148,26 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("dim48", (2, 4096, 16, 1, 48), "bfloat16", "head_dim"),
       ("seq4100", (2, 4100, 16, 1, 128), "bfloat16", "multiple of 128"),
       ("vmem_dim256_group16", (2, 4096, 16, 1, 256), "bfloat16", "VMEM"),
-      ("vmem_seq12288", (1, 12288, 32, 2, 128), "bfloat16", "VMEM"),
+      ("vmem_seq17920", (1, 17920, 32, 2, 128), "bfloat16", "VMEM"),
       ("smem_batch64_seq16384", (64, 16384, 4, 4, 64), "bfloat16", "SMEM"),
   )
   def test_unsupported(self, shape, dtype, expected):
     b, s, h, n, d = shape
     reason = splash_tbwd.unsupported_reason((b, s, h, d), (b, s, n, d), (b, s, n, d), jnp.dtype(dtype))
     self.assertIn(expected, reason or "")
+
+  @parameterized.named_parameters(
+      # (B, S, H, N, D), expected (stream_kv, single_buffer_kv)
+      ("qwen3_235b", (16, 4096, 64, 4, 128), (False, False)),
+      ("group16_seq10240", (1, 10240, 32, 2, 128), (False, True)),
+      ("muse_glimmer_seq16384", (1, 16384, 32, 2, 128), (True, True)),
+      ("group16_dim64_seq32768", (1, 32768, 32, 2, 64), (True, False)),
+  )
+  def test_kv_modes(self, shape, expected):
+    """K / V stay resident (the old, slightly faster layout) unless only streaming them fits."""
+    b, s, h, n, d = shape
+    block = splash_tbwd.block_size(s)
+    self.assertEqual(splash_tbwd._kv_modes(d, h // n, s, block, None), expected)  # pylint: disable=protected-access
 
   @parameterized.named_parameters(("v_dim64", 64), ("v_dim256", 256))
   def test_v_head_dim_must_match(self, v_head_dim):
@@ -164,7 +178,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
 
   def test_limits_follow_tpu_info(self):
     """The VMEM / SMEM limits are the attached core's capacities less fixed headroom."""
-    # Needs ~56 MiB of VMEM (fits TPU7x's 60 MiB limit) and a 6.6 KiB schedule.
+    # Needs ~49 MiB of VMEM streamed (fits TPU7x's 60 MiB limit, not a 44 MiB one) and a 6.6 KiB schedule.
     shape = ((1, 10240, 32, 128), (1, 10240, 2, 128), (1, 10240, 2, 128), jnp.dtype(jnp.bfloat16))
     for info, expected in (
         (_fake_tpu_info(), None),
@@ -835,6 +849,41 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         # No systematic scale difference from Tokamax's backward (TPU7x: <= 3.1e-4 here). A log2(e) or scale ratio
         # that did not match the forward's bf16 rounding biased every gradient by 1-2e-3.
         self.assertLess(abs((g.norm() / t.norm()).item() - 1), max_norm_bias, name)
+
+  def test_transposed_bwd_stream_kv_matches_resident(self):
+    """Streaming K / V one kv block per step gives bit-identical gradients to keeping them resident."""
+    reason = splash_tbwd.hardware_unsupported_reason()
+    if reason is not None:
+      self.skipTest(reason)
+    b, s, h, n, d = 2, 2048, 8, 2, 128
+    keys = jax.random.split(jax.random.key(3), 5)
+    q, out, do = (jax.random.normal(kk, (b, s, h, d), jnp.bfloat16) for kk in keys[:3])
+    k, v = (jax.random.normal(kk, (b, s, n, d), jnp.bfloat16) for kk in keys[3:])
+    lse2 = jnp.full((b, h, s), 12.0, jnp.float32)
+    seg = jnp.asarray(np.repeat(np.arange(8), s // 8)[None].repeat(b, 0), jnp.int32)
+    grads = {
+        stream: jax.jit(
+            functools.partial(splash_tbwd.transposed_attention_bwd, q_scale=d**-0.5, stream_kv=stream)
+        )(q, k, v, out, lse2, do, seg)
+        for stream in (False, True)
+    }
+    for name, resident, streamed in zip(("dq", "dk", "dv"), grads[False], grads[True]):
+      np.testing.assert_array_equal(np.asarray(resident), np.asarray(streamed), err_msg=name)
+
+  def test_transposed_bwd_long_sequence(self):
+    """At Muse Glimmer's 16k tokens, 32 q / 2 kv heads (fits only with K / V streamed), splash_tbwd matches Tokamax."""
+    torch.manual_seed(7)
+    segment_ids = _packed_segment_ids(((5000, 3000, 8384),))
+    q, grad_out = (torch.randn(1, 16384, 32, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(1, 16384, 2, 128, dtype=torch.bfloat16) for _ in range(2))
+    self._assert_runs_transposed_bwd(q, k, v)
+    segment_ids = segment_ids.to(self.accelerator_device)
+    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids)
+    self._set_tokamax_config(use_transposed_bwd=True)
+    got = self._packed_grads(q, k, v, grad_out, segment_ids)
+    for name, g, t in zip(("dq", "dk", "dv"), got, tokamax):
+      # Both round P / dS to bf16 for the MXU (~3-5e-3 off dense f32 each).
+      self.assertLess(((g - t).norm() / t.norm()).item(), 1e-2, name)
 
   @parameterized.named_parameters(
       dict(testcase_name="logit_std8", logit_std=8.0),
