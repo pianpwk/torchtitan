@@ -1,8 +1,8 @@
 """Kimi K3 (text-only) on the TPU GraphTrainer path.
 
-The model config comes from ``experiments.tpu.kimi_k3.model_registry``; its
-``override.imports`` entries swap in the TPU KDA, MLA and LatentMoE layers.
-``parallelize_kimi_k3`` follows upstream GraphTrainer's
+The model config comes from ``experiments.tpu.kimi_k3.model_registry``; the
+recipes swap in the TPU KDA, MLA and LatentMoE layers through
+``override.imports``. ``parallelize_kimi_k3`` follows upstream GraphTrainer's
 ``parallelize_deepseekv3`` (``model.parallelize``, SimpleFSDP, compile) plus
 the TPU SimpleFSDP policy of ``graph_trainer/deepseek_v3.py``.
 """

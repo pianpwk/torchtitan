@@ -10,8 +10,8 @@
 The ``tiny`` flavor balances experts by quantile balancing alone
 (``quantile_balance``; auxiliary-loss-free, as in the Kimi K3 report).
 
-``model_registry`` builds a text-only K3 config for the TPU lane, which the
-three overrides turn into the TPU layers. This module imports neither
+``model_registry`` builds a text-only K3 config for the TPU lane; the recipes
+in ``config_registry`` add the three overrides. This module imports neither
 ``jax`` nor ``torch_tpu``, so a GPU run can build the same flavors.
 """
 
