@@ -138,6 +138,67 @@ def _producer_output_storage(
     return _tensor_storage_id(outputs[output_index].meta.get("val"))
 
 
+def _functionalize_input_mutations(gm: torch.fx.GraphModule) -> list[int]:
+    """Turn in-place ATen ops on graph inputs into extra graph outputs.
+
+    StaticCompiler lowers the graph functionally: an in-place op on a
+    placeholder updates only the tensor it traces with, so the update is
+    silently lost (e.g. an MoE layer's ``tokens_per_expert_E.add_``, which
+    the expert-bias balancer reads after the step). Each such op becomes its
+    out-of-place overload, later reads of the input use the new value, and
+    the input's final value is appended to the outputs.
+
+    Returns:
+        For each appended output, in order, the position of the input it
+        replaces; ``tpu_backend_compile_pass`` copies it back after running.
+    """
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    position = {node: i for i, node in enumerate(placeholders)}
+    current: dict[torch.fx.Node, torch.fx.Node] = {}
+    for node in list(gm.graph.nodes):
+        if node.op == "output":
+            break
+        for placeholder, value in current.items():
+            node.replace_input_with(placeholder, value)
+        if node.op != "call_function" or not isinstance(
+            node.target, torch._ops.OpOverload
+        ):
+            continue
+        schema = node.target._schema
+        first = schema.arguments[0] if schema.arguments else None
+        alias = first.alias_info if first is not None else None
+        if alias is None or not alias.is_write:
+            continue
+        mutated = node.args[0]
+        input_node = next(
+            (p for p, v in current.items() if v is mutated),
+            mutated if mutated in position else None,
+        )
+        if input_node is None:
+            continue  # An intermediate: traced eagerly, the update is kept.
+        name = schema.name.split("::")[-1]
+        packet = getattr(torch.ops.aten, name.removesuffix("_"), None)
+        if not name.endswith("_") or packet is None:
+            raise NotImplementedError(
+                f"TPU GraphTrainer cannot functionalize {schema.name} on graph"
+                f" input {input_node.name}"
+            )
+        overload = getattr(packet, node.target._overloadname)
+        with gm.graph.inserting_after(node):
+            value = gm.graph.call_function(overload, node.args, node.kwargs)
+        value.meta = dict(node.meta)
+        node.replace_all_uses_with(value)
+        gm.graph.erase_node(node)
+        current[input_node] = value
+    if not current:
+        return []
+    output_node = next(n for n in gm.graph.nodes if n.op == "output")
+    output_node.args = (tuple(output_node.args[0]) + tuple(current.values()),)
+    gm.graph.lint()
+    gm.recompile()
+    return [position[p] for p in current]
+
+
 def _donatable_input_positions(
     parent: torch.fx.GraphModule,
     call: torch.fx.Node,
@@ -333,6 +394,9 @@ def tpu_backend_compile_pass(
             f"optimization_barrier nodes: {ob}"
         )
 
+    mutated_input_positions = _functionalize_input_mutations(gm)
+    if set(mutated_input_positions) & set(donated_input_positions):
+        raise ValueError("TPU GraphTrainer cannot donate an input it updates")
     output_node = next(n for n in gm.graph.nodes if n.op == "output")
     original_outs = output_node.args[0]
     tensor_outs: list = []
@@ -384,14 +448,24 @@ def tpu_backend_compile_pass(
     gm._tpu_executable = executable
 
     if non_tensor_slots:
-        def _compiled_forward(*flat_inputs):
+        def _run(*flat_inputs):
             outs = list(executable(*flat_inputs))
             for pos, val in non_tensor_slots:
                 outs.insert(pos, val)
             return tuple(outs)
     else:
+        _run = executable
+
+    if mutated_input_positions:
+        num_outputs = len(original_outs) - len(mutated_input_positions)
+
         def _compiled_forward(*flat_inputs):
-            return executable(*flat_inputs)
+            outs = _run(*flat_inputs)
+            for pos, val in zip(mutated_input_positions, outs[num_outputs:]):
+                flat_inputs[pos].copy_(val)
+            return tuple(outs[:num_outputs])
+    else:
+        _compiled_forward = _run
 
     gm.forward = _compiled_forward  # type: ignore[method-assign]
     return gm
