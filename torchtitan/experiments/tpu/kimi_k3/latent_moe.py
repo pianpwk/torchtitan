@@ -34,6 +34,9 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
 )
+from torchtitan.experiments.tpu.kimi_k3.quantile_balance import (
+    QuantileBalancedKimiLatentMoE,
+)
 from torchtitan.experiments.tpu.kimi_k3.sharding import reduce_tp_partial, tp_group
 from torchtitan.models.common.moe import _tokens_per_expert  # pylint: disable=protected-access
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
@@ -167,9 +170,27 @@ class TpuKimiLatentMoE(KimiLatentMoE):
     return out_TD
 
 
+class TpuQuantileBalancedKimiLatentMoE(
+    TpuKimiLatentMoE, QuantileBalancedKimiLatentMoE
+):
+  """``TpuKimiLatentMoE`` with ``QuantileBalancedKimiLatentMoE``'s expert bias."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(TpuKimiLatentMoE.Config, QuantileBalancedKimiLatentMoE.Config):
+    pass
+
+
+# Source config type -> TPU config type.
+_TPU_LATENT_MOE = {
+    KimiLatentMoE.Config: TpuKimiLatentMoE.Config,
+    QuantileBalancedKimiLatentMoE.Config: (
+        TpuQuantileBalancedKimiLatentMoE.Config
+    ),
+}
+
+
 @override(
     target=KimiLatentMoE.Config,
-    exact=True,
     description="Kimi K3 LatentMoE on TPU: MegaBlox experts, Ring-of-Experts EP.",
 )
 def tpu_latent_moe(
@@ -180,11 +201,19 @@ def tpu_latent_moe(
 ) -> TpuKimiLatentMoE.Config:
   """K3 LatentMoE with TPU experts and the TPU dispatcher (TP-aware).
 
+  ``KimiLatentMoE`` becomes ``TpuKimiLatentMoE`` and
+  ``QuantileBalancedKimiLatentMoE`` becomes ``TpuQuantileBalancedKimiLatentMoE``.
+
   ``capacity_factor`` (Ring-of-Experts rows per EP rank, in units of the local
   routes; None is drop-free) and ``num_moe_token_chunks`` (Ring-of-Experts
   token chunks) apply only under EP; see ``TpuAllToAllTokenDispatcher`` and
   ``TpuRoutedExperts``.
   """
+  tpu_config_cls = _TPU_LATENT_MOE.get(type(cfg))
+  if tpu_config_cls is None:
+    raise ValueError(
+        f"tpu_latent_moe does not support {type(cfg).__qualname__}"
+    )
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
     raise ValueError(
@@ -193,7 +222,7 @@ def tpu_latent_moe(
     )
   return derive(
       cfg,
-      TpuKimiLatentMoE.Config,
+      tpu_config_cls,
       routed_experts=derive(
           routed,
           TpuRoutedExperts.Config,

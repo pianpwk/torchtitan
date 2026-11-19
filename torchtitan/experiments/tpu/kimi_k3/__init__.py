@@ -8,6 +8,9 @@
 * ``latent_moe.tpu_latent_moe``: LatentMoE with MegaBlox experts and
   Ring-of-Experts expert parallelism.
 
+The ``tiny`` flavor balances experts by quantile balancing
+(``quantile_balance``), as upstream K3 does.
+
 ``model_registry`` builds a text-only K3 config for the TPU lane; the recipes
 in ``config_registry`` add the three overrides. This module imports neither
 ``jax`` nor ``torch_tpu``, so a GPU run can build the same flavors.
@@ -17,6 +20,8 @@ import dataclasses
 
 # Before `torchtitan.models.kimi_k3`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.config.override import derive
+from torchtitan.experiments.tpu.kimi_k3 import quantile_balance
 import torchtitan.models.kimi_k3 as upstream_kimi_k3
 from torchtitan.models.kimi_k3 import KimiK3Model
 from torchtitan.protocols.model_spec import ModelSpec
@@ -31,12 +36,13 @@ def _tiny() -> KimiK3Model.Config:
   KDA + LatentMoE and every 4th layer gated MLA + LatentMoE (3:1, as K3's
   ``range(3, 92, 4)``). Attention residual blocks of 4 layers (two blocks).
   K3's head dims (KDA 128, MLA qk 128 + 64 and v 128), latent dim =
-  dim / 2, sigmoid router with the load-balancing bias, shared experts and
-  an untied LM head. The vocabulary covers the test tokenizer (2020 tokens).
+  dim / 2, sigmoid router whose expert bias is set by quantile balancing
+  (upstream K3's router and 1000 bins), shared experts and an untied LM head.
+  The vocabulary covers the test tokenizer (2020 tokens).
   """
   dim = 512
   # pylint: disable-next=protected-access
-  return upstream_kimi_k3._kimi_k3_config(
+  cfg = upstream_kimi_k3._kimi_k3_config(
       dim=dim,
       vocab_size=2048,
       num_layers=8,
@@ -59,6 +65,19 @@ def _tiny() -> KimiK3Model.Config:
       vision_encoder=None,  # pytype: disable=wrong-arg-types
       attn_backend="flex",
   )
+  for layer in cfg.layers:
+    if layer.moe is not None:
+      layer.moe = derive(
+          layer.moe,
+          quantile_balance.QuantileBalancedKimiLatentMoE.Config,
+          load_balance_coeff=None,
+          router=derive(
+              layer.moe.router,
+              quantile_balance.QuantileBalancedTopKRouter.Config,
+              num_bins=1000,
+          ),
+      )
+  return cfg
 
 
 def _k3_slice(num_experts: int) -> KimiK3Model.Config:
@@ -106,6 +125,18 @@ def _k3_slice(num_experts: int) -> KimiK3Model.Config:
   return cfg
 
 
+def _register_moe_balancing_hooks(optimizers, model_parts, parallel_dims):
+  """Each hook registers only if its MoE layers exist: the sign-based one for
+  ``load_balance_coeff`` (``k3_slice_*``), the quantile one for quantile-
+  balanced routers (``tiny``)."""
+  upstream_kimi_k3.register_moe_load_balancing_hook(
+      optimizers, model_parts, parallel_dims
+  )
+  quantile_balance.register_moe_quantile_balancing_hook(
+      optimizers, model_parts, parallel_dims
+  )
+
+
 # flavor -> (config builder, max context length)
 kimi_k3_tpu_configs = {
     "tiny": (_tiny, 4096),
@@ -125,7 +156,8 @@ def model_registry(flavor: str, *, seq_len: int | None = None) -> ModelSpec:
 
   Returns:
     Upstream's spec (flex MLA and the standard dispatcher, which the TPU
-    overrides replace) without a vision encoder.
+    overrides replace) without a vision encoder, with the flavor's MoE
+    balancing hook.
   """
   get_config, max_context_len = kimi_k3_tpu_configs[flavor]
   context_len = seq_len or max_context_len
@@ -140,4 +172,5 @@ def model_registry(flavor: str, *, seq_len: int | None = None) -> ModelSpec:
       flavor=flavor,
       model=get_config(),
       max_context_length=context_len,
+      post_optimizer_build_fn=_register_moe_balancing_hooks,
   )
