@@ -1989,27 +1989,18 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     self.assertEqual(pipeline_cfg.compile.graph_split.pipeline_kinds, ("rs",))
     apply_tpu_graph_trainer_model_transforms(pipeline_cfg)
 
-  def test_ep_rejects_fsdp_pipeline_and_allows_by_layer(self) -> None:
-    ep_pipeline_cfg = ConfigManager().parse_args([
-        "--module=torchtitan.experiments.tpu.qwen3_5",
-        "--config=graph_trainer_qwen35_moe_debugmodel",
-        "--parallelism.expert_parallel_degree=2",
-        "--compile.no-compile_grad_norm",
-    ])
-    with self.assertRaisesRegex(
-        ValueError, "backward_partition_mode=by_layer"
-    ):
-      apply_tpu_graph_trainer_model_transforms(ep_pipeline_cfg)
-
-    ep_by_layer_cfg = ConfigManager().parse_args([
-        "--module=torchtitan.experiments.tpu.qwen3_5",
-        "--config=graph_trainer_qwen35_moe_debugmodel",
-        "--parallelism.expert_parallel_degree=2",
-        "--compile.no-compile_grad_norm",
-        "--compile.graph_split.backward_partition_mode=by_layer",
-    ])
-    apply_tpu_graph_trainer_model_transforms(ep_by_layer_cfg)
-
+  def test_ep_allows_fsdp_pipeline_and_by_layer(self) -> None:
+    # EP's activation collectives run inside the dispatcher's "EP"-annotated
+    # dispatch / combine, which fsdp_pipeline leaves with their layer.
+    for extra in ([], ["--compile.graph_split.backward_partition_mode=by_layer"]):
+      cfg = ConfigManager().parse_args([
+          "--module=torchtitan.experiments.tpu.qwen3_5",
+          "--config=graph_trainer_qwen35_moe_debugmodel",
+          "--parallelism.expert_parallel_degree=2",
+          "--compile.no-compile_grad_norm",
+          *extra,
+      ])
+      apply_tpu_graph_trainer_model_transforms(cfg)
 
 if __name__ == "__main__":
   absltest.main()
