@@ -108,6 +108,12 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
       graph_config.libtpu_init_flags,
       _LLAMA3_SCAN_FLAGS,
   )
+  # The scan lane keeps the stock splash kernel: the Tokamax / transposed
+  # kernels have not been validated inside scan bodies.
+  splash = graph_config.splash_attention_kernel
+  splash.use_tokamax_splash_attention_kernel = False
+  splash.use_transposed_fwd = False
+  splash.use_transposed_bwd = False
   return graph_config
 
 
@@ -248,6 +254,12 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          # Tokamax path with the one-call transposed forward / backward
+          # (splash_tfwd / splash_tbwd); the sa_block_* tiles below apply
+          # only where those fall back to Tokamax.
+          use_tokamax_splash_attention_kernel=True,
+          use_transposed_fwd=True,
+          use_transposed_bwd=True,
           sa_q_layout="SEQ_MINOR",
           sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
@@ -313,6 +325,12 @@ def llama3_70b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          # Tokamax path with the one-call transposed forward / backward
+          # (splash_tfwd / splash_tbwd); the sa_block_* tiles below apply
+          # only where those fall back to Tokamax.
+          use_tokamax_splash_attention_kernel=True,
+          use_transposed_fwd=True,
+          use_transposed_bwd=True,
           sa_q_layout="SEQ_MINOR",
           sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
@@ -378,6 +396,12 @@ def llama3_405b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          # Tokamax path with the one-call transposed forward / backward
+          # (splash_tfwd / splash_tbwd); the sa_block_* tiles below apply
+          # only where those fall back to Tokamax.
+          use_tokamax_splash_attention_kernel=True,
+          use_transposed_fwd=True,
+          use_transposed_bwd=True,
           sa_q_layout="SEQ_MINOR",
           sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
@@ -468,6 +492,12 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          # Tokamax path with the one-call transposed forward / backward
+          # (splash_tfwd / splash_tbwd); the sa_block_* tiles below apply
+          # only where those fall back to Tokamax.
+          use_tokamax_splash_attention_kernel=True,
+          use_transposed_fwd=True,
+          use_transposed_bwd=True,
           sa_q_layout="SEQ_MINOR",
           sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,

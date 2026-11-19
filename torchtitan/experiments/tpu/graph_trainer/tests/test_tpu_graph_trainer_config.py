@@ -1284,6 +1284,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       llama3_70b,
       llama3_405b,
       sft_llama3_8b_metamath,
+      qwen3_moe_30b,
+  )
+  def test_recipe_uses_transposed_splash(self, recipe) -> None:
+    splash = recipe().splash_attention_kernel
+    self.assertTrue(splash.use_tokamax_splash_attention_kernel)
+    self.assertTrue(splash.use_transposed_fwd)
+    self.assertTrue(splash.use_transposed_bwd)
+
+  @parameterized.parameters(llama3_8b_scan, llama3_70b_scan, llama3_405b_scan)
+  def test_llama3_scan_recipe_keeps_stock_splash(self, recipe) -> None:
+    splash = recipe().splash_attention_kernel
+    self.assertTrue(splash.use_splash_attention_kernel)
+    self.assertFalse(splash.use_tokamax_splash_attention_kernel)
+    self.assertFalse(splash.use_transposed_fwd)
+    self.assertFalse(splash.use_transposed_bwd)
+
+  @parameterized.parameters(
+      llama3_8b,
+      llama3_70b,
+      llama3_405b,
+      sft_llama3_8b_metamath,
   )
   def test_llama3_recipe_uses_pallas_cross_entropy(self, recipe) -> None:
     """`loss_kernel.use_loss_kernel` is the route that does not survive here.

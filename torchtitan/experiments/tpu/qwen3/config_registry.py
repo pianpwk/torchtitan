@@ -769,6 +769,12 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
+      # Tokamax path with the one-call transposed forward / backward
+      # (splash_tfwd / splash_tbwd); the sa_block_* tiles below apply only
+      # where those fall back to Tokamax.
+      use_tokamax_splash_attention_kernel=True,
+      use_transposed_fwd=True,
+      use_transposed_bwd=True,
       sa_block_q=1024,
       sa_block_kv=1024,
       sa_block_dkv=1024,
