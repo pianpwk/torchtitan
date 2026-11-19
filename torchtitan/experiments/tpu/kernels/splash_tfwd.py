@@ -32,8 +32,8 @@ Schedule
 --------
 `splash_tbwd.build_schedule`: grid (N, T) over the active (example, q block,
 kv block) tiles in that order. O^T, m and l of one (example, q block)
-accumulate in VMEM over its run of steps and are written once; K and V^T of
-one (example, kv head) stay resident. A q column's first tiles can be fully
+accumulate in VMEM over its run of steps and are written once; K and V^T are
+fetched one kv block per step. A q column's first tiles can be fully
 masked (its document starts in a later kv block): their m / l / O^T terms are
 exp2(mask - mask) = 1 garbage that the diagonal tile, which always holds the q
 token itself, wipes with exp2(m_old - m) = 0.
@@ -41,10 +41,10 @@ token itself, wipes with exp2(m_old - m) = 0.
 Supported shapes
 ----------------
 splash_tbwd's (`splash_tbwd.unsupported_reason`, checked by the caller).
-VMEM is below splash_tbwd's estimate: per step 14 * G * block * D bytes (q^T
-and o^T blocks, bf16, 2 buffers each; Q2 scratch, bf16; f32 O^T accumulator)
-versus splash_tbwd's 20 * G * block * D, and per (example, kv head) K and V^T
-only, without dK^T / dV^T and their f32 accumulators.
+VMEM does not depend on S and is below splash_tbwd's estimate: per step
+14 * G * block * D bytes (q^T and o^T blocks, bf16, 2 buffers each; Q2
+scratch, bf16; f32 O^T accumulator) versus splash_tbwd's 20 * G * block * D,
+and no per-sequence residents.
 """
 
 import functools
@@ -123,9 +123,8 @@ def _kernel(
       q2_GDQ[g] = _round_q(q_GDQ_ref[g], q_scale, q_ratio, q_dtype)
 
   def tile(masked: bool) -> None:
-    kv = pl.ds(kv_start, block)
-    k_CD = k_SD_ref[kv, :]
-    vt_DC = v_DS_ref[:, kv]
+    k_CD = k_SD_ref[...]
+    vt_DC = v_DS_ref[...]
     if masked:
       k_pos = kv_start + lax.broadcasted_iota(jnp.int32, (block, block), 0)
       q_pos = q_block * block + lax.broadcasted_iota(
@@ -184,7 +183,6 @@ def splash_tfwd_call(
     block: int,
     q_scale: float,
     q_ratio: float = 1.0,
-    single_buffer_kv: bool = False,
     window: int | None = None,
 ):
   """The pallas_call on kernel layouts.
@@ -198,7 +196,6 @@ def splash_tfwd_call(
     qseg_B8S, kvseg_BSL: segment ids broadcast to 8 rows / 128 lanes.
     block: tile size (q block = kv block).
     q_scale, q_ratio: see `splash_tbwd.splash_tbwd_call`.
-    single_buffer_kv: one VMEM buffer for the per-(example, kv head) K / V^T.
     window: sliding window (`splash_tbwd.build_schedule`); None is causal.
 
   Returns:
@@ -211,20 +208,27 @@ def splash_tfwd_call(
   def q_seq_minor(h, t, b, qi, *_):
     return (b[t], h, 0, qi[t])
 
-  def per_kv_head(h, t, b, *_):
-    return (b[t], h, 0, 0)
-
   def q_segments(h, t, b, qi, *_):
     return (b[t], 0, qi[t])
 
   def kv_segments(h, t, b, qi, kj, *_):
     return (b[t], kj[t], 0)
 
-  resident = dict(pipeline_mode=pl.Buffered(1)) if single_buffer_kv else {}
+  def kv_seq_minor(h, t, b, qi, kj, *_):
+    return (b[t], h, 0, kj[t])
+
+  def kv_head_dim_minor(h, t, b, qi, kj, *_):
+    return (b[t], h, kj[t], 0)
+
+  # K and V^T: one kv block per step (no per-sequence residents, so VMEM does
+  # not depend on S).
+  kv_specs = [
+      pl.BlockSpec((None, None, block, d), kv_head_dim_minor),
+      pl.BlockSpec((None, None, d, block), kv_seq_minor),
+  ]
   in_specs = [
       pl.BlockSpec((None, g, d, block), q_seq_minor),
-      pl.BlockSpec((None, None, s, d), per_kv_head, **resident),
-      pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
+      *kv_specs,
       pl.BlockSpec((None, 8, block), q_segments),
       pl.BlockSpec((None, block, NUM_LANES), kv_segments),
   ]

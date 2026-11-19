@@ -42,8 +42,8 @@ arrays are sized to the data-independent bound B * nb * (nb + 1) / 2
   - dQ of one (example, q block) accumulates in VMEM over its run of steps and
     is written once;
   - dK^T / dV^T of one (example, kv head) stay resident in VMEM as [D, S] f32
-    for the whole sequence, and so do K / V; there are no HBM partial sums and
-    no reduction op;
+    for the whole sequence; there are no HBM partial sums and no reduction
+    op. K^T / V^T / K are fetched one kv block per step;
   - each step processes all G query heads of its kv head (K^T / V^T / K
     loaded once per step).
 A tile is skipped when its q and kv blocks share no segment id ([min, max]
@@ -66,26 +66,24 @@ Supported shapes
 - S: multiple of 128, q and kv equal length. Tile (q block = kv block) is
   512 if it divides S, else 256, else 128. Upper bound from VMEM (below).
 - B: any; the upper bound comes from SMEM (below).
-- VMEM: K / V and the dK^T / dV^T accumulators stay resident for the whole
-  sequence, so VMEM grows with D * S. This estimate (`_vmem_bytes`, bytes)
-  must stay within the VMEM limit (the core's VMEM less 4 MiB: 60 MiB on
-  TPU7x), with Dl = D rounded up to 128 lanes and kv_buffers = 1 (2 when that
-  fits):
+- VMEM: the dK^T / dV^T accumulators stay resident for the whole sequence,
+  so VMEM grows with D * S. This estimate (`_vmem_bytes`, bytes) must stay
+  within the VMEM limit (the core's VMEM less 4 MiB: 60 MiB on TPU7x), with
+  Dl = D rounded up to 128 lanes and kv_buffers = 1 (2 when that fits):
 
     12 * G * block * D           q^T, dO^T, o^T blocks: bf16, 2 buffers
     + 8 * G * block * Dl         dq block: bf16, 2 buffers, + f32 accumulator
-    + kv_buffers * S * (8 * D    K^T, V^T, dK^T, dV^T blocks: [D, S] bf16
-        + 2 * Dl + 32)           K block: [S, Dl] bf16; kv segment ids: int32
+    + 2 * block * (4 * D         K^T, V^T [D, block], K [block, Dl] bf16, kv
+        + 2 * Dl + 32)           segment ids [8, block] int32: 2 buffers
+    + kv_buffers * 4 * S * D     dK^T, dV^T output blocks: [D, S] bf16
     + 8 * S * D                  f32 dK^T, dV^T accumulators
     + 1 KiB * G * D + 11 MiB     compiler temporaries (fit to TPU7x compile
                                  reports) + small blocks (q segment ids, lse2)
 
-  It is never below the exact block sizes plus a temporaries fit that matched
-  every compile failure seen (D = 128..512, G = 8 / 16, S = 4k..128k). With
-  512 tiles (S a multiple of 512):
-    G = 16, D = 64:  S <= 27136
-    G = 16, D = 128: S <= 11776
-    G = 8,  D = 256: S <= 5632
+  With 512 tiles (S a multiple of 512):
+    G = 16, D = 64:  S <= 45568
+    G = 16, D = 128: S <= 17408
+    G = 8,  D = 256: S <= 8192
     G = 16, D = 256: S <= 1024
   Past the real limit Mosaic fails at compile time with RESOURCE_EXHAUSTED.
 - SMEM: the 8 int32 schedule arrays hold every causal tile, so
@@ -313,7 +311,7 @@ def _kernel(
     lse2_GQ_ref: jax.Ref,
     o_GDQ_ref: jax.Ref,
     qseg_QL_ref: jax.Ref,
-    kvseg_8S_ref: jax.Ref,
+    kvseg_8C_ref: jax.Ref,
     # outputs (VMEM blocks)
     dq_GQD_ref: jax.Ref,
     dkt_DS_ref: jax.Ref,
@@ -372,16 +370,16 @@ def _kernel(
     """All G query heads on the whole tile."""
     kv = pl.ds(kv_start, block)
     # Shared by all heads: K^T / V^T / K slices and the element mask.
-    kt_DC = k_DS_ref[:, kv]
-    vt_DC = v_DS_ref[:, kv]
-    k_CD = k_SD_ref[kv, :]
+    kt_DC = k_DS_ref[...]
+    vt_DC = v_DS_ref[...]
+    k_CD = k_SD_ref[...]
     if masked:
       q_pos = q_block * block + lax.broadcasted_iota(
           jnp.int32, (block, block), 0
       )
       k_pos = kv_start + lax.broadcasted_iota(jnp.int32, (block, block), 1)
       qseg_QC = jnp.tile(qseg_QL_ref[...], (1, block // NUM_LANES))
-      mask_QC = (q_pos >= k_pos) & (qseg_QC == kvseg_8S_ref[0:1, kv])
+      mask_QC = (q_pos >= k_pos) & (qseg_QC == kvseg_8C_ref[0:1, :])
       if window is not None:
         mask_QC &= q_pos - k_pos <= window
 
@@ -519,27 +517,47 @@ def splash_tbwd_call(
   ) -> _BlockIndex:
     return (b[t], qi[t], 0)
 
-  def kv_segments(
-      h: jax.Array, t: jax.Array, b: jax.Ref, *_: jax.Ref
+  def kv_seq_minor(
+      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, kj: jax.Ref,
+      *_: jax.Ref
   ) -> _BlockIndex:
-    return (b[t], 0, 0)
+    return (b[t], h, 0, kj[t])
 
-  # The per-(example, kv head) arrays change block only when the example or kv
-  # head does, so their second buffer only prefetches the next example's K / V.
-  # Dropping it (single_buffer_kv) frees VMEM for ~1.5x longer sequences, at ~1%
-  # kernel time (Q235 shape: the DMA at each of the 64 example / kv head changes
-  # is no longer hidden).
+  def kv_head_dim_minor(
+      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, kj: jax.Ref,
+      *_: jax.Ref
+  ) -> _BlockIndex:
+    return (b[t], h, kj[t], 0)
+
+  def kv_segments(
+      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, kj: jax.Ref,
+      *_: jax.Ref
+  ) -> _BlockIndex:
+    return (b[t], 0, kj[t])
+
+  # The dK^T / dV^T output blocks change only when the example or kv head does,
+  # so their second buffer only overlaps the write-back of the previous
+  # example's. Dropping it (single_buffer_kv) frees VMEM for longer sequences.
   resident = dict(pipeline_mode=pl.Buffered(1)) if single_buffer_kv else {}
+
+  # K^T, V^T, K and the kv segment ids: one kv block per step. Each step's
+  # three [block, D] tiles are small next to its compute (Q235: ~0.4 MiB per
+  # ~10 us step), so streaming them costs nothing measurable and frees VMEM
+  # for longer sequences.
+  kv_specs = [
+      pl.BlockSpec((None, None, d, block), kv_seq_minor),
+      pl.BlockSpec((None, None, block, d), kv_head_dim_minor),
+      pl.BlockSpec((None, None, d, block), kv_seq_minor),
+  ]
+  kvseg_spec = pl.BlockSpec((None, 8, block), kv_segments)
   in_specs = [
       pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, g, d, block), q_seq_minor),
-      pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
-      pl.BlockSpec((None, None, s, d), per_kv_head, **resident),
-      pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
+      *kv_specs,
       pl.BlockSpec((None, None, g, block), q_seq_minor),
       pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, block, NUM_LANES), q_segments),
-      pl.BlockSpec((None, 8, s), kv_segments, **resident),
+      kvseg_spec,
   ]
   out_specs = [
       pl.BlockSpec((None, g, block, d), q_head_dim_minor),
@@ -671,8 +689,11 @@ def _vmem_bytes(
   d_lanes = _round_up(d, NUM_LANES)
   # q^T, dO^T, o^T: bf16, 2 buffers. dq: bf16, 2 buffers, + f32 accumulator.
   per_step = 12 * g * block * d + 8 * g * block * d_lanes
-  # K^T, V^T, dK^T, dV^T [D, S] and K [S, Dl]: bf16. kv segment ids: int32.
-  per_kv_head = kv_buffers * s * (8 * d + 2 * d_lanes + 32)
+  # K^T, V^T [D, block], K [block, Dl] bf16, kv segment ids [8, block] int32:
+  # 2 buffers.
+  per_step += 2 * block * (4 * d + 2 * d_lanes + 32)
+  # dK^T, dV^T [D, S] bf16.
+  per_kv_head = kv_buffers * s * 4 * d
   dkv_accumulators = 8 * s * d  # f32 dK^T, dV^T
   # Compiler temporaries (fit to TPU7x compile reports) + small blocks.
   other = g * d * 1024 + (11 << 20)

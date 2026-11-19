@@ -132,6 +132,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("qwen3_235b", (16, 4096, 64, 4, 128)),
       ("group1_dim64", (2, 4096, 16, 16, 64)),
       ("group16_seq10240", (1, 10240, 32, 2, 128)),
+      ("muse_glimmer_seq16384", (1, 16384, 32, 2, 128)),
       ("tile256", (1, 4352, 8, 2, 128)),
       ("dim512_group1", (1, 4096, 4, 4, 512)),
   )
@@ -147,7 +148,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("dim48", (2, 4096, 16, 1, 48), "bfloat16", "head_dim"),
       ("seq4100", (2, 4100, 16, 1, 128), "bfloat16", "multiple of 128"),
       ("vmem_dim256_group16", (2, 4096, 16, 1, 256), "bfloat16", "VMEM"),
-      ("vmem_seq12288", (1, 12288, 32, 2, 128), "bfloat16", "VMEM"),
+      ("vmem_seq17920", (1, 17920, 32, 2, 128), "bfloat16", "VMEM"),
       ("smem_batch64_seq16384", (64, 16384, 4, 4, 64), "bfloat16", "SMEM"),
   )
   def test_unsupported(self, shape, dtype, expected):
@@ -164,7 +165,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
 
   def test_limits_follow_tpu_info(self):
     """The VMEM / SMEM limits are the attached core's capacities less fixed headroom."""
-    # Needs ~56 MiB of VMEM (fits TPU7x's 60 MiB limit) and a 6.6 KiB schedule.
+    # Needs ~49 MiB of VMEM (fits TPU7x's 60 MiB limit, not a 44 MiB one) and a 6.6 KiB schedule.
     shape = ((1, 10240, 32, 128), (1, 10240, 2, 128), (1, 10240, 2, 128), jnp.dtype(jnp.bfloat16))
     for info, expected in (
         (_fake_tpu_info(), None),
@@ -848,6 +849,26 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         # No systematic scale difference from Tokamax's backward (TPU7x: <= 3.1e-4 here). A log2(e) or scale ratio
         # that did not match the forward's bf16 rounding biased every gradient by 1-2e-3.
         self.assertLess(abs((g.norm() / t.norm()).item() - 1), max_norm_bias, name)
+
+  @parameterized.named_parameters(
+      # Muse Glimmer's attention: 16k tokens, 32 q / 2 kv heads; sliding-window and global layers.
+      ("window2047", 2047),
+      ("global", None),
+  )
+  def test_transposed_long_sequence(self, window):
+    """splash_tfwd + splash_tbwd at the VMEM bound's scale (S = 16384, G = 16) match the Tokamax forward / backward."""
+    torch.manual_seed(7)
+    segment_ids = _packed_segment_ids(((5000, 3000, 8384),))
+    q, grad_out = (torch.randn(1, 16384, 32, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(1, 16384, 2, 128, dtype=torch.bfloat16) for _ in range(2))
+    self._assert_runs_transposed_bwd(q, k, v, window)
+    segment_ids = segment_ids.to(self.accelerator_device)
+    tokamax = self._packed_out_grads(q, k, v, grad_out, segment_ids, local_window_size=window)
+    self._set_tokamax_config(use_transposed_fwd=True, use_transposed_bwd=True)
+    got = self._packed_out_grads(q, k, v, grad_out, segment_ids, local_window_size=window)
+    for name, g, t in zip(("out", "dq", "dk", "dv"), got, tokamax):
+      # Both round P / dS to bf16 for the MXU (~3-5e-3 off dense f32 each).
+      self.assertLess(((g - t).norm() / t.norm()).item(), 1e-2, name)
 
   @parameterized.named_parameters(
       dict(testcase_name="logit_std8", logit_std=8.0),
