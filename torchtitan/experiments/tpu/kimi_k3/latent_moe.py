@@ -30,6 +30,9 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
 )
+from torchtitan.experiments.tpu.kimi_k3.quantile_balance import (
+    QuantileBalancedKimiLatentMoE,
+)
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.kimi_k3.moe import KimiLatentMoE
 
@@ -100,11 +103,20 @@ class TpuKimiGroupedExperts(TpuGroupedExperts):
 
 @override(
     target=KimiLatentMoE.Config,
-    exact=True,
     description="Kimi K3 LatentMoE on TPU: MegaBlox experts.",
 )
 def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
-  """K3 LatentMoE with TPU experts and the TPU dispatcher."""
+  """K3 LatentMoE with TPU experts and the TPU dispatcher.
+
+  Takes ``KimiLatentMoE`` and ``QuantileBalancedKimiLatentMoE`` and keeps the
+  layer's type.
+  """
+  if type(cfg) not in (
+      KimiLatentMoE.Config, QuantileBalancedKimiLatentMoE.Config
+  ):
+    raise ValueError(
+        f"tpu_latent_moe does not support {type(cfg).__qualname__}"
+    )
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
     raise ValueError(
