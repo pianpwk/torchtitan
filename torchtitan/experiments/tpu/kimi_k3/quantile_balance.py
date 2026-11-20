@@ -24,8 +24,16 @@ histogram, mean-centered.
 Adaptations to this fork (TODO: drop this file once the fork rebases onto
 upstream's ``common/moe``):
 
-* The fork's MoE, not its router, owns ``tokens_per_expert_E``; the hook zeroes
-  it there.
+* No in-place write in the TPU compiled step: under TPU GraphTrainer,
+  ``observe`` returns each forward's histogram as an output of the compiled
+  step (``QuantileBalancer.step_output``), which the trainer adds to the
+  buffer outside the graph (``consume_step_output``); eagerly it adds it to
+  the buffer in the forward, as upstream does. Upstream's in-place
+  ``scatter_add_`` on the buffer would be dropped by TPU StaticCompiler, which
+  lowers the step functionally, and the bias would never move. TODO: upstream
+  this histogram-as-output form.
+* The hook does not zero the MoE's ``tokens_per_expert_E``: only upstream's
+  sign-based balancer reads it, and K3 on TPU does not use it.
 * The fork's router has no padding mask, so ``observe`` always gets None.
 * The fork's router names its score function by string, and its node-limited
   routing and ``_debug_force_load_balance`` bypass the quantile cutoff; the
@@ -125,6 +133,12 @@ class QuantileBalancer(Module):
         torch.zeros(config.num_experts, config.num_bins, dtype=torch.int32),
         persistent=False,
     )
+    # Set by the TPU GraphTrainer, whose compiled step drops in-place buffer
+    # writes: `observe` then keeps this forward's histogram for the step to
+    # return (`step_output`), and the trainer adds it to the buffer outside
+    # the graph (`consume_step_output`).
+    self.emit_step_output = False
+    self._step_histogram_EB: torch.Tensor | None = None
 
   def observe(
       self,
@@ -157,11 +171,27 @@ class QuantileBalancer(Module):
         histogram_updates_ET = histogram_updates_ET * (
             ~padding_mask_T
         ).unsqueeze(0)
-      self.required_bias_histogram_EB.scatter_add_(
-          1,
-          bin_indices_ET,
-          histogram_updates_ET,
+      histogram_EB = torch.zeros_like(
+          self.required_bias_histogram_EB
+      ).scatter_add(1, bin_indices_ET, histogram_updates_ET)
+      if self.emit_step_output:
+        self._step_histogram_EB = histogram_EB
+      else:
+        self.required_bias_histogram_EB.add_(histogram_EB)
+
+  def step_output(self) -> torch.Tensor:
+    """This forward's ``[E, num_bins]`` histogram, for the compiled step."""
+    if self._step_histogram_EB is None:
+      raise RuntimeError(
+          "QuantileBalancer.step_output: the forward observed no training"
+          " batch."
       )
+    histogram_EB, self._step_histogram_EB = self._step_histogram_EB, None
+    return histogram_EB
+
+  def consume_step_output(self, histogram_EB: torch.Tensor) -> None:
+    """Adds a compiled step's histogram, outside the graph."""
+    self.required_bias_histogram_EB.add_(histogram_EB)
 
   def estimate_expert_bias(
       self,
@@ -295,7 +325,6 @@ def register_moe_quantile_balancing_hook(
       )
       expert_bias_E.copy_(next_expert_bias_E)
       quantile_balancer.required_bias_histogram_EB.zero_()
-      moe.tokens_per_expert_E.zero_()
 
   optimizers.register_step_pre_hook(
       lambda *args, **kwargs: _update_expert_bias()

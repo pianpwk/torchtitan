@@ -65,6 +65,19 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
 
+def _step_output_modules(model: nn.Module) -> list[nn.Module]:
+    """Modules that return a per-forward statistic from the compiled step.
+
+    The TPU compiled step drops in-place writes to module buffers (StaticCompiler
+    lowers it functionally), so a module that accumulates a statistic in its
+    forward (e.g. Kimi K3's quantile balancer histogram) instead keeps one
+    fixed-shape tensor per forward when ``emit_step_output`` is set, which the
+    step returns (``step_output``), and adds it to its buffer outside the graph
+    (``consume_step_output``), like the MoE routing metrics.
+    """
+    return [m for m in model.modules() if hasattr(m, "consume_step_output")]
+
+
 class TpuGraphTrainer(GraphTrainer):
     """Branched specialization of GraphTrainer for TPU/PJRT execution.
 
@@ -193,6 +206,7 @@ class TpuGraphTrainer(GraphTrainer):
 
         if self._optimizer_in_graph:
             self._opt_state_registered = False
+        self._step_output_modules: list[nn.Module] = []
 
         self._optimizer_separate_graph = (
             config.compile.optimizer_compile == "separate_graph"
@@ -392,14 +406,25 @@ class TpuGraphTrainer(GraphTrainer):
             remove_parameter_gradient_markers_pass,
         )
         if self._traced_step is None:
+            self._step_output_modules = _step_output_modules(model)
+            for module in self._step_output_modules:
+                module.emit_step_output = True
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
-                fwd_bwd_fn = make_fwd_bwd_step(
+                step_fn = make_fwd_bwd_step(
                     model,
                     self.loss_fn,
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
+                step_output_modules = self._step_output_modules
+
+                def fwd_bwd_fn(*args):
+                    return [
+                        *step_fn(*args),
+                        *(m.step_output() for m in step_output_modules),
+                    ]
+
                 maybe_register_blockmask_pytree_node()
                 trace_context = dist_utils.get_spmd_context(
                     parallel_dims=self.parallel_dims,
@@ -451,6 +476,15 @@ class TpuGraphTrainer(GraphTrainer):
                 global_valid_tokens,
                 extra_kwargs,
             )
+        if self._step_output_modules:
+            num_step_outputs = len(self._step_output_modules)
+            for module, value in zip(
+                self._step_output_modules,
+                outputs[-num_step_outputs:],
+                strict=True,
+            ):
+                module.consume_step_output(value)
+            outputs = outputs[:-num_step_outputs]
         loss = outputs[0]
         grads = outputs[1 : 1 + len(params)]
         if self._collect_moe_routing_metrics:
@@ -506,6 +540,11 @@ class TpuGraphTrainer(GraphTrainer):
         )
 
         if self._traced_step is None:
+            if _step_output_modules(model):
+                raise NotImplementedError(
+                    "optimizer_compile='in_graph' does not return module step"
+                    " outputs (e.g. the quantile balancer's histogram)"
+                )
             maybe_register_blockmask_pytree_node()
             param_fqns = list(self._optstate_param_fqns)
             betas = tuple(self.optimizers.optimizers[0].param_groups[0]["betas"])
