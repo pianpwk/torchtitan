@@ -778,6 +778,12 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="window511_no_segment_ids", n_heads=16, n_kv_heads=1, head_dim=128, packed=False,
            window=511),
       dict(testcase_name="window1023", n_heads=8, n_kv_heads=4, head_dim=128, window=1023),
+      # A window across 256-token tiles; Gemma 4's sliding layers (head_dim 256, softmax scale 1.0, so the
+      # non-default-scale q rounding, window 1023).
+      dict(testcase_name="window300_tile256", n_heads=8, n_kv_heads=2, head_dim=128,
+           documents=((300, 517, 77, 898), (1000, 48, 744)), block=256, window=300),
+      dict(testcase_name="gemma4_window1023_dim256_scale1", n_heads=4, n_kv_heads=2, head_dim=256, scale=1.0,
+           window=1023),
   )
   def test_transposed_bwd_matches_reference(
       self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, block=None, scale=None,
@@ -869,13 +875,15 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         # that did not match the forward's bf16 rounding biased every gradient by 1-2e-3.
         self.assertLess(abs((g.norm() / t.norm()).item() - 1), max_norm_bias, name)
 
-  @parameterized.named_parameters(("causal", None), ("window300", 300))
-  def test_transposed_bwd_stream_kv_matches_resident(self, window):
+  @parameterized.named_parameters(
+      ("causal", None, 2048), ("window300", 300, 2048), ("window300_tile256", 300, 2304)
+  )
+  def test_transposed_bwd_stream_kv_matches_resident(self, window, s):
     """Streaming K / V one kv block per step gives bit-identical gradients to keeping them resident."""
     reason = splash_tbwd.hardware_unsupported_reason()
     if reason is not None:
       self.skipTest(reason)
-    b, s, h, n, d = 2, 2048, 8, 2, 128
+    b, h, n, d = 2, 8, 2, 128
     keys = jax.random.split(jax.random.key(3), 5)
     q, out, do = (jax.random.normal(kk, (b, s, h, d), jnp.bfloat16) for kk in keys[:3])
     k, v = (jax.random.normal(kk, (b, s, n, d), jnp.bfloat16) for kk in keys[3:])
