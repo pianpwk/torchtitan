@@ -100,11 +100,13 @@ def _graph_trainer_kimi_k3_slice(flavor: str) -> TpuGraphTrainer.Config:
   Model: see ``kimi_k3._k3_slice`` (3 layers at K3's widths; 34.2B / 8.8B
   parameters, 5.6B activated, for 448 / 64 routed experts).
   Run: eight packed 4096-token rows (32,768 tokens) per data-parallel rank
-  and microbatch, 8 steps; otherwise ``graph_trainer_kimi_k3_tiny``'s
+  and microbatch (under dense TP2, the target's 16,384 routed tokens per core,
+  m = 1; ``--training.num_tokens_per_microbatch_per_dp_rank 16384`` gives
+  the m = 2 microbatch), 8 steps; otherwise ``graph_trainer_kimi_k3_tiny``'s
   optimizer, schedule, rematerialization and compilation. Balanced forced
   routing (see the flavor) and Ring-of-Experts at capacity factor 1.0 under
   ``--parallelism.expert_parallel_degree`` > 1. Parallelism: SimpleFSDP over
-  every rank by default; set EP by flag.
+  every rank by default; set EP and TP by flag.
   """
   cfg = graph_trainer_kimi_k3_tiny()
   seq_len = 4096

@@ -13,6 +13,7 @@ and ``KimiK3TransformerBlock`` is not one, so the experts are sharded here.
 import dataclasses
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
 from torch import nn
 from torchtitan.config import (
@@ -21,6 +22,7 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 from torchtitan.distributed.activation_checkpoint import (
     ActivationCheckpointingConfig,
 )
@@ -40,6 +42,9 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu import kimi_k3 as tpu_kimi_k3
+from torchtitan.experiments.tpu.kimi_k3.sharding import (
+    set_kimi_k3_tp_sharding_config,
+)
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
@@ -58,7 +63,15 @@ class GraphTrainerKimiK3Model(KimiK3Model):
 
   @dataclass(kw_only=True, slots=True)
   class Config(KimiK3Model.Config):
-    pass
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      super(GraphTrainerKimiK3Model.Config, self).update_from_config(
+          config=config, **kwargs
+      )
+      if config.parallelism.tensor_parallel_degree > 1:
+        set_kimi_k3_tp_sharding_config(
+            self, enable_ep=config.parallelism.expert_parallel_degree > 1
+        )
 
   def init_states(self, *, buffer_device: torch.device | None = None) -> None:
     with disable_active_parametrization():
@@ -144,8 +157,31 @@ def _shard_uneven_dim0_params(
           mode,
           mp_policy=mp_policy,
           shard_dim=1,
+          non_dp_mesh=parallel_dims.get_optional_mesh("tp"),
           ignored_params=set(holder.parameters()) - own,
       )
+
+
+def _check_tp_layers(model: GraphTrainerKimiK3Model) -> None:
+  """TP needs the TPU layers, whose forwards run the TP collectives."""
+  # Imported here: the layer modules import jax / Tokamax, which must not load
+  # before the CLI parses the config (it breaks tyro's type checks).
+  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.kimi_k3.latent_moe import TpuKimiLatentMoE
+  from torchtitan.experiments.tpu.kimi_k3.tokamax_kda import TpuKDA
+  from torchtitan.experiments.tpu.kimi_k3.tokamax_mla import TpuKimiMLAAttention
+  # pylint: enable=g-import-not-at-top
+  for name, block in model.layers.items():
+    for module, tp_type, override_name in (
+        (block.delta_attention, TpuKDA, "tokamax_kda_attention"),
+        (block.attention, TpuKimiMLAAttention, "tokamax_mla_attention"),
+        (block.moe, TpuKimiLatentMoE, "tpu_latent_moe"),
+    ):
+      if module is not None and not isinstance(module, tp_type):
+        raise ValueError(
+            f"TP needs {tp_type.__name__} in layer {name}, got"
+            f" {type(module).__name__}; add the {override_name} override"
+        )
 
 
 def parallelize_kimi_k3(
@@ -158,18 +194,25 @@ def parallelize_kimi_k3(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
-  """Applies EP, SimpleFSDP and GraphTrainer compile to text-only K3."""
+  """Applies TP, EP, SimpleFSDP and GraphTrainer compile to text-only K3."""
   # GraphTrainer recomputes per `compile.memory_policy`.
   del ac_config
   # The TPU registry has no pipelining_fn; CP is not wired for KDA / MLA.
   if parallel_dims.cp_enabled or parallel_dims.pp_enabled:
     raise NotImplementedError("TPU GraphTrainer K3 does not support CP or PP.")
-  if parallel_dims.tp_enabled:
-    raise NotImplementedError("TPU GraphTrainer K3 does not support TP.")
   annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
+  if parallel_dims.tp_enabled:
+    _check_tp_layers(model)
   model.parallelize(parallel_dims)
+  if parallel_dims.tp_enabled:
+    # Parameters `set_kimi_k3_tp_sharding_config` leaves undeclared live on
+    # the invariant residual stream (see kimi_k3/sharding.py).
+    with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
+      for param in model.parameters():
+        if not spmd.has_local_type(param):
+          spmd.assert_type(param, spmd.I)
 
   configure_simple_fsdp_shard_dims(model, parallel_dims)
   if parallel_dims.ep_enabled:

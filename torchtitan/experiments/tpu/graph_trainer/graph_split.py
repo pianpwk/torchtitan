@@ -719,9 +719,10 @@ def _collect_backward_collective_owners(
   for launch, role in classify_fsdp_roles(collective_chains).items():
     if role is None:
       # Token traffic annotated "EP" (Ring-of-Experts' all-gather /
-      # reduce-scatter) is activation traffic, not FSDP: it stays with its
-      # inputs.
-      if "EP" in (launch.meta.get("custom") or {}):
+      # reduce-scatter) or "TP" (e.g. LatentMoE's token shard, whose backward
+      # all-gathers over TP) is activation traffic, not FSDP: it stays with
+      # its inputs.
+      if {"EP", "TP"} & (launch.meta.get("custom") or {}).keys():
         continue
       if (is_gather(launch) and "ag" in pipelined_kinds) or (
           is_reduce_scatter(launch) and "rs" in pipelined_kinds
