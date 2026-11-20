@@ -177,22 +177,34 @@ def _gated_delta(
 ) -> jax.Array:
   """Gated delta rule via Mosaic KDA; ``[B, T, H, D]`` in and out.
 
-  ``segment_ids`` (``[B, T]``, 1-based per row) restarts the recurrence at
-  every document, with at most ``max_num_segments`` documents per row.
+  ``g`` is GatedDeltaNet's per-head log decay ``[B, T, H]`` (clamped to
+  ``min_log_decay``, broadcast over the key channels, with ``beta`` cast to
+  ``q``'s dtype) or KDA's per-channel log decay ``[B, T, H, K]`` (passed to
+  the kernels as is, with ``beta`` as is). ``segment_ids`` (``[B, T]``,
+  1-based per row) restarts the recurrence at every document, with at most
+  ``max_num_segments`` documents per row.
   """
   q_h, k_h, v_h = _heads_first(q), _heads_first(k), _heads_first(v)
-  # NOTE: Post-0.0.17 Tokamax (`openxla/tokamax@eeb06e7`) adds scalar-gate
-  # `per_channel_gate=False` (`gate` shape `[H, B, T, 1]`), bypassing the
-  # per-channel backward `exp2(g_max - g_b)` re-centering. Revisit dropping
-  # both the `-5` clamp and `[H, B, T, K]` broadcast on the next release.
-  log_decay = jnp.maximum(_heads_first(g).astype(jnp.float32), min_log_decay)
-  gate = jnp.broadcast_to(log_decay[..., None], q_h.shape)
+  if g.ndim == q.ndim:
+    # Per-channel decay (Kimi K3's KDA): the caller keeps it in the kernels'
+    # range and picks beta's dtype.
+    gate, beta_h = _heads_first(g), _heads_first(beta)
+  else:
+    # NOTE: Post-0.0.17 Tokamax (`openxla/tokamax@eeb06e7`) adds scalar-gate
+    # `per_channel_gate=False` (`gate` shape `[H, B, T, 1]`), bypassing the
+    # per-channel backward `exp2(g_max - g_b)` re-centering. Revisit dropping
+    # both the `-5` clamp and `[H, B, T, K]` broadcast on the next release.
+    log_decay = jnp.maximum(
+        _heads_first(g).astype(jnp.float32), min_log_decay
+    )
+    gate = jnp.broadcast_to(log_decay[..., None], q_h.shape)
+    beta_h = _heads_first(beta).astype(q.dtype)
   out, _ = _require_tokamax_kda()(
       q_h,
       k_h,
       v_h,
       gate,
-      _heads_first(beta).astype(q.dtype),
+      beta_h,
       use_qk_l2norm=True,
       segment_ids=segment_ids,
       max_num_segments=max_num_segments,
@@ -481,9 +493,12 @@ def tokamax_gated_delta(
     q: ``(bs, seq_len, n_heads, key_head_dim)`` un-normalized queries.
     k: ``(bs, seq_len, n_heads, key_head_dim)`` un-normalized keys.
     v: ``(bs, seq_len, n_heads, value_head_dim)`` values.
-    g: ``(bs, seq_len, n_heads)`` log-space decay (negative).
-    beta: ``(bs, seq_len, n_heads)`` update gate in ``(0, 1)``.
-    min_log_decay: ``g`` is clamped to at least this value (see
+    g: ``(bs, seq_len, n_heads)`` per-head log-space decay (negative), or
+      ``(bs, seq_len, n_heads, key_head_dim)`` per-channel fp32 log decay
+      (KDA) already in ``[MIN_SUPPORTED_LOG_DECAY, 0]``.
+    beta: ``(bs, seq_len, n_heads)`` update gate in ``(0, 1)``; cast to
+      ``q.dtype`` with a per-head ``g``, used as is with a per-channel one.
+    min_log_decay: A per-head ``g`` is clamped to at least this value (see
       ``DEFAULT_MIN_LOG_DECAY``).
     segment_ids: Optional ``(bs, seq_len)`` non-decreasing document ids (such as
       ``segment_ids_from_positions`` or ``tokamax_segment_ids``); normalized per
