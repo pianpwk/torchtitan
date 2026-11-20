@@ -463,7 +463,8 @@ def _kernel(
   def _():
     # dq leaves sequence-minor, like dk^T / dv^T; see transposed_attention_bwd.
     for g in range(dq_GQD_acc.shape[0]):
-      dq_GDQ_ref[g] = (dq_GQD_acc[g] * q_scale).T.astype(dq_GDQ_ref.dtype)
+      # Round to bf16 before the transpose: half the XLU work of an f32 one.
+      dq_GDQ_ref[g] = (dq_GQD_acc[g] * q_scale).astype(dq_GDQ_ref.dtype).T
 
   @pl.when(should_write_dkv)
   def _():
