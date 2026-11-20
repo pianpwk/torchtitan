@@ -1,10 +1,13 @@
 """Kimi K3 (text-only) on the TPU GraphTrainer path.
 
+The model config comes from ``experiments.tpu.kimi_k3.model_registry``; its
+``override.imports`` entries swap in the TPU KDA, MLA and LatentMoE layers.
 ``parallelize_kimi_k3`` follows upstream GraphTrainer's
 ``parallelize_deepseekv3`` (``model.parallelize``, SimpleFSDP, compile) plus
 the TPU SimpleFSDP policy of ``graph_trainer/deepseek_v3.py``.
 """
 
+import dataclasses
 from dataclasses import dataclass
 
 import torch
@@ -25,8 +28,7 @@ from torchtitan.experiments.graph_trainer.configs import (
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     disable_active_parametrization,
 )
-# Before `torchtitan.models.kimi_k3`, which imports the CUDA-only `attn_gym`.
-from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu import kimi_k3 as tpu_kimi_k3
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
@@ -34,6 +36,7 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
 from torchtitan.models.kimi_k3 import KimiK3Model
+from torchtitan.protocols.model_spec import ModelSpec
 
 
 class GraphTrainerKimiK3Model(KimiK3Model):
@@ -86,4 +89,24 @@ def parallelize_kimi_k3(
       parallelism=parallelism,
       parallel_dims=parallel_dims,
       dump_folder=dump_folder,
+  )
+
+
+def model_registry(flavor: str) -> ModelSpec:
+  """GraphTrainer ``ModelSpec`` for a TPU K3 flavor.
+
+  ``TpuGraphTrainer.Config.from_tpu_trainer_config`` takes only the model
+  class, ``parallelize_fn`` and ``pipelining_fn`` from this spec; the field
+  values come from the recipe's model config.
+  """
+  model_spec = tpu_kimi_k3.model_registry(flavor)
+  model_config = GraphTrainerKimiK3Model.Config(**{
+      field.name: getattr(model_spec.model, field.name)
+      for field in dataclasses.fields(model_spec.model)
+  })
+  return dataclasses.replace(
+      model_spec,
+      model=model_config,
+      parallelize_fn=parallelize_kimi_k3,
+      pipelining_fn=None,
   )
