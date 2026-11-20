@@ -28,6 +28,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
     apply_simple_fsdp,
+    get_simple_fsdp_mesh,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import (
@@ -46,6 +47,9 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
 from torchtitan.models.kimi_k3 import KimiK3Model
+from torchtitan.models.kimi_k3.kda import KDA
+from torchtitan.models.kimi_k3.model import KimiMLAAttention
+from torchtitan.models.kimi_k3.moe import KimiLatentMoE
 from torchtitan.protocols.model_spec import ModelSpec
 
 
@@ -98,6 +102,52 @@ def _shard_routed_experts(
     )
 
 
+def _shard_uneven_dim0_params(
+    model: GraphTrainerKimiK3Model,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+) -> None:
+  """SimpleFSDP for the K3 parameters whose dim 0 can be uneven.
+
+  KDA's ``beta`` [H, D], MLA's ``wkv_a`` [576, D] and the router gate [E, D]
+  weights shard on dim 1 when dim 0 does not divide the FSDP degree. KDA's own
+  ``A_log`` [H] and ``dt_bias`` [H, K] are replicated then: SimpleFSDP gives a
+  module one placement, and ``A_log`` has no dim 1. Runs before
+  ``apply_simple_fsdp``, whose walk then skips these modules.
+  """
+  # TODO: pad / unpad uneven dim-0 shards in the TPU SimpleFSDP all-gather (as
+  # DTensor and FSDP2 do on GPU) and drop this.
+  fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
+  mp_policy = MixedPrecisionPolicy(
+      param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+      reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+  )
+  for module in model.modules():
+    if isinstance(module, KDA):
+      targets = [
+          (module, ("A_log", "dt_bias"), "replicate"),
+          (module.beta, ("weight",), "fully_shard"),
+      ]
+    elif isinstance(module, KimiMLAAttention):
+      targets = [(module.wkv_a, ("weight",), "fully_shard")]
+    elif isinstance(module, KimiLatentMoE):
+      targets = [(module.router.gate, ("weight",), "fully_shard")]
+    else:
+      continue
+    for holder, names, mode in targets:
+      if getattr(holder, names[0]).shape[0] % fsdp_mesh.size() == 0:
+        continue
+      own = {getattr(holder, name) for name in names}
+      data_parallel(
+          holder,
+          fsdp_mesh,
+          mode,
+          mp_policy=mp_policy,
+          shard_dim=1,
+          ignored_params=set(holder.parameters()) - own,
+      )
+
+
 def parallelize_kimi_k3(
     model: GraphTrainerKimiK3Model,
     *,
@@ -124,6 +174,7 @@ def parallelize_kimi_k3(
   configure_simple_fsdp_shard_dims(model, parallel_dims)
   if parallel_dims.ep_enabled:
     _shard_routed_experts(model, parallel_dims, training)
+  _shard_uneven_dim0_params(model, parallel_dims, training)
   model = apply_simple_fsdp(
       model, parallel_dims=parallel_dims, training=training
   )  # pyrefly: ignore[bad-assignment]
