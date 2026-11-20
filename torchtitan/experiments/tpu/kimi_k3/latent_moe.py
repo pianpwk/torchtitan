@@ -12,9 +12,12 @@ children:
 
 * ``TpuKimiGroupedExperts``: ``TpuGroupedExperts`` (Pallas MegaBlox GMM,
   kernel-native weight layout) with K3's SiTU-GLU activation.
-* ``TpuAllToAllTokenDispatcher``: TPU local-reorder VJPs, with the scores
-  applied after W2, as upstream does.
-* ``TpuRoutedExperts``: the TPU ``RoutedExperts`` that holds them.
+* ``TpuAllToAllTokenDispatcher``: TPU local-reorder VJPs without EP; with EP,
+  its default Ring-of-Experts transport (``components/ring_of_experts.py``):
+  all-gather of the latent tokens, scores and expert ids, the local experts on
+  a static ``max_R``-row buffer, and a reduce-scatter of the per-token sums.
+  The scores are applied after W2, as upstream does.
+* ``TpuRoutedExperts``: optional Ring-of-Experts token chunking.
 """
 
 import dataclasses
@@ -103,13 +106,23 @@ class TpuKimiGroupedExperts(TpuGroupedExperts):
 
 @override(
     target=KimiLatentMoE.Config,
-    description="Kimi K3 LatentMoE on TPU: MegaBlox experts.",
+    description="Kimi K3 LatentMoE on TPU: MegaBlox experts, Ring-of-Experts EP.",
 )
-def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
+def tpu_latent_moe(
+    cfg: KimiLatentMoE.Config,
+    *,
+    capacity_factor: float | None = None,
+    num_moe_token_chunks: int = 1,
+) -> KimiLatentMoE.Config:
   """K3 LatentMoE with TPU experts and the TPU dispatcher.
 
   Takes ``KimiLatentMoE`` and ``QuantileBalancedKimiLatentMoE`` and keeps the
   layer's type.
+
+  ``capacity_factor`` (Ring-of-Experts rows per EP rank, in units of the local
+  routes; None is drop-free) and ``num_moe_token_chunks`` (Ring-of-Experts
+  token chunks) apply only under EP; see ``TpuAllToAllTokenDispatcher`` and
+  ``TpuRoutedExperts``.
   """
   if type(cfg) not in (
       KimiLatentMoE.Config, QuantileBalancedKimiLatentMoE.Config
@@ -139,6 +152,8 @@ def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
               routed.token_dispatcher,
               TpuAllToAllTokenDispatcher.Config,
               fuse_route_score_backward=True,
+              capacity_factor=capacity_factor,
           ),
+          num_moe_token_chunks=num_moe_token_chunks,
       ),
   )

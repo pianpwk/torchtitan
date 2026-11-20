@@ -1,5 +1,7 @@
 """TPU recipes for Kimi K3 (text only) on the TPU GraphTrainer."""
 
+import dataclasses
+
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -40,7 +42,9 @@ def graph_trainer_kimi_k3_tiny() -> TpuGraphTrainer.Config:
   warmup steps, linear decay over the last 80% to 0.1x), FP32 master weights
   and BF16 compute; full rematerialization; the whole step (forward, loss,
   backward) as one compiled executable. Parallelism: SimpleFSDP over every
-  rank (one rank: a single core).
+  rank (one rank: a single core); with
+  ``--parallelism.expert_parallel_degree`` > 1 the routed experts use
+  Ring-of-Experts at capacity factor 1.0.
   """
   seq_len = 4096
   base = TPUTrainerConfig(
@@ -76,7 +80,7 @@ def graph_trainer_kimi_k3_tiny() -> TpuGraphTrainer.Config:
       (f"{_OVERRIDES}.tokamax_kda.tokamax_kda_attention",
        {"max_num_segments": 32}),
       f"{_OVERRIDES}.tokamax_mla.tokamax_mla_attention",
-      f"{_OVERRIDES}.latent_moe.tpu_latent_moe",
+      (f"{_OVERRIDES}.latent_moe.tpu_latent_moe", {"capacity_factor": 1.0}),
   ]
   cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
       base, graph_trainer_model_registry
@@ -88,3 +92,36 @@ def graph_trainer_kimi_k3_tiny() -> TpuGraphTrainer.Config:
       memory_policy="full",
   )
   return cfg
+
+
+def _graph_trainer_kimi_k3_slice(flavor: str) -> TpuGraphTrainer.Config:
+  """A K3-width ``k3_slice_*`` flavor for comm / memory benchmarks.
+
+  Model: see ``kimi_k3._k3_slice`` (3 layers at K3's widths; 34.2B / 8.8B
+  parameters, 5.6B activated, for 448 / 64 routed experts).
+  Run: eight packed 4096-token rows (32,768 tokens) per data-parallel rank
+  and microbatch, 8 steps; otherwise ``graph_trainer_kimi_k3_tiny``'s
+  optimizer, schedule, rematerialization and compilation. Balanced forced
+  routing (see the flavor) and Ring-of-Experts at capacity factor 1.0 under
+  ``--parallelism.expert_parallel_degree`` > 1. Parallelism: SimpleFSDP over
+  every rank by default; set EP by flag.
+  """
+  cfg = graph_trainer_kimi_k3_tiny()
+  seq_len = 4096
+  tokens = 8 * seq_len
+  cfg.model_spec = dataclasses.replace(
+      graph_trainer_model_registry(flavor), max_context_length=seq_len
+  )
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = tokens
+  cfg.training.steps = 8
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e448() -> TpuGraphTrainer.Config:
+  """``k3_slice_e448``: 56 experts per core on EP8."""
+  return _graph_trainer_kimi_k3_slice("k3_slice_e448")
+
+
+def graph_trainer_kimi_k3_slice_e64() -> TpuGraphTrainer.Config:
+  """``k3_slice_e64``: small expert count for debugging on 2x2x1."""
+  return _graph_trainer_kimi_k3_slice("k3_slice_e64")

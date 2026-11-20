@@ -5,7 +5,8 @@
 * ``tokamax_kda.tokamax_kda_attention``: Kimi Delta Attention with Tokamax's
   Mosaic TPU kernels.
 * ``tokamax_mla.tokamax_mla_attention``: gated MLA with Tokamax Splash.
-* ``latent_moe.tpu_latent_moe``: LatentMoE with MegaBlox experts.
+* ``latent_moe.tpu_latent_moe``: LatentMoE with MegaBlox experts and
+  Ring-of-Experts expert parallelism.
 
 The ``tiny`` flavor balances experts by quantile balancing alone
 (``quantile_balance``; auxiliary-loss-free, as in the Kimi K3 report).
@@ -88,9 +89,69 @@ def _tiny() -> KimiK3Model.Config:
   return cfg
 
 
+def _k3_slice(num_experts: int) -> KimiK3Model.Config:
+  """Three K3 layers at the released widths, one of each layer type.
+
+  Model: ``k3_slice_e448`` 34,163,726,784 parameters (5,625,682,368
+  activated), ``k3_slice_e64`` 8,791,071,168 (5,620,177,344 activated);
+  routed experts at top_k / num_experts, embedding and LM head included.
+  - 3 layers: 0 KDA + dense FFN, 1 KDA + LatentMoE, 2 gated MLA + LatentMoE.
+  - dim 7168; vocab 163840; untied LM head.
+  - KDA: 96 heads x 128. MLA: 96 heads, qk 128 + 64 (no RoPE), v 128, q / kv
+    LoRA ranks 1536 / 512.
+  - LatentMoE: ``num_experts`` routed experts, top-16, expert hidden 3072 on
+    the latent dim 3584; 2 shared experts (hidden 6144). Dense FFN hidden
+    33792.
+  - Router: upstream's balanced round-robin assignment
+    (``_debug_force_load_balance``), no expert-bias balancing.
+
+  Every width is Kimi-K3's; only the layer count and the expert count change.
+  The expert count sets the experts per EP rank: 448 experts over EP8 keep the
+  target's 56 experts per core (896 over EP16). The forced routing gives every
+  EP rank exactly its share of the routes, so capacity factor 1.0 drops
+  nothing, and it is balanced by construction (quantile balancing rejects
+  forced routing); this flavor is for comm / memory benchmarks, not training.
+  """
+  dim = 7168
+  # pylint: disable-next=protected-access
+  cfg = upstream_kimi_k3._kimi_k3_config(
+      dim=dim,
+      vocab_size=163840,
+      num_layers=3,
+      full_attention_layers={2},
+      attn_res_block_size=12,
+      num_heads=96,
+      q_lora_rank=1536,
+      kv_lora_rank=512,
+      qk_nope_head_dim=128,
+      qk_rope_head_dim=64,
+      v_head_dim=128,
+      kda_head_dim=128,
+      conv_kernel_size=4,
+      dense_hidden_dim=33792,
+      latent_dim=3584,
+      expert_hidden_dim=3072,
+      num_experts=num_experts,
+      top_k=16,
+      num_shared_experts=2,
+      vision_encoder=None,  # pytype: disable=wrong-arg-types
+      attn_backend="flex",
+  )
+  for layer in cfg.layers:
+    if layer.moe is not None:
+      # pylint: disable-next=protected-access
+      layer.moe.router._debug_force_load_balance = True
+      layer.moe.load_balance_coeff = None
+  return cfg
+
+
 # flavor -> (config builder, max context length)
 kimi_k3_tpu_configs = {
     "tiny": (_tiny, 4096),
+    # K3 widths, 3 layers: 56 experts per core on EP8 (4x4x4 x ring) or a
+    # smaller expert count for debugging on small slices.
+    "k3_slice_e448": (lambda: _k3_slice(448), 4096),
+    "k3_slice_e64": (lambda: _k3_slice(64), 4096),
 }
 
 
