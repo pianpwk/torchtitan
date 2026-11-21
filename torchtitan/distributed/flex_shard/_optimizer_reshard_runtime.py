@@ -32,6 +32,7 @@ from ._optimizer_reshard_schedule import (
     _PackedAllToAllSchedule,
     _RedistributionBucketPlan,
     _TensorRegion,
+    _TPU_ALL_TO_ALL_COLUMNS,
 )
 
 
@@ -114,11 +115,29 @@ def _execute_packed_all_to_all(
             input[: schedule.input_buffer_numel]
         )
         return
+    output = output[: schedule.output_buffer_numel]
+    input = input[: schedule.input_buffer_numel]
+    output_split_sizes = schedule.output_split_sizes
+    input_split_sizes = schedule.input_split_sizes
+    # TODO: Drop once XLA TPU handles flat 16-bit all-to-all well. A flat
+    # 16-bit buffer gets packed (2, 128) tiles: it compiles for ~1 s per MiB
+    # (minutes for DistMuon's buckets) and runs at ~17 GB/s on TPU7x. The same
+    # bytes as [rows, 1024] rows compile in ~0.2 s and run at ~70 GB/s. The
+    # schedule pads every TPU split to whole rows.
+    if output.device.type == "tpu":
+        output = output.view(-1, _TPU_ALL_TO_ALL_COLUMNS)
+        input = input.view(-1, _TPU_ALL_TO_ALL_COLUMNS)
+        output_split_sizes = [
+            size // _TPU_ALL_TO_ALL_COLUMNS for size in output_split_sizes
+        ]
+        input_split_sizes = [
+            size // _TPU_ALL_TO_ALL_COLUMNS for size in input_split_sizes
+        ]
     torch.distributed.all_to_all_single(
-        output[: schedule.output_buffer_numel],
-        input[: schedule.input_buffer_numel],
-        output_split_sizes=schedule.output_split_sizes,
-        input_split_sizes=schedule.input_split_sizes,
+        output,
+        input,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
         group=schedule.process_group,
     )
 
