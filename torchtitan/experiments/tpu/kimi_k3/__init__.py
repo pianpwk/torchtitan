@@ -175,6 +175,9 @@ kimi_k3_tpu_configs = {
         ),
         4096,
     ),
+    # 12 layers at K3 widths (9 KDA + 3 MLA), 64 experts: optimizer-bucketing
+    # benchmarks with many same-shape matrices on 4x4x4.
+    "k3_slice_l12_e64": (lambda: _k3_slice(64, num_layers=12), 4096),
 }
 
 

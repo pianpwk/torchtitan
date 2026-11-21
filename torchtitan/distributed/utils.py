@@ -10,9 +10,9 @@ import contextlib
 import math
 import os as os
 from abc import abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import timedelta
-from typing import Protocol, TYPE_CHECKING
+from typing import Any, Protocol, TYPE_CHECKING
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -406,6 +406,80 @@ def init_fake_mode(
         rank=rank,
         world_size=world_size,
     )
+
+
+def build_transport_meshes(
+    transports: Sequence[tuple[DeviceMesh, tuple[str, ...]] | None],
+    *,
+    max_ctas: int | None,
+) -> list[DeviceMesh | None]:
+    """Build one optimizer transport mesh per ``(storage mesh, axes)`` entry.
+
+    Returns a list aligned with ``transports``; ``None`` entries stay ``None``.
+    Each mesh is 1D over the ranks of ``storage_mesh[axes]`` in storage order
+    and named by joining its axes (``dp_shard_tp``), as ``BucketConfig.mesh``
+    expects. A single uncapped axis reuses its storage group. Other transports
+    get a new group; a ``max_ctas`` cap gives it its own NCCL communicator and
+    leaves the storage groups unchanged.
+
+    ``dist.new_group`` must be called by every rank in the same order, but
+    pipeline stages request different transports, and some stages have no
+    storage mesh for another stage's transport (e.g. an expert-free stage).
+    Every rank therefore all-gathers the rank lists of its transports and
+    creates the sorted union. ``max_ctas`` must be the same on every rank.
+    """
+    default_backend = dist.get_backend()
+    backend = pg_options = None
+    if max_ctas is not None:
+        if dist.Backend.NCCL not in default_backend:
+            raise ValueError(f"max_ctas requires NCCL, got {default_backend!r}")
+        backend = dist.Backend.NCCL
+        pg_options = dist.ProcessGroupNCCL.Options()
+        pg_options.config.max_ctas = max_ctas
+        # Keep redistribution channels independent from the storage groups.
+        pg_options.config.split_share = 0  # pyrefly: ignore [missing-attribute]
+
+    # Device type of each transport that needs a new group, keyed by its axes
+    # and the ranks of ``storage_mesh[axes]``.
+    device_type_by_key = {}
+    for storage_mesh, axes in filter(None, transports):
+        if len(axes) > 1 or max_ctas is not None:
+            ranks = tuple(storage_mesh[axes].mesh.flatten().tolist())
+            device_type_by_key[axes, ranks] = storage_mesh.device_type
+    # Fake process groups are local, so ranks need not agree on the union.
+    keys_by_rank: list[Any] = [set(device_type_by_key)]
+    if default_backend != "fake":
+        keys_by_rank = [None] * dist.get_world_size()
+        dist.all_gather_object(keys_by_rank, set(device_type_by_key))
+
+    all_keys: list[tuple[tuple[str, ...], tuple[int, ...]]] = sorted(
+        set().union(*keys_by_rank)
+    )
+    transport_mesh_by_key = {}
+    for axes, ranks in all_keys:
+        group = dist.new_group(list(ranks), backend=backend, pg_options=pg_options)
+        if (axes, ranks) in device_type_by_key:
+            assert isinstance(group, dist.ProcessGroup)
+            transport_mesh_by_key[axes, ranks] = DeviceMesh.from_group(
+                group,
+                device_type_by_key[axes, ranks],
+                mesh=torch.tensor(ranks),
+                mesh_dim_names=("_".join(axes),),
+            )
+
+    meshes: list[DeviceMesh | None] = []
+    for transport in transports:
+        if transport is None:
+            meshes.append(None)
+            continue
+        storage_mesh, axes = transport
+        ranks = tuple(storage_mesh[axes].mesh.flatten().tolist())
+        meshes.append(
+            transport_mesh_by_key[axes, ranks]
+            if (axes, ranks) in transport_mesh_by_key
+            else storage_mesh[axes[0]]
+        )
+    return meshes
 
 
 def init_distributed(

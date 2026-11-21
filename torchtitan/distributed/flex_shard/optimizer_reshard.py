@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Replicate, Shard
 
@@ -33,27 +34,54 @@ class Owned:
 
 @dataclass(frozen=True, slots=True)
 class BlockShard:
-    """Shard fixed-size blocks without changing the tensor shape.
+    """Shard complete contiguous blocks without changing the tensor shape.
 
     The selected tensor dimension is partitioned into contiguous blocks of
-    ``block_size`` elements, and those blocks are sharded using the same
+    sizes from the repeating sequence ``block_sizes``, sharded using the same
     contiguous partitioning as ``Shard``. A block is never split between
     participants. ``BlockShard`` describes only distribution; it does not
     reshape or reinterpret the tensor.
+
+    ``block_sizes`` must be a nonempty tuple of positive integers. Use ``(R,)``
+    for uniform blocks of size R. For example, ``(128, 64)`` partitions 384 rows
+    into four independently shardable blocks of 128, 64, 128, and 64 rows. The
+    dimension must contain whole repetitions of this sequence. DistMuon treats
+    each block as one independent matrix.
     """
 
     dim: int
-    block_size: int
+    block_sizes: tuple[int, ...]
 
     def __post_init__(self) -> None:
         if isinstance(self.dim, bool) or not isinstance(self.dim, int):
             raise ValueError("BlockShard.dim must be an integer")
         if (
-            isinstance(self.block_size, bool)
-            or not isinstance(self.block_size, int)
-            or self.block_size <= 0
+            not isinstance(self.block_sizes, tuple)
+            or not self.block_sizes
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in self.block_sizes
+            )
         ):
-            raise ValueError("BlockShard.block_size must be a positive integer")
+            raise ValueError(
+                "BlockShard.block_sizes must be a nonempty tuple of positive integers"
+            )
+
+    def num_blocks(self, dim_size: int) -> int:
+        """Return the block count for a dimension containing whole repetitions."""
+        period = sum(self.block_sizes)
+        num_periods, remainder = divmod(dim_size, period)
+        if remainder:
+            raise ValueError(
+                f"BlockShard dimension size {dim_size} must be divisible by "
+                f"block-size period {period}"
+            )
+        return num_periods * len(self.block_sizes)
+
+    def block_start(self, block_index: int) -> int:
+        """Return a block boundary, including the final dimension endpoint."""
+        num_periods, offset = divmod(block_index, len(self.block_sizes))
+        return num_periods * sum(self.block_sizes) + sum(self.block_sizes[:offset])
 
 
 _ComputeSharding = Owned | Replicate | Shard | BlockShard
@@ -116,7 +144,7 @@ class ComputeLayout:
     Each named axis uses one of four compute shardings: ``Owned`` assigns the
     complete subgroup-local logical tensor to one dynamically selected owner rank,
     ``Replicate`` assigns it to every rank, ``Shard`` partitions one tensor
-    dimension, and ``BlockShard`` partitions fixed-size blocks without changing
+    dimension, and ``BlockShard`` partitions complete blocks without changing
     the tensor shape.
     Multiple ``Owned`` shardings select one owner rank from their joint Cartesian
     group.
@@ -131,17 +159,20 @@ class ComputeLayout:
     axes in storage-mesh order. Each named axis must declare ``Shard`` on that
     same tensor dimension, written as a non-negative index.
 
+    ``compute_dtype`` is the dtype the optimizer computes in for parameters
+    that are redistributed; ``None`` keeps the storage dtype.
+
     Examples:
         Shard a logical batch of matrices over EP first, then split each
-        EP-local batch over EFSDP even though EFSDP precedes EP in the storage
+        EP-local batch over ``edp_shard`` even though ``edp_shard`` precedes EP in the storage
         mesh::
 
             ComputeLayout(
                 shardings_by_mesh_axis={
-                    "efsdp": Shard(0),
+                    "edp_shard": Shard(0),
                     "ep": Shard(0),
                 },
-                shard_order_by_tensor_dim={0: ("ep", "efsdp")},
+                shard_order_by_tensor_dim={0: ("ep", "edp_shard")},
             )
 
         Assign the complete subgroup-local logical tensor to one owner rank
@@ -157,15 +188,20 @@ class ComputeLayout:
 
             ComputeLayout(
                 shardings_by_mesh_axis={
-                    "dp_shard": BlockShard(dim=0, block_size=4),
+                    "dp_shard": BlockShard(dim=0, block_sizes=(4,)),
                 }
             )
     """
 
     shardings_by_mesh_axis: Mapping[str, _ComputeSharding]
     shard_order_by_tensor_dim: Mapping[int, tuple[str, ...]] = _DEFAULT_SHARD_ORDER
+    compute_dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
+        if self.compute_dtype is not None and not isinstance(
+            self.compute_dtype, torch.dtype
+        ):
+            raise ValueError("compute_dtype must be a torch.dtype or None")
         shardings_by_mesh_axis = dict(self.shardings_by_mesh_axis)
         if not shardings_by_mesh_axis:
             raise ValueError("ComputeLayout must declare a compute sharding")
@@ -252,13 +288,20 @@ class ComputeLayout:
 class BucketConfig:
     """Ordered optimizer-work bucket selected by canonical FQN patterns.
 
-    Compute layouts determine communication topology. A bucket controls only
-    scheduling order and overlap; all redistributed parameters it selects must
-    currently resolve to one homogeneous transport group.
+    ``mesh`` may override the process groups used for redistribution. It must
+    have the same ranks in the same order as the selected storage axes. For
+    one transport axis, its name must match and a storage-shaped mesh is also
+    accepted. For multiple axes, supply a 1D mesh named by joining the axis
+    names, for example ``dp_shard_tp``. The caller creates and owns these
+    communicators. ``None`` reuses the storage group for a single transport
+    axis; combined transports require an explicit mesh.
     """
 
     patterns: tuple[str, ...]
     name: str = ""
+    # A ``DeviceMesh | None``. Typed ``Any`` so tyro, which walks recipe
+    # defaults, does not try to resolve ``DeviceMesh``'s type hints.
+    mesh: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "patterns", tuple(self.patterns))

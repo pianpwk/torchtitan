@@ -1,15 +1,28 @@
 """TPU recipes for Kimi K3 (text only) on the TPU GraphTrainer."""
 
 import dataclasses
+from typing import Literal
 
+import torch
+from torch.distributed.tensor import Shard
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+    ParamGroupConfig,
+)
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.flex_shard import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    Owned,
+)
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
@@ -181,4 +194,279 @@ def graph_trainer_kimi_k3_full93_e896_fused_kda() -> TpuGraphTrainer.Config:
   fused Pallas KDA kernels and host offload of the saved layer boundaries."""
   cfg = _graph_trainer_kimi_k3_slice("k3_full93_e896", kda_override=_FUSED_KDA)
   cfg.compile.memory_policy = "full_and_offload"
+# Mesh axes a dense K3 parameter can be stored on: SimpleFSDP's ``fsdp`` (FSDP2
+# names it ``dp_shard``) and ``tp``. Layout axes absent from a parameter's mesh
+# are ignored, so one layout covers FSDP and FSDP x TP.
+_DENSE_AXES = ("fsdp", "dp_shard", "tp")
+
+# Muon matrices by raw parameter name; every other parameter goes to AdamW:
+# embedding, LM head, norms, KDA's A_log / dt_bias / short convolutions, the
+# per-head scalar matrices of KDA's ``beta`` and the single-row attention
+# residual projections (Newton-Schulz would only rescale those).
+_K3_MUON_PATTERN = (
+    r"(?:^|\.)(?:"
+    r"delta_attention\.(?:q_proj|k_proj|v_proj|forget_a|forget_b|output_gate"
+    r"|output_proj)\.weight"
+    r"|attention\.(?:wq_a|wq_b|wkv_a|wkv_b|gate|wo)\.weight"
+    r"|feed_forward\.w[123]\.weight"
+    r"|moe\.(?:router\.gate|shared_experts\.w[123]|routed_down|routed_up)"
+    r"\.weight"
+    r"|moe\.routed_experts\.inner_experts\.w[123]_E[DF][DF]"
+    r")$"
+)
+
+
+# ``bucketing="by_shape"``: Muon matrix families that share one bucket across
+# all layers (same matrix shape or same per-head block shape). Parameters not
+# listed get a bucket of their own name (e.g. ``feed_forward.w1`` of layer 0).
+_K3_SHAPE_FAMILIES = {
+    "delta_attention.output_proj": "o_proj",
+    "attention.wo": "o_proj",
+    "moe.shared_experts.w1": "shared_w13",
+    "moe.shared_experts.w3": "shared_w13",
+    "moe.shared_experts.w2": "shared_w2",
+    "moe.routed_down": "latent",
+    "moe.routed_up": "latent",
+    "moe.router.gate": "router",
+    "delta_attention.forget_a": "lora_down",
+    "attention.wq_a": "lora_down",
+    "attention.wkv_a": "lora_down",
+    # Per-head [head_dim, dim] blocks.
+    "delta_attention.q_proj": "head_q",
+    "delta_attention.k_proj": "head_k",
+    "delta_attention.v_proj": "head_v",
+    "delta_attention.output_gate": "head_gate",
+    "attention.gate": "head_gate",
+    # Small per-head blocks.
+    "delta_attention.forget_b": "head_small",
+    "attention.wq_b": "head_small",
+    "attention.wkv_b": "head_small",
+    "feed_forward.w1": "dense_ffn",
+    "feed_forward.w2": "dense_ffn",
+    "feed_forward.w3": "dense_ffn",
+}
+
+
+def _k3_dist_muon_optimizer(
+    model_config,
+    *,
+    lr: float = 8e-4,
+    bucketing: Literal["by_layer", "by_shape"] = "by_layer",
+) -> OptimizersContainer.Config:
+  """DistMuon on every K3 matrix (upstream K3's split), AdamW on the rest.
+
+  Layouts follow upstream's ``kimi_k3`` test recipe in this fork's parameter
+  names, extended to FSDP x TP: each layout lists the dense TP axis next to
+  the FSDP axis, so one transport group spans ``fsdp x tp``.
+
+  * Per-head Newton-Schulz (``BlockShard`` rows) for the head-sharded
+    projections: KDA q / k / v, ``forget_b``, ``output_gate``; MLA ``wq_b``
+    ([q_nope; q_rope] per head), ``wkv_a`` ([kv_latent; k_rope]), ``wkv_b``
+    ([k_nope; v] per head) and ``gate``.
+  * Whole-matrix (``Owned``): KDA ``forget_a`` / ``output_proj``, MLA
+    ``wq_a`` / ``wo``, the dense FFN and shared experts (w1, w2, w3), the
+    router gate and the latent ``routed_down`` / ``routed_up``.
+  * Routed experts ``[E, ., .]``: one matrix per expert, ``Shard(0)`` over the
+    expert dim on the FSDP / expert-FSDP / EP axes (EP first, as stored), TP
+    replicated as stored. Every rank then updates its own experts in place.
+
+  Buckets (``bucketing``):
+
+  * ``by_layer``: layer 0 alone, then pairs of layers, routed experts in their
+    own bucket (upstream's grouping).
+  * ``by_shape``: the non-expert matrices bucket by family across all layers
+    (``_K3_SHAPE_FAMILIES``), routed experts as in ``by_layer``. On TPU every
+    all-to-all pads each (source, destination) segment to the largest pair
+    (equal splits), so a bucket costs every rank about the largest volume one
+    owner receives. A bucket of many same-shape matrices keeps that close to the
+    packed volume; a layer bucket mixing one large and many small matrices does
+    not.
+  """
+  bf16 = torch.bfloat16
+
+  def dense(sharding) -> ComputeLayout:
+    return ComputeLayout(
+        shardings_by_mesh_axis={axis: sharding for axis in _DENSE_AXES},
+        compute_dtype=bf16,
+    )
+
+  owned = dense(Owned())
+
+  def blocks_of(*num_rows: int) -> ComputeLayout:
+    return dense(BlockShard(dim=0, block_sizes=num_rows))
+
+  per_expert = ComputeLayout(
+      shardings_by_mesh_axis={
+          axis: Shard(0) for axis in ("fsdp", "dp_shard", "efsdp", "ep")
+      },
+      shard_order_by_tensor_dim={0: ("ep", "efsdp")},
+      compute_dtype=bf16,
+  )
+
+  layer_fqns: list[dict[str, ComputeLayout]] = []
+  for layer_id, layer in enumerate(model_config.layers):
+    prefix = f"layers.{layer_id}"
+    shardings: dict[str, ComputeLayout] = {}
+    if layer.delta_attention is not None:
+      per_head = blocks_of(layer.delta_attention.head_dim)
+      for name, layout in (
+          ("q_proj", per_head), ("k_proj", per_head), ("v_proj", per_head),
+          ("forget_a", owned), ("forget_b", per_head),
+          ("output_gate", per_head), ("output_proj", owned),
+      ):
+        shardings[f"{prefix}.delta_attention.{name}.weight"] = layout
+    if layer.attention is not None:
+      mla = layer.attention
+      for name, layout in (
+          ("wq_a", owned),
+          ("wq_b", blocks_of(mla.qk_nope_head_dim, mla.qk_rope_head_dim)),
+          ("wkv_a", blocks_of(mla.kv_lora_rank, mla.qk_rope_head_dim)),
+          ("wkv_b", blocks_of(mla.qk_nope_head_dim, mla.v_head_dim)),
+          ("gate", blocks_of(mla.v_head_dim)),
+          ("wo", owned),
+      ):
+        shardings[f"{prefix}.attention.{name}.weight"] = layout
+    if layer.feed_forward is not None:
+      for name in ("w1", "w2", "w3"):
+        shardings[f"{prefix}.feed_forward.{name}.weight"] = owned
+    if layer.moe is not None:
+      for name in ("router.gate", "routed_down", "routed_up") + tuple(
+          f"shared_experts.{w}" for w in ("w1", "w2", "w3")
+      ):
+        shardings[f"{prefix}.moe.{name}.weight"] = owned
+      # TpuGroupedExperts' kernel-native (transposed) names.
+      for name in ("w1_EDF", "w2_EFD", "w3_EDF"):
+        shardings[f"{prefix}.moe.routed_experts.inner_experts.{name}"] = (
+            per_expert
+        )
+    layer_fqns.append(shardings)
+
+  num_layers = len(layer_fqns)
+  bucket_layer_ids = [(0,)] + [
+      tuple(range(first, min(first + 2, num_layers)))
+      for first in range(1, num_layers, 2)
+  ]
+  bucket_configs = []
+  for layer_ids in bucket_layer_ids:
+    name = "layers." + "-".join(map(str, layer_ids))
+    fqns = [fqn for i in layer_ids for fqn in layer_fqns[i]]
+    routed = tuple(f for f in fqns if ".routed_experts." in f)
+    dense = tuple(f for f in fqns if f not in routed)
+    if bucketing == "by_layer":
+      bucket_configs.append(BucketConfig(name=name, patterns=dense))
+    if routed:
+      bucket_configs.append(
+          BucketConfig(name=f"{name}.routed-experts", patterns=routed))
+  if bucketing == "by_shape":
+    # One bucket per matrix family across all layers (see the docstring).
+    families: dict[str, list[str]] = {}
+    for shardings in layer_fqns:
+      for fqn in shardings:
+        if ".routed_experts." in fqn:
+          continue
+        suffix = fqn.split(".", 2)[2].removesuffix(".weight")
+        family = _K3_SHAPE_FAMILIES.get(suffix, suffix)
+        families.setdefault(family, []).append(fqn)
+    bucket_configs = [
+        BucketConfig(name=family, patterns=tuple(fqns))
+        for family, fqns in families.items()
+    ] + bucket_configs
+  return OptimizersContainer.Config(
+      implementation="for-loop",
+      param_groups=[
+          ParamGroupConfig(
+              pattern=_K3_MUON_PATTERN,
+              optimizer_name="DistMuon",
+              optimizer_kwargs={
+                  "lr": lr,
+                  "weight_decay": 0.1,
+                  "adjust_lr_fn": "match_rms_adamw",
+              },
+          ),
+          ParamGroupConfig(
+              pattern=r".*",
+              optimizer_name="AdamW",
+              optimizer_kwargs={
+                  "lr": lr,
+                  "betas": (0.9, 0.95),
+                  "eps": 1e-8,
+                  "weight_decay": 0.1,
+              },
+          ),
+      ],
+      optimizer_factory_kwargs_by_name={
+          "DistMuon": {
+              "compute_sharding_by_fqn": {
+                  fqn: layout for d in layer_fqns for fqn, layout in d.items()
+              },
+              "bucket_configs": tuple(bucket_configs),
+          }
+      },
+  )
+
+
+def graph_trainer_kimi_k3_tiny_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_tiny`` with DistMuon (eager) on every matrix.
+
+  The forward / backward stays one compiled executable; the optimizer runs
+  eager. Works with FSDP, FSDP x TP2 and EP (``--parallelism.*``).
+  """
+  cfg = graph_trainer_kimi_k3_tiny()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def graph_trainer_kimi_k3_tiny_dist_muon_by_shape() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_tiny_dist_muon`` with ``by_shape`` buckets."""
+  cfg = graph_trainer_kimi_k3_tiny()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, bucketing="by_shape"
+  )
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e448_dist_muon_by_shape(
+) -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_slice_e448_dist_muon``, ``by_shape`` buckets."""
+  cfg = graph_trainer_kimi_k3_slice_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, bucketing="by_shape"
+  )
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_l12_e64() -> TpuGraphTrainer.Config:
+  """``k3_slice_l12_e64``: 12 K3-width layers, 64 experts (AdamW)."""
+  return _graph_trainer_kimi_k3_slice("k3_slice_l12_e64")
+
+
+def graph_trainer_kimi_k3_slice_l12_e64_dist_muon(
+) -> TpuGraphTrainer.Config:
+  """``k3_slice_l12_e64`` with DistMuon, ``by_layer`` buckets."""
+  cfg = graph_trainer_kimi_k3_slice_l12_e64()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_l12_e64_dist_muon_by_shape(
+) -> TpuGraphTrainer.Config:
+  """``k3_slice_l12_e64`` with DistMuon, ``by_shape`` buckets."""
+  cfg = graph_trainer_kimi_k3_slice_l12_e64()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, bucketing="by_shape"
+  )
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e448_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_slice_e448`` with DistMuon (eager)."""
+  cfg = graph_trainer_kimi_k3_slice_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e64_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_slice_e64`` with DistMuon (eager)."""
+  cfg = graph_trainer_kimi_k3_slice_e64()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
   return cfg
