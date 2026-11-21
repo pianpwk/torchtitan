@@ -68,6 +68,37 @@ def ptd_checkpoint_wrapper_with_early_stop(
     )
 
 
+def _contiguous_dist_muon_grads(optimizer, args, kwargs) -> None:
+    """Gives every DistMuon gradient its parameter's local memory layout.
+
+    DistMuon requires each gradient to have the parameter's exact storage
+    layout (placements and local strides). A SimpleFSDP parameter sharded on
+    dim 1 (e.g. K3 routed experts whose local expert count does not divide
+    expert FSDP) gets its reduce-scattered gradient from the compiled TPU step
+    as a permuted, non-contiguous view of a dim-0-scattered buffer. Copy those
+    into the parameter's contiguous layout before the step.
+    TODO: Emit the gradient in the parameter's layout inside the compiled step.
+    """
+    del args, kwargs
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            grad = param.grad
+            if (
+                not isinstance(grad, DTensor)
+                or grad.to_local().is_contiguous()
+                or not param.to_local().is_contiguous()
+            ):
+                continue
+            param.grad = DTensor.from_local(
+                grad.to_local().contiguous(),
+                grad.device_mesh,
+                grad.placements,
+                run_check=False,
+                shape=param.shape,
+                stride=param.stride(),
+            )
+
+
 def split_optimizers_by_mesh(
     optimizers_container: "OptimizersContainer",
 ) -> bool:
@@ -105,8 +136,17 @@ def split_optimizers_by_mesh(
         RuntimeError: If a group that needs splitting already has an LR
             scheduler attached (it has ``initial_lr``).
     """
+    from torchtitan.distributed.flex_shard import DistMuon  # pylint: disable=g-import-not-at-top
+
     regrouped: list[tuple[torch.optim.Optimizer, list[dict[str, Any]]]] = []
     for optimizer in optimizers_container.optimizers:
+        # DistMuon keeps exactly one frozen param group and plans its own
+        # per-bucket transports across storage meshes (dense and EP experts).
+        if isinstance(optimizer, DistMuon):
+            if not getattr(optimizer, "_tpu_contiguous_grads_hook", False):
+                optimizer.register_step_pre_hook(_contiguous_dist_muon_grads)
+                optimizer._tpu_contiguous_grads_hook = True
+            continue
         new_groups: list[dict[str, Any]] = []
         for group in optimizer.param_groups:
             params = list(group["params"])

@@ -305,7 +305,7 @@ def _dist_muon_optimizer(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: BlockShard(
                 dim=0,
-                block_size=(attention.qk_nope_head_dim + attention.qk_rope_head_dim),
+                block_sizes=(attention.qk_nope_head_dim + attention.qk_rope_head_dim,),
             )
         },
     )
@@ -313,7 +313,7 @@ def _dist_muon_optimizer(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: BlockShard(
                 dim=0,
-                block_size=attention.qk_nope_head_dim + attention.v_head_dim,
+                block_sizes=(attention.qk_nope_head_dim + attention.v_head_dim,),
             )
         },
     )

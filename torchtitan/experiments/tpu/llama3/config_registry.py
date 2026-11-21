@@ -4,11 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+    ParamGroupConfig,
+)
+from torchtitan.distributed.flex_shard import BucketConfig, ComputeLayout, Owned
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
@@ -154,6 +160,116 @@ def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
   """Llama3 debug model using TPU GraphTrainer."""
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       llama3_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
+  return config
+
+
+def _dist_muon_optimizer(
+    *, num_layers: int, tensor_parallel_degree: int
+) -> OptimizersContainer.Config:
+  """DistMuon on every Llama3 linear weight, AdamW on the rest.
+
+  Each matrix is computed whole (``Owned``) on one rank of the transport
+  group: the FSDP axis alone, or FSDP x ``tp`` under TP.
+  One bucket per transformer layer.
+  """
+  # FSDP2 names the dense storage axis ``dp_shard``; SimpleFSDP (GraphTrainer)
+  # names it ``fsdp``. Axes absent from a parameter's mesh are ignored.
+  dense_axes = ("dp_shard", "fsdp") + (
+      ("tp",) if tensor_parallel_degree > 1 else ()
+  )
+  owned = ComputeLayout(
+      shardings_by_mesh_axis={axis: Owned() for axis in dense_axes},
+      compute_dtype=torch.bfloat16,
+  )
+  projections = (
+      "attention.qkv_linear.wqkv",
+      "attention.wo",
+      "feed_forward.w1",
+      "feed_forward.w2",
+      "feed_forward.w3",
+  )
+  compute_sharding_by_fqn = {
+      f"layers.{layer}.{projection}.weight": owned
+      for layer in range(num_layers)
+      for projection in projections
+  }
+  bucket_configs = tuple(
+      BucketConfig(name=f"layers.{layer}", patterns=(f"layers.{layer}.*",))
+      for layer in range(num_layers)
+  )
+  # Matched against raw names, which may carry activation-checkpoint wrapper
+  # prefixes; compute layouts are keyed by canonical FQN.
+  muon_pattern = (
+      r"(?:attention\.qkv_linear\.wqkv|attention\.wo|feed_forward\.w[123])"
+      r"\.weight$"
+  )
+  return OptimizersContainer.Config(
+      implementation="for-loop",
+      param_groups=[
+          ParamGroupConfig(
+              pattern=muon_pattern,
+              optimizer_name="DistMuon",
+              optimizer_kwargs={
+                  "lr": 8e-4,
+                  "weight_decay": 0.1,
+                  "adjust_lr_fn": "match_rms_adamw",
+              },
+          ),
+          ParamGroupConfig(
+              pattern=r".*",
+              optimizer_name="AdamW",
+              optimizer_kwargs={
+                  "lr": 8e-4,
+                  "betas": (0.9, 0.95),
+                  "eps": 1e-8,
+                  "weight_decay": 0.1,
+              },
+          ),
+      ],
+      optimizer_factory_kwargs_by_name={
+          "DistMuon": {
+              "compute_sharding_by_fqn": compute_sharding_by_fqn,
+              "bucket_configs": bucket_configs,
+          }
+      },
+  )
+
+
+def _llama3_debugmodel_dist_muon(tensor_parallel_degree: int) -> TPUTrainerConfig:
+  config = llama3_debugmodel()
+  config.parallelism.tensor_parallel_degree = tensor_parallel_degree
+  config.optimizer = _dist_muon_optimizer(
+      num_layers=len(config.model_spec.model.layers),
+      tensor_parallel_degree=tensor_parallel_degree,
+  )
+  config.validator.enable = False
+  config.checkpoint.enable = False
+  return config
+
+
+def llama3_debugmodel_dist_muon() -> TPUTrainerConfig:
+  """Llama3 debug model with DistMuon under FSDP only."""
+  return _llama3_debugmodel_dist_muon(tensor_parallel_degree=1)
+
+
+def llama3_debugmodel_dist_muon_tp2() -> TPUTrainerConfig:
+  """Llama3 debug model with DistMuon under FSDP x TP2."""
+  return _llama3_debugmodel_dist_muon(tensor_parallel_degree=2)
+
+
+def graph_trainer_llama3_debugmodel_dist_muon_tp2() -> TpuGraphTrainer.Config:
+  """``llama3_debugmodel_dist_muon_tp2`` on the TPU GraphTrainer.
+
+  The forward / backward is one compiled program; DistMuon stays eager.
+  """
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      _llama3_debugmodel_dist_muon(tensor_parallel_degree=2),
+      graph_trainer_model_registry,
   )
   config.compile = TpuGraphTrainerCompileConfig(
       enable=True,

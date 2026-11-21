@@ -13,37 +13,103 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
   `DeviceMesh` axes using PyTorch DTensor placements plus `BlockShard` or
   `Owned`, and optionally the order in which several axes shard one tensor
   dimension.
-- `BlockShard` shards complete fixed-size blocks along one tensor dimension. It
+- `ComputeLayout.compute_dtype` is the dtype the optimizer computes in for
+  that parameter; `None` keeps the storage dtype. DistMuon runs Newton-Schulz
+  in BF16 and accepts only `torch.bfloat16`, so every FP32 parameter sets it.
+  Inputs are sent to the compute ranks and directions are sent back in this
+  dtype.
+- `BlockShard` shards complete contiguous blocks along one tensor dimension. It
   preserves the tensor's rank and global shape and never creates a tensor view.
 - `Owned` assigns a complete subgroup-local logical tensor to one dynamically
   selected rank for the compute phase.
 - `BucketConfig` groups and orders parameters by fully qualified name for
   packed redistribution and communication-compute overlap.
-- `build_dist_muon` consumes optimizer-agnostic per-parameter `ComputeLayout`
+- `redistribution_mesh_axes(fqn, parameter, compute_layout)` returns the
+  storage mesh axes a parameter's transport spans, or `()` when its storage
+  already holds complete compute matrices. It does not communicate.
+- `BlockShard.block_sizes` is a nonempty tuple describing a repeating sequence
+  of independently shardable block sizes. Use `(R,)` for uniform blocks.
+  For example, `(128, 64)` partitions
+  384 rows into four blocks of 128, 64, 128, and 64 rows. Blocks are distributed
+  by count, so ranks can own different numbers of rows. DistMuon runs
+  Newton-Schulz and the aspect-ratio learning-rate adjustment independently
+  for each block. Kimi's shared `wkv_a` projection uses `(512, 64)` to distribute
+  its KV latent and RoPE key matrices separately.
+- `DistMuon` consumes optimizer-agnostic per-parameter `ComputeLayout`
   values in `compute_sharding_by_fqn`. DistMuon's `BlockShard` path accepts
-  only a 2D parameter `[M * R, C]` with contiguous local DTensor storage. The
-  placement must target tensor dimension 0 with `block_size=R`; the leading
-  dimension must be nonzero and divisible by `R`. Each consecutive `R` rows
-  forms one independent `[R, C]` matrix. FlexShard routes the flat 2D compute
-  tensor, and DistMuon applies a zero-copy local `[M_local, R, C]` view
-  immediately before Muon compute. A native batch-first 3D `[M, R, C]`
-  parameter uses `Shard(0)` to distribute complete matrices. A single 2D
-  matrix without `BlockShard` uses whole-matrix compute such as `Owned`. The
-  builder validates named DTensor parameters and plans their storage-to-compute
-  transitions.
+  only a 2D parameter with contiguous local DTensor storage. The placement
+  must target tensor dimension 0; the leading dimension must be nonzero and
+  divisible by the sum of `block_sizes`.
+  With `block_sizes=(R,)`, each consecutive `R` rows forms one independent
+  `[R, C]` matrix. Multiple block sizes allow these matrices to have different
+  row counts. FlexShard routes the flat 2D compute tensor using the block
+  boundaries. DistMuon's planning code constructs zero-copy strided
+  `[M, R, C]` views directly from each rank's compute shape and logical starting
+  row. For `(R,)`, the view is equivalent to unflattening the row dimension.
+  A native matrix batch `[..., R, C]` uses `Shard(0)` to distribute its
+  outermost batch dimension, or `Owned` to assign the complete batch to one
+  rank. A single 2D matrix without
+  `BlockShard` uses whole-matrix compute such as `Owned`. The builder validates
+  named DTensor parameters and plans their storage-to-compute transitions.
 
 Storage placements describe persistent ownership only; they do not define
-Muon matrix boundaries. Flat matrix-batch compute supports `BlockShard` on at
-most one non-unit mesh axis. Storage on that axis may use exact `Shard(0)` or
-`Replicate`; every other non-unit storage mesh axis must be replicated.
+Muon matrix boundaries. Flat matrix-batch compute may use `BlockShard` on one
+or more non-unit mesh axes. Callers supply a mesh combining those axes into
+one optimizer transport group. FlexShard routes complete matrices across it and restores the
+original DTensor storage layout after the update. This supports combined DP
+and TP storage, including the strided shards produced when TP and FSDP shard
+the same tensor dimension. Non-transport mesh axes retain their storage
+placement.
+
+Native `[..., R, C]` parameters can redistribute `Replicate()`, a shard of the
+matrix-row dimension, or a shard of the matrix-column dimension to `Shard(0)`
+compute on one mesh axis, with every other non-unit storage mesh axis
+preserving its existing batch ownership. Changed matrix axes may also combine
+into one transport group; complete matrices are assigned across that group.
+For example, expert storage `Shard(0), Shard(1)` on DP/TP preserves each DP
+rank's expert range while TP redistributes matrix rows to whole-expert compute.
+
+### Transport meshes
+
+FlexShard never creates process groups. A bucket whose transport spans one
+storage axis uses that axis's existing group when `BucketConfig.mesh` is
+`None`. A transport spanning several axes needs an explicit 1D mesh over the
+same ranks in storage order, named by joining the axes.
+
+Which axes a transport spans follows from FlexShard's resolution rules (e.g.
+`Owned` on a replicated axis still transports over it, and `BlockShard` rows
+already aligned with storage do not), so callers cannot derive them on their
+own. `redistribution_mesh_axes` resolves the axes with the same rules
+`DistMuon`'s planner uses, so the caller's mesh always matches the plan. It
+reads metadata only:
+
+```python
+axes = redistribution_mesh_axes("matrix", parameter, compute_layout)  # ("dp_shard", "tp")
+ranks = parameter.device_mesh[axes].mesh.flatten().tolist()
+group = dist.new_group(ranks)  # collective over WORLD
+mesh = DeviceMesh.from_group(
+    group,
+    parameter.device_mesh.device_type,
+    mesh=torch.tensor(ranks),
+    mesh_dim_names=("_".join(axes),),
+)
+bucket = BucketConfig(patterns=("matrix",), mesh=mesh)
+```
+
+`dist.new_group` must be called by every rank in the same order. When ranks
+need different transports (e.g. pipeline stages), create the union of all
+ranks' groups on every rank, as `build_transport_meshes` does.
+
+TorchTitan's `DistMuon` wrapper builds these meshes for every bucket with
+`torchtitan.distributed.utils.build_transport_meshes`.
 
 Several mesh axes may shard the same tensor dimension. By default they apply
 in storage-mesh order; `shard_order_by_tensor_dim` states a different order,
 outermost axis first. For example, preserving an EP-axis `Shard(0)` while
-repartitioning its local expert domain over a preceding EFSDP axis uses
-`Shard(0)` on both axes with `shard_order_by_tensor_dim={0: ("ep", "efsdp")}`.
+repartitioning its local expert domain over a preceding `edp_shard` axis uses
+`Shard(0)` on both axes with `shard_order_by_tensor_dim={0: ("ep", "edp_shard")}`.
 FlexShard derives each axis's split factor from the bound mesh, then lowers the
-EFSDP placement to subgroup-local `Shard(0)` for optimizer execution.
+`edp_shard` placement to subgroup-local `Shard(0)` for optimizer execution.
 
 Compute sharding is construction-time configuration. It is validated and
 frozen when the optimizer is built, but is not stored in its state dict;
@@ -51,8 +117,8 @@ checkpoint restore must rebuild the optimizer with matching values.
 
 ## TorchTitan Kimi integration
 
-The [Kimi configuration registry](../../models/kimi_k2_7/config_registry.py)
-is the first TorchTitan integration. Its shared optimizer configuration:
+The [Kimi test recipes](../../../torchtitan_recipes/tests/models/kimi_k2_7.py)
+provide the first TorchTitan integration. Their shared optimizer configuration:
 
 - Selects matrix parameters from attention, dense MLPs, routed and shared
   experts, and routers for DistMuon. Other parameters continue to use
@@ -62,8 +128,8 @@ is the first TorchTitan integration. Its shared optimizer configuration:
 - Groups layers into buckets so compute-ready work can overlap packed
   redistribution.
 
-The configuration is shared by the Kimi-family, Kimi-VL, and Moonlight
-recipes in that registry.
+The same construction can be used by Kimi-family, Kimi-VL, and Moonlight
+recipes.
 
 ## Package boundary
 
