@@ -848,9 +848,10 @@ def _build_packed_all_to_all_schedule(
     )
 
     # Equal splits: every (source, destination) segment is padded to the
-    # largest pair in the group, so all ranks run the same dense all-to-all
-    # with the same buffer sizes. Every participant derives the same pair
-    # sizes from the global routes, so no communication is needed.
+    # largest pair in the group, rounded up to whole TPU all-to-all rows, so
+    # all ranks run the same dense all-to-all with the same buffer sizes.
+    # Every participant derives the same pair sizes from the global routes, so
+    # no communication is needed.
     split_stride = None
     if _requires_equal_all_to_all_splits(process_group):
         pair_numel: dict[tuple[int, int], int] = {}
@@ -859,7 +860,10 @@ def _build_packed_all_to_all_schedule(
                 pair_numel[source, destination] = (
                     pair_numel.get((source, destination), 0) + source_region.numel
                 )
-        split_stride = max(pair_numel.values(), default=0)
+        max_pair_numel = max(pair_numel.values(), default=0)
+        split_stride = -(-max_pair_numel // _TPU_ALL_TO_ALL_COLUMNS) * (
+            _TPU_ALL_TO_ALL_COLUMNS
+        )
 
     input_split_sizes = []
     input_spans = []
@@ -927,6 +931,11 @@ def _build_packed_all_to_all_schedule(
             output_spans, len(redistribution_plans)
         ),
     )
+
+
+# Row width of the 2-D view a TPU all-to-all buffer travels as (see
+# _optimizer_reshard_runtime._execute_packed_all_to_all).
+_TPU_ALL_TO_ALL_COLUMNS = 1024
 
 
 def _requires_equal_all_to_all_splits(process_group: dist.ProcessGroup) -> bool:
