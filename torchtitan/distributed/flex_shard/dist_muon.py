@@ -728,10 +728,10 @@ class _MatrixBatchView:
             raise RuntimeError(
                 "compute tensor shape is inconsistent with its matrix view"
             )
-        return compute_tensor.as_strided(
-            self.shape,
-            self.strides,
-            storage_offset=compute_tensor.storage_offset() + self.offset,
+        # Offset by slicing rather than reading storage_offset(), which
+        # torch.compile cannot trace; as_strided keeps the slice's offset.
+        return compute_tensor.reshape(-1)[self.offset :].as_strided(
+            self.shape, self.strides
         )
 
 
@@ -1824,6 +1824,38 @@ def _compute_muon_direction(
         if lr_reference_shape is None
         else _adjust_muon_learning_rate(1.0, adjust_lr_fn, lr_reference_shape)
     )
+    if torch.compiler.is_compiling():
+        # Compile cannot functionalize in-place writes through as_strided
+        # views: read each batch from ``prepared``, scatter the results into a
+        # functional copy and write ``prepared`` once. Same arithmetic.
+        flat = prepared.reshape(-1)
+        for view in matrix_views:
+            matrices = view.view_as_matrix_batch(prepared)
+            direction = _zeropower_via_newtonschulz(
+                matrices,
+                ns_coefficients=ns_coefficients,
+                ns_steps=ns_steps,
+                eps=eps,
+            ).to(prepared.dtype)
+            if reference_ratio is not None:
+                ratio = _adjust_muon_learning_rate(
+                    1.0, adjust_lr_fn, matrices.shape[-2:]
+                )
+                if ratio != reference_ratio:
+                    direction = direction.mul(ratio / reference_ratio)
+            if (
+                view.offset == 0
+                and matrices.is_contiguous()
+                and matrices.numel() == prepared.numel()
+            ):
+                # One batch covering the whole tensor (e.g. routed experts).
+                flat = direction.reshape(-1)
+            else:
+                flat = torch.as_strided_scatter(
+                    flat, direction, view.shape, view.strides, view.offset
+                )
+        prepared.copy_(flat.view(prepared.shape))
+        return prepared
     for view in matrix_views:
         matrices = view.view_as_matrix_batch(prepared)
         matrices.copy_(
@@ -1902,18 +1934,26 @@ def _apply_muon_update(
     parameter: Tensor,
     direction: Tensor,
     *,
-    lr: float,
+    lr: float | Tensor,
     weight_decay: float,
     adjust_lr_fn: str | None,
     compute_matrix_shape: torch.Size | tuple[int, ...],
 ) -> Tensor:
-    """Apply decoupled weight decay and a computed Muon direction."""
+    """Apply decoupled weight decay and a computed Muon direction.
+
+    A Tensor ``lr`` lets a compiled step take the scheduled LR as a program
+    input instead of specializing (and recompiling) on every new value.
+    """
+    parameter.mul_(1 - lr * weight_decay)
+    if isinstance(lr, Tensor):
+        ratio = _adjust_muon_learning_rate(1.0, adjust_lr_fn, compute_matrix_shape)
+        parameter.sub_(direction * (lr * ratio))
+        return parameter
     adjusted_lr = _adjust_muon_learning_rate(
         lr,
         adjust_lr_fn,
         compute_matrix_shape,
     )
-    parameter.mul_(1 - lr * weight_decay)
     parameter.add_(direction, alpha=-adjusted_lr)
     return parameter
 
