@@ -21,6 +21,9 @@ class TPUConfig:
   # (see experiments/tpu/components/bld_layout.py). Numerics match to rounding order.
   bld_block_layout: bool = True
   use_jax_profiler: bool = False
+  # Global ranks that write a JAX profile (one trace per rank; each trace is
+  # ~90 MB at K3 width). Pick one rank per distinct role, e.g. 0 1 8 120.
+  jax_profiler_ranks: list[int] = dataclasses.field(default_factory=lambda: [0])
   # Emit one aggregate MFU measurement after the configured start log step
   # through the end of training. Both boundaries must be metric log steps.
   enable_mfu_benchmark: bool = False

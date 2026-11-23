@@ -14,14 +14,16 @@ logger = torchtitan_logging.logger
 class JaxProfiler:
   """Wrapper for JAX profiler."""
 
-  def __init__(self, profiler_instance: profiler_tool.Profiler):
+  def __init__(
+      self, profiler_instance: profiler_tool.Profiler, *, ranks: list[int]
+  ):
     self.prof = profiler_instance
+    self.traced = int(os.environ.get("RANK", 0)) in ranks
 
   def start(self) -> None:
     if not jax:
       return
-    rank = int(os.environ.get("RANK", 0))
-    if rank == 0:
+    if self.traced:
       # pytype: disable=attribute-error
       # pylint: disable=protected-access
       save_folder = self.prof._config.save_traces_folder
@@ -50,8 +52,7 @@ class JaxProfiler:
 
   def stop(self) -> None:
     if jax:
-      rank = int(os.environ.get("RANK", 0))
-      if rank == 0:
+      if self.traced:
         logger.info(
             "Stopping JAX profiler at step %d",
             # pytype: disable=attribute-error

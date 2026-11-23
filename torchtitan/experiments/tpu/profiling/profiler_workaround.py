@@ -58,7 +58,9 @@ def custom_enter(self: torchtitan_profiler.Profiler) -> torchtitan_profiler.Prof
         jax_profiler = None
 
       if jax_profiler and jax_profiler.jax:
-        patched_profiler = jax_profiler.JaxProfiler(self)
+        patched_profiler = jax_profiler.JaxProfiler(
+            self, ranks=getattr(tpu_config, "jax_profiler_ranks", [0])
+        )
       else:
         torchtitan_logging.logger.warning(
             "JAX profiler requested, but JAX is not available."
