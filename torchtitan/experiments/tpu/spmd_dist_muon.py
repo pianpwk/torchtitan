@@ -36,6 +36,7 @@ differs from the bucket plan's.
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -218,26 +219,29 @@ class _CollectiveGuard:
 
 
 def _is_rank_symmetric(plan: Any) -> bool:
-    """Whether every transport participant computes the same partition shapes.
+    """Whether every transport participant stores and computes the same shapes.
 
     Local buckets issue no collectives. A redistributed bucket is captured
-    only when each participant stores and computes identically shaped
-    partitions of every parameter, i.e. its program differs only in offsets
+    only when each participant's set of storage partitions and of non-empty
+    compute partitions has the same shapes (e.g. participant 0 computes
+    experts 0-6 of tensor A and participant 8 experts 0-6 of tensor B), i.e.
+    its program differs only in offsets and in which tensor feeds a batch
     (the collective check still verifies the compiled result).
     """
-    participants = getattr(plan, "group", None)
-    if participants is None:
+    if getattr(plan, "group", None) is None:
         return True
-    signatures = {
-        tuple(
-            (
-                tuple(redistribution.storage_partition(p).tensor_shape),
-                tuple(redistribution.compute_partition(p).tensor_shape),
-            )
-            for redistribution in plan.redistribution_plans
+    signatures = set()
+    for participant in plan.group.participants:
+        storage = sorted(
+            tuple(r.storage_partition(participant).tensor_shape)
+            for r in plan.redistribution_plans
         )
-        for p in plan.group.participants
-    }
+        compute = sorted(
+            shape
+            for r in plan.redistribution_plans
+            if math.prod(shape := tuple(r.compute_partition(participant).tensor_shape))
+        )
+        signatures.add((tuple(storage), tuple(compute)))
     return len(signatures) == 1
 
 
