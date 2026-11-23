@@ -824,10 +824,15 @@ def _validate_matrix_batch_storage_placements(
                 "requires Shard, _StridedShard, or Replicate placements"
             )
         sharded_placement = cast(Shard | _StridedShard, placement)
-        if sharded_placement.dim % param.ndim != 0:
+        # Dim-1 (column) shards of a 2-D parameter are gathered into whole
+        # row blocks by the transport (e.g. MLA wkv_a [576, D] at FSDP 128,
+        # where 576 does not divide the degree).
+        if sharded_placement.dim % param.ndim != 0 and not (
+            param.ndim == 2 and type(sharded_placement) is Shard
+        ):
             raise ValueError(
                 f"Muon parameter {fqn!r} with matrix-batch storage "
-                "requires shards along tensor dimension 0"
+                "requires shards along tensor dimension 0 or 1"
             )
 
 
@@ -936,11 +941,16 @@ def _resolve_storage_to_compute_redistribution_requirement(
                 f"non-replicated axes: {nonreplicated_other_mesh_axes}"
             )
 
-        if len(active_block_shard_mesh_axes) != 1 or (
-            type(param.placements[active_block_shard_mesh_axes[0]]) is _StridedShard
+        if (
+            len(active_block_shard_mesh_axes) != 1
+            or type(param.placements[active_block_shard_mesh_axes[0]]) is _StridedShard
+            or _is_shard_on_dim(
+                param.placements[active_block_shard_mesh_axes[0]], 1, param.ndim
+            )
         ):
-            # Several axes, or strided rows that never match sequential compute
-            # blocks, always redistribute over every active axis.
+            # Several axes, strided rows that never match sequential compute
+            # blocks, or column shards always redistribute over every active
+            # axis.
             redistribution_storage_mesh_axes = active_block_shard_mesh_axes
         else:
             redistribution_storage_mesh_axis = active_block_shard_mesh_axes[0]
