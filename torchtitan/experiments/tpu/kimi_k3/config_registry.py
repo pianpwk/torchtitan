@@ -542,6 +542,20 @@ def graph_trainer_kimi_k3_slice_e64_dist_muon() -> TpuGraphTrainer.Config:
   return cfg
 
 
+def graph_trainer_kimi_k3_deep8_e448_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e448`` with DistMuon (eager, experts too)."""
+  cfg = graph_trainer_kimi_k3_deep8_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e896_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e896`` with DistMuon (eager, experts too)."""
+  cfg = graph_trainer_kimi_k3_deep8_e896()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
 def _with_spmd_dist_muon_flags(cfg: TpuGraphTrainer.Config) -> None:
   """TPU flags ``SpmdDistMuon`` needs (see ``_k3_dist_muon_optimizer``).
 
