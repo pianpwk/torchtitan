@@ -603,3 +603,17 @@ def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon() -> TpuGraphTrainer.Config:
   )
   _with_spmd_dist_muon_flags(cfg)
   return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e896_spmd_dist_muon() -> TpuGraphTrainer.Config:
+  """``k3_deep8_e896`` with captured experts in buckets of two tensors.
+
+  56 local experts on EP16; at eFSDP 8 (4x4x4, TP1) each rank already holds
+  seven whole experts, so the expert buckets may need no exchange.
+  """
+  cfg = graph_trainer_kimi_k3_deep8_e896()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, spmd_expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg)
+  return cfg
