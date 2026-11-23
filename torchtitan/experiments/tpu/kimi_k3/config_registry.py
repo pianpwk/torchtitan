@@ -1,6 +1,7 @@
 """TPU recipes for Kimi K3 (text only) on the TPU GraphTrainer."""
 
 import dataclasses
+import os
 from typing import Literal
 
 import torch
@@ -33,10 +34,12 @@ from torchtitan.experiments.tpu.graph_trainer.kimi_k3 import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.kimi_k3 import model_registry
 from torchtitan.experiments.tpu.kimi_k3.attention_residual import (
     use_tpu_attention_residual,
 )
+from torchtitan.experiments.tpu.spmd_dist_muon import TpuOptimizersContainer
 from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
@@ -214,6 +217,9 @@ _K3_MUON_PATTERN = (
     r"|moe\.routed_experts\.inner_experts\.w[123]_E[DF][DF]"
     r")$"
 )
+_K3_ROUTED_EXPERT_PATTERN = (
+    r"(?:^|\.)moe\.routed_experts\.inner_experts\.w[123]_E[DF][DF]$"
+)
 
 
 # ``bucketing="by_shape"``: Muon matrix families that share one bucket across
@@ -252,6 +258,7 @@ def _k3_dist_muon_optimizer(
     *,
     lr: float = 8e-4,
     bucketing: Literal["by_layer", "by_shape"] = "by_layer",
+    spmd_expert_bucket_size: int | None = None,
 ) -> OptimizersContainer.Config:
   """DistMuon on every K3 matrix (upstream K3's split), AdamW on the rest.
 
@@ -281,6 +288,17 @@ def _k3_dist_muon_optimizer(
     owner receives. A bucket of many same-shape matrices keeps that close to the
     packed volume; a layer bucket mixing one large and many small matrices does
     not.
+
+  With ``spmd_expert_bucket_size`` set, the routed experts move to a second
+  optimizer, ``SpmdDistMuon`` (one captured ``spmd_safe`` TPU program; see
+  ``experiments/tpu/spmd_dist_muon.py``), in buckets of that many same-shape
+  expert tensors (w1 / w3 of consecutive MoE layers, or w2); the dense
+  matrices stay in the eager DistMuon. A bucket is captured when its per-rank
+  program is identical: ``P`` tensors of ``E`` local experts over an
+  ``N``-rank transport group split into equal runs of ``k = P * E / N``
+  experts when ``k`` divides ``E`` (``E`` = 56: ``N`` = 16 needs ``P`` = 2,
+  ``N`` = 64 needs ``P`` = 8); other buckets run eagerly. Recipes using it also
+  need ``_with_spmd_dist_muon_flags``.
   """
   bf16 = torch.bfloat16
 
@@ -354,7 +372,7 @@ def _k3_dist_muon_optimizer(
     dense = tuple(f for f in fqns if f not in routed)
     if bucketing == "by_layer":
       bucket_configs.append(BucketConfig(name=name, patterns=dense))
-    if routed:
+    if routed and spmd_expert_bucket_size is None:
       bucket_configs.append(
           BucketConfig(name=f"{name}.routed-experts", patterns=routed))
   if bucketing == "by_shape":
@@ -371,36 +389,88 @@ def _k3_dist_muon_optimizer(
         BucketConfig(name=family, patterns=tuple(fqns))
         for family, fqns in families.items()
     ] + bucket_configs
+  layouts = {fqn: layout for d in layer_fqns for fqn, layout in d.items()}
+  muon_kwargs = {
+      "lr": lr,
+      "weight_decay": 0.1,
+      "adjust_lr_fn": "match_rms_adamw",
+  }
+  if spmd_expert_bucket_size is not None:
+    # Same-shape classes: w1 / w3 are [E, D, F], w2 is [E, F, D].
+    routed_by_class = {
+        cls: [
+            f for d in layer_fqns for f in d
+            if f.rsplit(".", 1)[-1] in names
+        ]
+        for cls, names in (("w13", ("w1_EDF", "w3_EDF")), ("w2", ("w2_EFD",)))
+    }
+    expert_buckets = tuple(
+        BucketConfig(
+            name=f"routed-experts.{cls}.{i // spmd_expert_bucket_size}",
+            patterns=tuple(fqns[i:i + spmd_expert_bucket_size]),
+        )
+        for cls, fqns in routed_by_class.items()
+        for i in range(0, len(fqns), spmd_expert_bucket_size)
+    )
+    return TpuOptimizersContainer.Config(
+        implementation="for-loop",
+        param_groups=[
+            ParamGroupConfig(
+                pattern=_K3_ROUTED_EXPERT_PATTERN,
+                optimizer_name="SpmdDistMuon",
+                optimizer_kwargs=muon_kwargs,
+            ),
+            ParamGroupConfig(
+                pattern=_K3_MUON_PATTERN,
+                optimizer_name="DistMuon",
+                optimizer_kwargs=muon_kwargs,
+            ),
+            _k3_adamw_rest(lr),
+        ],
+        optimizer_factory_kwargs_by_name={
+            "SpmdDistMuon": {
+                "compute_sharding_by_fqn": {
+                    f: layouts[f] for b in expert_buckets for f in b.patterns
+                },
+                "bucket_configs": expert_buckets,
+            },
+            "DistMuon": {
+                "compute_sharding_by_fqn": {
+                    f: v for f, v in layouts.items()
+                    if ".routed_experts." not in f
+                },
+                "bucket_configs": tuple(bucket_configs),
+            },
+        },
+    )
   return OptimizersContainer.Config(
       implementation="for-loop",
       param_groups=[
           ParamGroupConfig(
               pattern=_K3_MUON_PATTERN,
               optimizer_name="DistMuon",
-              optimizer_kwargs={
-                  "lr": lr,
-                  "weight_decay": 0.1,
-                  "adjust_lr_fn": "match_rms_adamw",
-              },
+              optimizer_kwargs=muon_kwargs,
           ),
-          ParamGroupConfig(
-              pattern=r".*",
-              optimizer_name="AdamW",
-              optimizer_kwargs={
-                  "lr": lr,
-                  "betas": (0.9, 0.95),
-                  "eps": 1e-8,
-                  "weight_decay": 0.1,
-              },
-          ),
+          _k3_adamw_rest(lr),
       ],
       optimizer_factory_kwargs_by_name={
           "DistMuon": {
-              "compute_sharding_by_fqn": {
-                  fqn: layout for d in layer_fqns for fqn, layout in d.items()
-              },
+              "compute_sharding_by_fqn": layouts,
               "bucket_configs": tuple(bucket_configs),
           }
+      },
+  )
+
+
+def _k3_adamw_rest(lr: float) -> ParamGroupConfig:
+  return ParamGroupConfig(
+      pattern=r".*",
+      optimizer_name="AdamW",
+      optimizer_kwargs={
+          "lr": lr,
+          "betas": (0.9, 0.95),
+          "eps": 1e-8,
+          "weight_decay": 0.1,
       },
   )
 
@@ -469,4 +539,67 @@ def graph_trainer_kimi_k3_slice_e64_dist_muon() -> TpuGraphTrainer.Config:
   """``graph_trainer_kimi_k3_slice_e64`` with DistMuon (eager)."""
   cfg = graph_trainer_kimi_k3_slice_e64()
   cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def _with_spmd_dist_muon_flags(cfg: TpuGraphTrainer.Config) -> None:
+  """TPU flags ``SpmdDistMuon`` needs (see ``_k3_dist_muon_optimizer``).
+
+  * Async all-to-all: XLA's TPU all-to-all is synchronous by default, so
+    nothing could overlap a bucket's exchange.
+  * A per-rank XLA dump (post-optimization HLO as text) of the DistMuon
+    programs: the startup check compares the captured program's collective
+    order across ranks. This process's rank is read from torchrun's ``RANK``
+    because XLA latches the dump flags before the trainer exists.
+  """
+  rank = os.environ.get("RANK", "0")
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, xla_tpu_enable_async_all_to_all=True
+  )
+  cfg.xla_flags = tpu_flags.merge_flags(
+      cfg.xla_flags,
+      xla_dump_to=f"/tmp/spmd_dist_muon_xla_dump/r{rank}",
+      xla_dump_hlo_as_text=True,
+      # TorchTPU names a program after the source of its last op: the
+      # captured optimizer ends in dist_muon.py's update. Dumping only those
+      # modules keeps the rest of the step's compiles fast.
+      xla_dump_hlo_module_re=".*dist_muon.*",
+  )
+
+
+def graph_trainer_kimi_k3_slice_e64_spmd_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_slice_e64_dist_muon`` with captured experts.
+
+  Routed experts in ``SpmdDistMuon`` (one bucket per expert tensor, async
+  all-to-all), dense matrices in the eager DistMuon (``by_layer``).
+  """
+  cfg = graph_trainer_kimi_k3_slice_e64()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, spmd_expert_bucket_size=1
+  )
+  _with_spmd_dist_muon_flags(cfg)
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e448_spmd_dist_muon() -> TpuGraphTrainer.Config:
+  """``k3_slice_e448`` with captured experts in buckets of two tensors.
+
+  Two same-shape expert tensors per bucket split evenly at 56 local experts
+  over eFSDP 16 (EP8 on 4x4x4) or 28 over eFSDP 8 (EP16).
+  """
+  cfg = graph_trainer_kimi_k3_slice_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, spmd_expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon() -> TpuGraphTrainer.Config:
+  """``k3_deep8_e448`` with captured experts (see the e448 slice recipe)."""
+  cfg = graph_trainer_kimi_k3_deep8_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, spmd_expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg)
   return cfg
