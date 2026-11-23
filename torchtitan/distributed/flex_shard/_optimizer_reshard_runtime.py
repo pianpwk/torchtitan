@@ -15,11 +15,11 @@ Canzona and its FSDP implementation:
 
 from __future__ import annotations
 
+import contextlib
 import math
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from types import ModuleType
 from typing import Any, Generic, TypeAlias
 
 import torch
@@ -98,7 +98,17 @@ def _reserve_tensor(
     return tensor
 
 
-def _reserved_view(tensor: Tensor | None, numel: int) -> Tensor:
+def _reserved_view(
+    reserved: _ReservedBuffers, name: str, numel: int, key: _BufferKey
+) -> Tensor:
+    if torch.compiler.is_compiling():
+        # A compiled program gets a fresh buffer per use instead of a view of
+        # the shared reserved storage: resizing storage is not traceable, and
+        # routing every bucket's exchange through one aliased buffer would
+        # serialize the program. The compiler plans this memory itself.
+        device, dtype = key
+        return torch.empty(numel, dtype=dtype, device=device)
+    tensor = getattr(reserved, name)
     assert tensor is not None and tensor.numel() >= numel
     return tensor[:numel]
 
@@ -202,6 +212,9 @@ class _BufferSlot:
 
     def allocate(self) -> None:
         """Regrow cached tensors on the current caller stream before use."""
+        if torch.compiler.is_compiling():
+            # Compiled runs use fresh in-graph buffers (see _reserved_view).
+            return
         for tensor in self._tensors:
             size = tensor.numel() * tensor.element_size()
             if (storage := tensor.untyped_storage()).nbytes() != size:
@@ -209,6 +222,8 @@ class _BufferSlot:
 
     def release(self) -> None:
         """Free accelerator storage, retaining host storage and tensor metadata."""
+        if torch.compiler.is_compiling():
+            return
         for tensor in self._tensors:
             if (
                 tensor.device.type != "cpu"
@@ -221,21 +236,26 @@ class _BufferSlot:
     ) -> tuple[Tensor, Tensor]:
         to_compute = plan.storage_to_compute_schedule
         to_storage = plan.compute_to_storage_schedule
-        reserved = self.buffers[(plan.device, plan.compute_dtype)]
+        key = (plan.device, plan.compute_dtype)
+        reserved = self.buffers[key]
         return (
             _reserved_view(
-                reserved.storage_exchange,
+                reserved,
+                "storage_exchange",
                 max(
                     to_compute.input_buffer_numel,
                     to_storage.output_buffer_numel,
                 ),
+                key,
             ),
             _reserved_view(
-                reserved.compute_exchange,
+                reserved,
+                "compute_exchange",
                 max(
                     to_compute.output_buffer_numel,
                     plan.compute_to_storage_offset + to_storage.input_buffer_numel,
                 ),
+                key,
             ),
         )
 
@@ -246,8 +266,10 @@ class _BufferSlot:
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tensor:
-        reserved = self.buffers[(device, dtype)]
-        return _reserved_view(reserved.compute_scratch, math.prod(shape)).view(shape)
+        key = (device, dtype)
+        return _reserved_view(
+            self.buffers[key], "compute_scratch", math.prod(shape), key
+        ).view(shape)
 
     def storage_partition_buffer(
         self,
@@ -256,8 +278,10 @@ class _BufferSlot:
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tensor:
-        reserved = self.buffers[(device, dtype)]
-        return _reserved_view(reserved.storage_scratch, math.prod(shape)).view(shape)
+        key = (device, dtype)
+        return _reserved_view(
+            self.buffers[key], "storage_scratch", math.prod(shape), key
+        ).view(shape)
 
 
 @dataclass(slots=True)
@@ -281,23 +305,63 @@ class _BucketWork(Generic[_ItemT]):
     compute_fragment_buffer: Tensor
 
 
-def _stream_device_module(device: torch.device) -> ModuleType:
+class _NoOpStream:
+    def wait_stream(self, stream: Any) -> None:
+        return None
+
+    def wait_event(self, event: Any) -> None:
+        return None
+
+
+class _NoOpEvent:
+    def record(self, stream: Any = None) -> None:
+        return None
+
+
+class _NoOpStreams:
+    """Plain-Python no-op streams and events (TPU).
+
+    Same single-stream semantics as ``torch.cpu``'s streams, but made of plain
+    Python objects, so ``torch.compile`` traces the whole runtime into one
+    graph (``torch.Stream`` objects cause a graph break).
+    """
+
+    _STREAM = _NoOpStream()
+
+    @staticmethod
+    def Stream(*args: Any, **kwargs: Any) -> _NoOpStream:  # noqa: N802
+        return _NoOpStreams._STREAM
+
+    @staticmethod
+    def Event(*args: Any, **kwargs: Any) -> _NoOpEvent:  # noqa: N802
+        return _NoOpEvent()
+
+    @staticmethod
+    def current_stream(device: Any = None) -> _NoOpStream:
+        return _NoOpStreams._STREAM
+
+    @staticmethod
+    def stream(stream: Any) -> contextlib.nullcontext:
+        return contextlib.nullcontext()
+
+
+def _stream_device_module(device: torch.device) -> Any:
     """Device module whose streams and events order the transfer pipeline.
 
     TorchTPU runs every op on one deferred stream and exposes no public
-    multi-stream API, so TPU uses ``torch.cpu``'s no-op streams and events, the
-    same single-stream path DistMuon takes on the host. XLA schedules the
+    multi-stream API, so TPU uses no-op streams and events, the same
+    single-stream path DistMuon takes on the host. XLA schedules the
     collectives asynchronously within the compiled programs.
     TODO: Use ``torch.accelerator`` streams once TorchTPU implements them.
     """
     if device.type == "tpu":
-        return torch.cpu
+        return _NoOpStreams
     return torch.get_device_module(device)
 
 
 @dataclass(slots=True)
 class _CommunicationContext:
-    device_handle: ModuleType
+    device_handle: Any
     transfer_stream: torch.Stream
     slots: tuple[_PipelineSlot, ...]
 
