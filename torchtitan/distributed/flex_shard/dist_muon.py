@@ -1181,6 +1181,16 @@ def _assign_balanced_compute_regions(
     stores, then bytes, then earlier bucket cost. Entirely local buckets
     bypass redistribution planning.
     """
+    if _requires_equal_all_to_all_splits(group.process_group) and (
+        aligned := _aligned_matrix_batch_regions(
+            compute_layouts,
+            domains,
+            group=group,
+            cumulative_loads=cumulative_loads,
+            ns_steps_by_group=ns_steps_by_group,
+        )
+    ):
+        return aligned
     participants = group.participants
     num_participants = len(participants)
     position_of = {
@@ -1274,6 +1284,69 @@ def _assign_balanced_compute_regions(
         ),
         tuple(updated_cumulative_loads),
     )
+
+
+def _aligned_matrix_batch_regions(
+    compute_layouts: Sequence[_ParameterComputeLayout],
+    domains: Sequence[_DTensorStorageDomain | None],
+    *,
+    group: _RedistributionGroup,
+    cumulative_loads: Sequence[int],
+    ns_steps_by_group: Sequence[int],
+) -> tuple[tuple[tuple[_ComputeRegionMapping, ...], ...], tuple[int, ...]] | None:
+    """Equal contiguous matrix batches for a bucket of same-shape batched tensors.
+
+    Applies when every parameter is redistributed with ``Shard(0)`` over a
+    leading matrix-batch dim (e.g. routed experts ``[E, r, c]``) and all share
+    one shape. The bucket's ``P * E`` matrices, concatenated in bucket order,
+    are split into ``N`` contiguous runs of ``k = P * E / N``; participant
+    ``i`` computes run ``i``. When ``k`` divides ``E`` no run crosses a
+    parameter, so every participant computes one ``[k, r, c]`` batch of one
+    parameter and sends / receives the same volume: the per-rank programs are
+    identical up to offsets, which a captured SPMD program needs (the greedy
+    split of ``ceil(E / N)`` chunks is not when ``N`` does not divide ``E``,
+    e.g. 56 experts over 16 ranks). Returns ``None`` otherwise.
+
+        E = 4, P = 2, N = 4 (k = 2):  A[0:2] -> r0, A[2:4] -> r1,
+                                      B[0:2] -> r2, B[2:4] -> r3
+    """
+    num_participants = len(group.participants)
+    shapes = set()
+    for layout, domain in zip(compute_layouts, domains, strict=True):
+        sharding = layout.compute_sharding
+        if (
+            layout.storage_is_compute_ready
+            or domain is None
+            or type(sharding) is not Shard
+            or sharding.dim != 0
+            or len(domain.logical_shape) < 3
+        ):
+            return None
+        shapes.add(tuple(domain.logical_shape))
+    if len(shapes) != 1:
+        return None
+    shape = shapes.pop()
+    num_matrices = shape[0]
+    total = num_matrices * len(compute_layouts)
+    if total % num_participants or num_matrices % (total // num_participants):
+        return None
+    run = total // num_participants
+    runs_per_parameter = num_matrices // run
+    cost = _estimate_muon_compute_cost((run, *shape[1:]), ns_steps_by_group[0])
+    assignments = tuple(
+        tuple(
+            (
+                group.participants[index * runs_per_parameter + j],
+                _TensorRegion(
+                    offsets=(j * run,) + (0,) * (len(shape) - 1),
+                    shape=(run, *shape[1:]),
+                ),
+            )
+            for j in range(runs_per_parameter)
+        )
+        for index in range(len(compute_layouts))
+    )
+    return assignments, tuple(load + cost for load in cumulative_loads)
 
 
 def _estimate_muon_compute_cost(
