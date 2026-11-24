@@ -10,7 +10,7 @@ import spmd_types as spmd
 # pyformat: enable
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
-from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types, set_current_spmd_mesh, spmd_local_context
