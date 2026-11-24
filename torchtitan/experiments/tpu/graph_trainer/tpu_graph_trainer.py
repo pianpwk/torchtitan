@@ -67,6 +67,19 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
 
+def _step_output_modules(model: nn.Module) -> list[nn.Module]:
+    """Modules that return a per-forward statistic from the compiled step.
+
+    The TPU compiled step drops in-place writes to module buffers (StaticCompiler
+    lowers it functionally), so a module that accumulates a statistic in its
+    forward (e.g. Kimi K3's quantile balancer histogram) instead keeps one
+    fixed-shape tensor per forward when ``emit_step_output`` is set, which the
+    step returns (``step_output``), and adds it to its buffer outside the graph
+    (``consume_step_output``), like the MoE routing metrics.
+    """
+    return [m for m in model.modules() if hasattr(m, "consume_step_output")]
+
+
 class TpuGraphTrainer(GraphTrainer):
     """Branched specialization of GraphTrainer for TPU/PJRT execution.
 
@@ -198,6 +211,7 @@ class TpuGraphTrainer(GraphTrainer):
 
         if self._optimizer_in_graph:
             self._opt_state_registered = False
+        self._step_output_modules: list[nn.Module] = []
 
         self._optimizer_separate_graph = (
             config.compile.optimizer_compile == "separate_graph"
@@ -551,6 +565,9 @@ class TpuGraphTrainer(GraphTrainer):
             remove_parameter_gradient_markers_pass,
         )
         if self._traced_step is None:
+            self._step_output_modules = _step_output_modules(model)
+            for module in self._step_output_modules:
+                module.emit_step_output = True
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
@@ -561,6 +578,10 @@ class TpuGraphTrainer(GraphTrainer):
                 )
                 if self._ep_drop_stats_enabled:
                     fwd_bwd_fn = _with_ep_drop_stat_outputs(fwd_bwd_fn, model)
+                if self._step_output_modules:
+                    fwd_bwd_fn = _with_module_step_outputs(
+                        fwd_bwd_fn, self._step_output_modules
+                    )
                 maybe_register_blockmask_pytree_node()
                 trace_context = dist_utils.get_spmd_context(
                     parallel_dims=self.parallel_dims,
@@ -612,6 +633,12 @@ class TpuGraphTrainer(GraphTrainer):
                 global_valid_tokens,
                 extra_kwargs,
             )
+        if self._step_output_modules:
+            outputs, step_values = outputs
+            for module, value in zip(
+                self._step_output_modules, step_values, strict=True
+            ):
+                module.consume_step_output(value)
         outputs = self._pop_ep_drop_stat_outputs(outputs)
         self.last_loss_metrics = outputs.loss_metrics
         if self._collect_moe_routing_metrics:
@@ -666,6 +693,11 @@ class TpuGraphTrainer(GraphTrainer):
         )
 
         if self._traced_step is None:
+            if _step_output_modules(model):
+                raise NotImplementedError(
+                    "optimizer_compile='in_graph' does not return module step"
+                    " outputs (e.g. the quantile balancer's histogram)"
+                )
             maybe_register_blockmask_pytree_node()
             param_fqns = list(self._optstate_param_fqns)
             betas = tuple(self.optimizers.optimizers[0].param_groups[0]["betas"])
@@ -806,6 +838,24 @@ def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:
         return outputs, stats_L2
 
     return step_with_ep_drop_stats
+
+
+def _with_module_step_outputs(
+    step_fn: Callable, modules: Sequence[nn.Module]
+) -> Callable:
+    """Returns ``step_fn`` with each module's ``step_output()`` as an extra output.
+
+    The step's own outputs stay nested as the first element of an
+    ``(outputs, step_values)`` pair, like ``_with_ep_drop_stat_outputs``;
+    ``TpuGraphTrainer.forward_backward_step`` hands each value to the module's
+    ``consume_step_output`` outside the graph.
+    """
+
+    def step_with_module_outputs(inputs, labels, global_valid_tokens, extra_kwargs):
+        outputs = step_fn(inputs, labels, global_valid_tokens, extra_kwargs)
+        return outputs, [module.step_output() for module in modules]
+
+    return step_with_module_outputs
 
 
 _GRAD_CLIP_EPS = 1e-6
