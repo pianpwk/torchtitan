@@ -17,7 +17,7 @@ from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_type
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
-from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import configure_moe_aux_loss_reduction, MoE
 from torchtitan.models.qwen3_5 import parallelize as dtensor_parallelize
