@@ -2052,6 +2052,20 @@ def _zeropower_via_newtonschulz(
     coefficients_by_step = _ns_coefficients_by_step(ns_coefficients, ns_steps)
     result = update.to(dtype=torch.bfloat16, copy=True)
     transposed = result.shape[-2] > result.shape[-1]
+    if transposed and torch.compiler.is_compiling():
+        # Tall matrices iterate on X^T X instead of transposing X: same
+        # polynomial, X f(X^T X) = f(X X^T) X. A compiled TPU program with
+        # --xla_tpu_enable_convolution_unfusing=true computes the transposed
+        # path's later grams X X^T wrongly (one operand keeps the producer's
+        # tiling), which gave routed w1 / w3 experts updates up to 1e15 x lr.
+        # TODO: report the self-product miscompile upstream and drop this branch.
+        result = result / result.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+        matrices = result.reshape(-1, *result.shape[-2:])
+        for a, b, c in coefficients_by_step:
+            gram = matrices.transpose(-2, -1) @ matrices
+            gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            matrices = torch.baddbmm(matrices, matrices, gram_update, beta=a)
+        return matrices.reshape(result.shape)
     if transposed:
         result = result.transpose(-2, -1)
     result.div_(result.norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
