@@ -340,7 +340,7 @@ def jax_attention_fwd(
   Accepts raw PyTorch layouts: (batch, seq_len, heads, head_dim), and
   optional int32 ``segment_ids`` of shape (batch, kv_seq_len) for packed
   documents. The tiling/layout fields arrive as arguments (see
-  _kernel_config_args) so they are part of the jax_op compile-cache key.
+  kernel_config_args) so they are part of the jax_op compile-cache key.
   """
   del use_transposed_bwd  # backward only
   seq_len = q.shape[1]
@@ -607,14 +607,22 @@ _KERNEL_CONFIG_FIELDS = (
 )
 
 
-def _kernel_config_args() -> tuple:
+def kernel_config_args(**overrides) -> tuple:
   """TokamaxConfig values, in jax_attention_fwd/bwd argument order.
 
   Passed as op arguments rather than read inside the JAX functions: jax_op
   caches compiled kernels by argument values, so a config read inside would be
   invisible to the cache and a changed config could reuse a stale kernel.
+  ``overrides`` replace TokamaxConfig values, for callers of ``splash_op``
+  that pick their own tiling.
   """
-  return tuple(getattr(TokamaxConfig, name) for name in _KERNEL_CONFIG_FIELDS)
+  unknown = overrides.keys() - set(_KERNEL_CONFIG_FIELDS)
+  if unknown:
+    raise ValueError(f"Unknown Tokamax Splash kernel fields: {sorted(unknown)}")
+  return tuple(
+      overrides.get(name, getattr(TokamaxConfig, name))
+      for name in _KERNEL_CONFIG_FIELDS
+  )
 
 
 def setup_context(ctx, inputs, output, **kwargs):
@@ -755,6 +763,6 @@ def splash_sdpa(
       is_causal,
       local_window_size_val,
       scale,
-      *_kernel_config_args(),
+      *kernel_config_args(),
   )
   return out
