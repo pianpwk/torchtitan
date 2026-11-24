@@ -66,7 +66,7 @@ from torchtitan.experiments.tpu.distributed.cp_attention import (
 )
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
-from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet, TpuInnerGatedDeltaNet
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 from torchtitan.protocols.module import Module
