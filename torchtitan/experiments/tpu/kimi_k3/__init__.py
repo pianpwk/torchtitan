@@ -79,9 +79,11 @@ def _tiny() -> KimiK3Model.Config:
   return cfg
 
 
-# flavor -> (config builder, max context length)
+# flavor -> (config builder, max context length, TPU GraphTrainer SimpleFSDP
+# placements; see graph_trainer/kimi_k3.py)
 kimi_k3_tpu_configs = {
-    "tiny": (_tiny, 4096),
+    # SimpleFSDP's default placements are even up to FSDP 64.
+    "tiny": (_tiny, 4096, {}),
 }
 
 
@@ -97,7 +99,7 @@ def model_registry(flavor: str, *, seq_len: int | None = None) -> ModelSpec:
     overrides replace) without a vision encoder, with the quantile-balancing
     hook (a no-op without quantile-balanced layers).
   """
-  get_config, max_context_len = kimi_k3_tpu_configs[flavor]
+  get_config, max_context_len, _ = kimi_k3_tpu_configs[flavor]
   context_len = seq_len or max_context_len
   if context_len > max_context_len:
     raise ValueError(
