@@ -2,14 +2,26 @@
 
 import dataclasses
 
+import torch
+from torch.distributed.tensor import Shard
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+    ParamGroupConfig,
+)
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.flex_shard import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    Owned,
+)
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
@@ -180,4 +192,193 @@ def graph_trainer_kimi_k3_full93_e896_fused_kda() -> TpuGraphTrainer.Config:
   fused Pallas KDA kernels and host offload of the saved layer boundaries."""
   cfg = _graph_trainer_kimi_k3_slice("k3_full93_e896", kda_override=_FUSED_KDA)
   cfg.compile.memory_policy = "full_and_offload"
+  return cfg
+
+
+# Mesh axes a dense K3 parameter can be stored on: SimpleFSDP's ``fsdp`` (FSDP2
+# names it ``dp_shard``) and ``tp``. Layout axes absent from a parameter's mesh
+# are ignored, so one layout covers FSDP and FSDP x TP.
+_DENSE_AXES = ("fsdp", "dp_shard", "tp")
+
+# Muon matrices by raw parameter name; every other parameter goes to AdamW:
+# embedding, LM head, norms, KDA's A_log / dt_bias / short convolutions, the
+# per-head scalar matrices of KDA's ``beta`` and the single-row attention
+# residual projections (Newton-Schulz would only rescale those).
+_K3_MUON_PATTERN = (
+    r"(?:^|\.)(?:"
+    r"delta_attention\.(?:q_proj|k_proj|v_proj|forget_a|forget_b|output_gate"
+    r"|output_proj)\.weight"
+    r"|attention\.(?:wq_a|wq_b|wkv_a|wkv_b|gate|wo)\.weight"
+    r"|feed_forward\.w[123]\.weight"
+    r"|moe\.(?:router\.gate|shared_experts\.w[123]|routed_down|routed_up)"
+    r"\.weight"
+    r"|moe\.routed_experts\.inner_experts\.w[123]_E[DF][DF]"
+    r")$"
+)
+
+
+def _k3_muon_layouts(model_config) -> list[dict[str, ComputeLayout]]:
+  """DistMuon compute layout of every K3 Muon matrix, per layer.
+
+  Upstream K3's split in this fork's parameter names, extended to FSDP x TP
+  (each dense layout lists the TP axis next to the FSDP axis, so one
+  transport group spans ``fsdp x tp``):
+
+  * Per head (``BlockShard`` rows): KDA q / k / v, ``forget_b``,
+    ``output_gate``; MLA ``wq_b`` ([q_nope; q_rope] per head), ``wkv_a``
+    ([kv_latent; k_rope]), ``wkv_b`` ([k_nope; v] per head) and ``gate``.
+  * Whole matrix (``Owned``): KDA ``forget_a`` / ``output_proj``, MLA
+    ``wq_a`` / ``wo``, the dense FFN and shared experts, the router gate and
+    the latent ``routed_down`` / ``routed_up``.
+  * Routed experts ``[E, ., .]``: one matrix per expert, ``Shard(0)`` over
+    the expert dim on the FSDP / expert-FSDP / EP axes (EP first, as
+    stored); TP as stored.
+  """
+
+  def dense(sharding) -> ComputeLayout:
+    return ComputeLayout(
+        shardings_by_mesh_axis={axis: sharding for axis in _DENSE_AXES},
+        compute_dtype=torch.bfloat16,
+    )
+
+  owned = dense(Owned())
+
+  def blocks_of(*num_rows: int) -> ComputeLayout:
+    return dense(BlockShard(dim=0, block_sizes=num_rows))
+
+  per_expert = ComputeLayout(
+      shardings_by_mesh_axis={
+          axis: Shard(0) for axis in ("fsdp", "dp_shard", "efsdp", "ep")
+      },
+      shard_order_by_tensor_dim={0: ("ep", "efsdp")},
+      compute_dtype=torch.bfloat16,
+  )
+  layer_fqns: list[dict[str, ComputeLayout]] = []
+  for layer_id, layer in enumerate(model_config.layers):
+    prefix = f"layers.{layer_id}"
+    shardings: dict[str, ComputeLayout] = {}
+    if layer.delta_attention is not None:
+      per_head = blocks_of(layer.delta_attention.head_dim)
+      for name, layout in (
+          ("q_proj", per_head), ("k_proj", per_head), ("v_proj", per_head),
+          ("forget_a", owned), ("forget_b", per_head),
+          ("output_gate", per_head), ("output_proj", owned),
+      ):
+        shardings[f"{prefix}.delta_attention.{name}.weight"] = layout
+    if layer.attention is not None:
+      mla = layer.attention
+      for name, layout in (
+          ("wq_a", owned),
+          ("wq_b", blocks_of(mla.qk_nope_head_dim, mla.qk_rope_head_dim)),
+          ("wkv_a", blocks_of(mla.kv_lora_rank, mla.qk_rope_head_dim)),
+          ("wkv_b", blocks_of(mla.qk_nope_head_dim, mla.v_head_dim)),
+          ("gate", blocks_of(mla.v_head_dim)),
+          ("wo", owned),
+      ):
+        shardings[f"{prefix}.attention.{name}.weight"] = layout
+    if layer.feed_forward is not None:
+      for name in ("w1", "w2", "w3"):
+        shardings[f"{prefix}.feed_forward.{name}.weight"] = owned
+    if layer.moe is not None:
+      for name in ("router.gate", "routed_down", "routed_up") + tuple(
+          f"shared_experts.{w}" for w in ("w1", "w2", "w3")
+      ):
+        shardings[f"{prefix}.moe.{name}.weight"] = owned
+      # TpuGroupedExperts' kernel-native (transposed) names.
+      for name in ("w1_EDF", "w2_EFD", "w3_EDF"):
+        shardings[f"{prefix}.moe.routed_experts.inner_experts.{name}"] = (
+            per_expert
+        )
+    layer_fqns.append(shardings)
+  return layer_fqns
+
+
+def _k3_layer_buckets(
+    layer_fqns: list[dict[str, ComputeLayout]], *, routed_experts: bool
+) -> list[BucketConfig]:
+  """Upstream's grouping: layer 0 alone, then pairs of layers; each group's
+  routed experts (``routed_experts=True``) in a bucket of their own."""
+  num_layers = len(layer_fqns)
+  buckets = []
+  for first in (0, *range(1, num_layers, 2)):
+    layer_ids = range(first, 1 if first == 0 else min(first + 2, num_layers))
+    name = "layers." + "-".join(map(str, layer_ids))
+    fqns = [fqn for i in layer_ids for fqn in layer_fqns[i]]
+    routed = tuple(f for f in fqns if ".routed_experts." in f)
+    buckets.append(BucketConfig(
+        name=name, patterns=tuple(f for f in fqns if f not in routed)))
+    if routed and routed_experts:
+      buckets.append(BucketConfig(name=f"{name}.routed-experts", patterns=routed))
+  return buckets
+
+
+def _k3_muon_kwargs(lr: float) -> dict[str, object]:
+  return {"lr": lr, "weight_decay": 0.1, "adjust_lr_fn": "match_rms_adamw"}
+
+
+def _k3_adamw_rest(lr: float) -> ParamGroupConfig:
+  return ParamGroupConfig(
+      pattern=r".*",
+      optimizer_name="AdamW",
+      optimizer_kwargs={
+          "lr": lr,
+          "betas": (0.9, 0.95),
+          "eps": 1e-8,
+          "weight_decay": 0.1,
+      },
+  )
+
+
+def _k3_dist_muon_optimizer(
+    model_config, *, lr: float = 8e-4
+) -> OptimizersContainer.Config:
+  """DistMuon (eager) on every K3 matrix (``_k3_muon_layouts``), AdamW on the
+  rest; ``_k3_layer_buckets`` buckets. lr 8e-4, weight decay 0.1, AdamW-RMS
+  matched Muon LR."""
+  layer_fqns = _k3_muon_layouts(model_config)
+  return OptimizersContainer.Config(
+      implementation="for-loop",
+      param_groups=[
+          ParamGroupConfig(
+              pattern=_K3_MUON_PATTERN,
+              optimizer_name="DistMuon",
+              optimizer_kwargs=_k3_muon_kwargs(lr),
+          ),
+          _k3_adamw_rest(lr),
+      ],
+      optimizer_factory_kwargs_by_name={
+          "DistMuon": {
+              "compute_sharding_by_fqn": {
+                  fqn: layout for d in layer_fqns for fqn, layout in d.items()
+              },
+              "bucket_configs": tuple(
+                  _k3_layer_buckets(layer_fqns, routed_experts=True)
+              ),
+          }
+      },
+  )
+
+
+def graph_trainer_kimi_k3_tiny_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_tiny`` with DistMuon (eager) on every matrix.
+
+  The forward / backward stays one compiled executable; the optimizer runs
+  eager. Works with FSDP, FSDP x TP2 and EP (``--parallelism.*``).
+  """
+  cfg = graph_trainer_kimi_k3_tiny()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e448_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e448`` with DistMuon (eager, experts too)."""
+  cfg = graph_trainer_kimi_k3_deep8_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e896_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e896`` with DistMuon (eager, experts too)."""
+  cfg = graph_trainer_kimi_k3_deep8_e896()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
   return cfg
