@@ -9,8 +9,10 @@ traffic bound. These kernels keep a ``[S, 128]`` column strip in VMEM, shift it
 with sublane rotations and fuse the SiLU (and its derivative), so each pass
 reads and writes every element once.
 
-Only whole rows are supported (no packed-document resets); see
-``qwen3_5.gated_delta.causal_conv_silu`` for the dispatch.
+``causal_conv_silu`` runs whole rows and ``causal_conv_silu_segmented``
+restarts the convolution at every packed document via each token's (clamped)
+position in its document; see ``qwen3_5.gated_delta.causal_conv_silu`` for the
+dispatch.
 """
 
 import jax
@@ -27,6 +29,9 @@ from torchtitan.experiments.tpu.kernels import pallas_vmem
 # the backward's live strips inside scoped VMEM.
 _BLOCK_C = 128
 _MAX_WIDTH = 8
+# Segmented kernels: rows x 128 lanes of one fp32 strip (_segmented_block_c).
+_SEG_FWD_BUDGET_ROWS = 16384
+_SEG_BWD_BUDGET_ROWS = 8192
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
@@ -64,12 +69,21 @@ def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:
   return base // 2 if width > 4 else base
 
 
-def _shift_down(x: jax.Array, shift: int, rows: jax.Array) -> jax.Array:
-  """``y[t] = x[t - shift]`` along axis 0, zeros for ``t < shift``."""
+def _tap_valid(rows: jax.Array, doc_pos: jax.Array | None, shift: int):
+  """``[S, 1]`` mask: token ``t`` reads ``t - shift`` (same row and document)."""
+  # doc_pos (position within the document, clamped) is >= shift exactly when
+  # t - shift is in t's document; rows is the same for a whole row.
+  return (rows if doc_pos is None else doc_pos) >= shift
+
+
+def _shift_down(
+    x: jax.Array, shift: int, rows: jax.Array, doc_pos: jax.Array | None = None
+) -> jax.Array:
+  """``y[t] = x[t - shift]`` along axis 0, zeros where the tap is invalid."""
   if shift == 0:
     return x
   rolled = pltpu.roll(x, shift=shift, axis=0)
-  return jnp.where(rows >= shift, rolled, 0.0)
+  return jnp.where(_tap_valid(rows, doc_pos, shift), rolled, 0.0)
 
 
 def _shift_up(x: jax.Array, shift: int, rows: jax.Array) -> jax.Array:
@@ -81,25 +95,30 @@ def _shift_up(x: jax.Array, shift: int, rows: jax.Array) -> jax.Array:
   return jnp.where(rows < seq_len - shift, rolled, 0.0)
 
 
-def _conv(x: jax.Array, w: jax.Array, rows: jax.Array) -> jax.Array:
+def _conv(
+    x: jax.Array, w: jax.Array, rows: jax.Array, doc_pos: jax.Array | None
+) -> jax.Array:
   """Causal depthwise conv of a ``[S, Cb]`` fp32 strip with ``[W, Cb]`` taps."""
   width = w.shape[0]
   acc = x * w[width - 1 : width]
   for k in range(width - 1):
-    acc = acc + _shift_down(x, width - 1 - k, rows) * w[k : k + 1]
+    acc = acc + _shift_down(x, width - 1 - k, rows, doc_pos) * w[k : k + 1]
   return acc
 
 
-def _fwd_kernel(x_ref, w_ref, o_ref):
+def _fwd_kernel(x_ref, w_ref, *refs):
+  *pos_ref, o_ref = refs
   x = x_ref[0].astype(jnp.float32)
   # `[S, 1]` row ids broadcast across lanes; a full `[S, 128]` int32 iota
   # would be one more live strip.
   rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
-  z = _conv(x, w_ref[...], rows)
+  doc_pos = pos_ref[0][0] if pos_ref else None
+  z = _conv(x, w_ref[...], rows, doc_pos)
   o_ref[0] = (z * jax.nn.sigmoid(z)).astype(o_ref.dtype)
 
 
-def _bwd_kernel(x_ref, w_ref, g_ref, dx_ref, dw_ref):
+def _bwd_kernel(x_ref, w_ref, g_ref, *refs):
+  *pos_ref, dx_ref, dw_ref = refs
   b = pl.program_id(1)
   w = w_ref[...]
   width = w.shape[0]
@@ -107,22 +126,30 @@ def _bwd_kernel(x_ref, w_ref, g_ref, dx_ref, dw_ref):
   # `[S, 1]` row ids broadcast across lanes; a full `[S, 128]` int32 iota
   # would be one more live strip.
   rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
-  z = _conv(x, w, rows)
+  doc_pos = pos_ref[0][0] if pos_ref else None
+  # x_taps[k][t] = x[t - (W - 1 - k)] (masked), shared by the recomputed
+  # convolution and the dw sums.
+  x_taps = [_shift_down(x, width - 1 - k, rows, doc_pos) for k in range(width)]
+  # Same summation order as `_conv`, so z matches the forward's.
+  z = x_taps[width - 1] * w[width - 1 : width]
+  for k in range(width - 1):
+    z = z + x_taps[k] * w[k : k + 1]
   sig = jax.nn.sigmoid(z)
   gz = g_ref[0].astype(jnp.float32) * (sig * (1.0 + z * (1.0 - sig)))
-  # dx[t] = sum_k w[k] * gz[t + W - 1 - k]: an anti-causal convolution.
+  # dx[t] = sum_k w[k] * gz[t + W - 1 - k]: an anti-causal convolution. With
+  # documents, output t + s reads input t only if its tap s is valid, so mask
+  # gz at its own position before shifting it up.
   dx = gz * w[width - 1 : width]
   for k in range(width - 1):
-    dx = dx + _shift_up(gz, width - 1 - k, rows) * w[k : k + 1]
+    shift = width - 1 - k
+    gz_k = gz
+    if doc_pos is not None:
+      gz_k = jnp.where(_tap_valid(rows, doc_pos, shift), gz, 0.0)
+    dx = dx + _shift_up(gz_k, shift, rows) * w[k : k + 1]
   dx_ref[0] = dx.astype(dx_ref.dtype)
   # dw[k] = sum_t x[t - (W - 1 - k)] * gz[t], accumulated over the batch.
   dw = jnp.concatenate(
-      [
-          jnp.sum(
-              _shift_down(x, width - 1 - k, rows) * gz, axis=0, keepdims=True
-          )
-          for k in range(width)
-      ],
+      [jnp.sum(x_taps[k] * gz, axis=0, keepdims=True) for k in range(width)],
       axis=0,
   )
 
@@ -133,28 +160,56 @@ def _bwd_kernel(x_ref, w_ref, g_ref, dx_ref, dw_ref):
   dw_ref[...] += dw
 
 
-def _specs(batch: int, seq_len: int, channels: int, width: int):
+def _segmented_block_c(seq_len: int, channels: int, budget_rows: int) -> int:
+  """Channel block for the segmented kernels: the document mask is per row, so
+  a wider block amortizes it over more lanes. ``budget_rows * 128`` fp32
+  elements bound one live strip (forward 16K rows, backward 8K)."""
+  lane_tiles = max(1, budget_rows // seq_len)
+  block_c = _BLOCK_C << (lane_tiles.bit_length() - 1)
+  while channels % block_c:
+    block_c //= 2
+  return block_c
+
+
+def _specs(batch: int, seq_len: int, channels: int, width: int, block_c: int):
   """BlockSpecs and grid ``(channels // 128, batch)``.
 
   ``batch`` is the innermost grid axis so ``dw_ref``'s block index ``(0, c)``
   stays constant across ``b = 0 .. batch - 1`` in backward, keeping ``dw_ref``
   resident in VMEM across the batch before a single HBM writeback.
   """
-  strip = pl.BlockSpec((1, seq_len, _BLOCK_C), lambda c, b: (b, 0, c))
-  taps = pl.BlockSpec((width, _BLOCK_C), lambda c, b: (0, c))
-  grid = (channels // _BLOCK_C, batch)
+  strip = pl.BlockSpec((1, seq_len, block_c), lambda c, b: (b, 0, c))
+  taps = pl.BlockSpec((width, block_c), lambda c, b: (0, c))
+  grid = (channels // block_c, batch)
   return strip, taps, grid
 
 
-def causal_conv_silu_fwd_jax(x: jax.Array, w_WC: jax.Array) -> jax.Array:
-  """``silu(causal_conv(x))`` for ``x`` ``[B, S, C]``, fp32 taps ``[W, C]``."""
+def _doc_pos_spec(seq_len: int):
+  """``[B, S, 1]`` int32 document positions, one row per grid step."""
+  return pl.BlockSpec((1, seq_len, 1), lambda c, b: (b, 0, 0))
+
+
+def causal_conv_silu_fwd_jax(
+    x: jax.Array, w_WC: jax.Array, doc_pos_BS1: jax.Array | None = None
+) -> jax.Array:
+  """``silu(causal_conv(x))`` for ``x`` ``[B, S, C]``, fp32 taps ``[W, C]``.
+
+  ``doc_pos_BS1``: optional ``[B, S, 1]`` int32 position of each token in its
+  document, clamped to ``W - 1`` (see ``doc_positions``).
+  """
   batch, seq_len, channels = x.shape
   width = w_WC.shape[0]
-  strip, taps, grid = _specs(batch, seq_len, channels, width)
+  extra = [] if doc_pos_BS1 is None else [doc_pos_BS1]
+  block_c = (
+      _BLOCK_C
+      if doc_pos_BS1 is None
+      else _segmented_block_c(seq_len, channels, _SEG_FWD_BUDGET_ROWS)
+  )
+  strip, taps, grid = _specs(batch, seq_len, channels, width, block_c)
   return pl.pallas_call(
       _fwd_kernel,
       grid=grid,
-      in_specs=[strip, taps],
+      in_specs=[strip, taps] + [_doc_pos_spec(seq_len)] * len(extra),
       out_specs=strip,
       out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
       compiler_params=pltpu.CompilerParams(
@@ -162,20 +217,29 @@ def causal_conv_silu_fwd_jax(x: jax.Array, w_WC: jax.Array) -> jax.Array:
           vmem_limit_bytes=_vmem_limit_bytes(),
       ),
       name="causal_conv1d_silu_fwd",
-  )(x, w_WC)
+  )(x, w_WC, *extra)
 
 
 def causal_conv_silu_bwd_jax(
-    x: jax.Array, w_WC: jax.Array, g: jax.Array
+    x: jax.Array,
+    w_WC: jax.Array,
+    g: jax.Array,
+    doc_pos_BS1: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Returns ``(dx, dw_WC)`` for the output gradient ``g`` ``[B, S, C]``."""
   batch, seq_len, channels = x.shape
   width = w_WC.shape[0]
-  strip, taps, grid = _specs(batch, seq_len, channels, width)
+  extra = [] if doc_pos_BS1 is None else [doc_pos_BS1]
+  block_c = (
+      _BLOCK_C
+      if doc_pos_BS1 is None
+      else _segmented_block_c(seq_len, channels, _SEG_BWD_BUDGET_ROWS)
+  )
+  strip, taps, grid = _specs(batch, seq_len, channels, width, block_c)
   return pl.pallas_call(
       _bwd_kernel,
       grid=grid,
-      in_specs=[strip, taps, strip],
+      in_specs=[strip, taps, strip] + [_doc_pos_spec(seq_len)] * len(extra),
       out_specs=[strip, taps],
       out_shape=[
           jax.ShapeDtypeStruct(x.shape, x.dtype),
@@ -186,7 +250,7 @@ def causal_conv_silu_bwd_jax(
           vmem_limit_bytes=_vmem_limit_bytes(),
       ),
       name="causal_conv1d_silu_bwd",
-  )(x, w_WC, g)
+  )(x, w_WC, g, *extra)
 
 
 @pallas.jax_op("tt_qwen35::causal_conv1d_silu_fwd")
@@ -218,6 +282,50 @@ def _backward(ctx, grad_out):
 
 
 _fwd_op.register_autograd(_backward, setup_context=_setup_context)
+
+
+@pallas.jax_op("tt_qwen35::causal_conv1d_silu_seg_fwd")
+def _seg_fwd_op(
+    x: jax.Array, w_WC: jax.Array, doc_pos_BS1: jax.Array
+) -> jax.Array:
+  return causal_conv_silu_fwd_jax(x, w_WC, doc_pos_BS1)
+
+
+@pallas.jax_op("tt_qwen35::causal_conv1d_silu_seg_bwd")
+def _seg_bwd_op(
+    x: jax.Array, w_WC: jax.Array, g: jax.Array, doc_pos_BS1: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+  return causal_conv_silu_bwd_jax(x, w_WC, g, doc_pos_BS1)
+
+
+def _seg_setup_context(ctx, inputs, output):
+  del output
+  ctx.set_materialize_grads(False)
+  ctx.save_for_backward(*inputs)
+
+
+def _seg_backward(ctx, grad_out):
+  need_dx, need_dw, _ = ctx.needs_input_grad
+  if grad_out is None or not (need_dx or need_dw):
+    return None, None, None
+  x, w_WC, doc_pos_BS1 = ctx.saved_tensors
+  dx, dw_WC = _seg_bwd_op(x, w_WC, grad_out.contiguous(), doc_pos_BS1)
+  return dx if need_dx else None, dw_WC if need_dw else None, None
+
+
+_seg_fwd_op.register_autograd(_seg_backward, setup_context=_seg_setup_context)
+
+
+def doc_positions(segment_ids_BS: torch.Tensor, width: int) -> torch.Tensor:
+  """``[B, S, 1]`` int32 position of each token in its document, clamped to
+  ``width - 1``. Documents are contiguous runs of equal ``segment_ids_BS``, so
+  the count of ``s in [1, width)`` with ``segment_ids[t - s] == segment_ids[t]``
+  is that clamped position."""
+  pos = torch.zeros_like(segment_ids_BS, dtype=torch.int32)
+  for shift in range(1, width):
+    same = segment_ids_BS[:, shift:] == segment_ids_BS[:, :-shift]
+    pos = pos + torch.nn.functional.pad(same.to(torch.int32), (shift, 0))
+  return pos.unsqueeze(-1)
 
 
 def unsupported_reason(
@@ -299,3 +407,28 @@ def causal_conv_silu(
     )
   w_WC = weight_C1W[:, 0, :].t().to(torch.float32).contiguous()
   return _fwd_op(x_BSC.contiguous(), w_WC)
+
+
+def causal_conv_silu_segmented(
+    x_BSC: torch.Tensor, weight_C1W: torch.Tensor, segment_ids_BS: torch.Tensor
+) -> torch.Tensor:
+  """``causal_conv_silu`` that restarts at every document of ``segment_ids_BS``.
+
+  Same limits as ``causal_conv_silu``; ``segment_ids_BS`` is ``[B, S]``.
+  """
+  reason = unsupported_reason(x_BSC, weight_C1W)
+  if reason is None and segment_ids_BS.shape != x_BSC.shape[:2]:
+    reason = (
+        f"segment_ids shape {tuple(segment_ids_BS.shape)} must be"
+        f" {tuple(x_BSC.shape[:2])}"
+    )
+  if reason is not None:
+    raise ValueError(
+        f"Unsupported inputs for causal_conv_silu_segmented ({reason})"
+    )
+  w_WC = weight_C1W[:, 0, :].t().to(torch.float32).contiguous()
+  return _seg_fwd_op(
+      x_BSC.contiguous(),
+      w_WC,
+      doc_positions(segment_ids_BS, weight_C1W.shape[2]),
+  )

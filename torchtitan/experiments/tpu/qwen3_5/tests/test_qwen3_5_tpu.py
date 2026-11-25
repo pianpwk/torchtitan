@@ -596,7 +596,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertLess(err, 1e-2, msg=f"d{name}: {err:.2e}")
 
   def test_causal_conv_silu_dispatches_to_pallas_when_supported(self):
-    """Tests whole-row TPU dispatch to Pallas causal_conv1d and fallbacks."""
+    """Tests TPU dispatch to Pallas causal_conv1d (rows, documents)."""
     dev = self.accelerator_device
     x = torch.randn(2, 64, 128, device=dev, dtype=torch.bfloat16)
     weight = torch.randn(128, 1, 4, device=dev, dtype=torch.bfloat16) * 0.5
@@ -611,11 +611,17 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
               "causal_conv_silu",
               wraps=gated_delta.causal_conv1d.causal_conv_silu,
           ) as pallas_spy,
+          mock.patch.object(
+              gated_delta.causal_conv1d,
+              "causal_conv_silu_segmented",
+              wraps=gated_delta.causal_conv1d.causal_conv_silu_segmented,
+          ) as segmented_spy,
           mock.patch.object(gated_delta.logger, "info") as log_info_spy,
       ):
         out_pallas = gated_delta.causal_conv_silu(x, weight, None)
         self.assertEqual(pallas_spy.call_count, 1)
-        _ = gated_delta.causal_conv_silu(x, weight, seg)
+        out_segmented = gated_delta.causal_conv_silu(x, weight, seg)
+        self.assertEqual(segmented_spy.call_count, 1)
         self.assertEqual(log_info_spy.call_count, 0)
         _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
         _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
@@ -624,6 +630,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         self.assertIn("seq_len=7", log_info_spy.call_args.args[1])
       out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
       self.assertLess(_relative_l2_error(out_pallas, out_slice), 5e-3)
+      out_slice = gated_delta._CausalConvSilu.apply(x, weight, seg)  # pylint: disable=protected-access
+      self.assertLess(_relative_l2_error(out_segmented, out_slice), 5e-3)
     else:
       out_fallback = gated_delta.causal_conv_silu(x, weight, None)
       out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
