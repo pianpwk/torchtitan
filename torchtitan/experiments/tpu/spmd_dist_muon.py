@@ -271,14 +271,16 @@ def _is_rank_symmetric(plan: Any) -> bool:
 
 
 def _run_buckets(
-    optimizer: "SpmdCompiledDistMuon", local_grads: dict[str, torch.Tensor]
+    optimizer: "SpmdCompiledDistMuon",
+    program: int,
+    local_grads: dict[str, torch.Tensor],
 ) -> None:
     # Gradients enter as an explicit input: tracing an optimizer makes Dynamo
     # guard on the identity of every ``param.grad`` it reads, and the trainer
     # allocates new gradients each step (one recompile per step).
     optimizer._step_local_grads = local_grads
     optimizer._redistribution_runtime.run(
-        optimizer._captured_plans,
+        optimizer._program_plans[program],
         local_tensor_spec=optimizer._local_tensor_spec,
         prepare=optimizer._prepare_local,
         compute=optimizer._compute_update,
@@ -293,12 +295,20 @@ class SpmdCompiledDistMuon(DistMuon):
     Validation and state creation (``_preflight_step``) stay eager. The
     scheduled LR enters the program as a 0-d tensor, so LR warmup and decay do
     not recompile it. See the module docstring for the collective check.
+
+    ``max_buckets_per_program`` splits the captured buckets into consecutive
+    programs of at most that many buckets. One program keeps every bucket's
+    exchange buffers and Newton-Schulz temporaries live at once (so the
+    all-to-alls can overlap) and returns new parameters and momenta without
+    aliasing the inputs, so its HBM grows with the number of buckets; several
+    programs bound it, overlapping only within each.
     """
 
     def __init__(
         self,
         *args: Any,
         collective_check_ranks: tuple[int, ...] | None = None,
+        max_buckets_per_program: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -328,25 +338,40 @@ class SpmdCompiledDistMuon(DistMuon):
                 "across ranks and needs the XLA dump: set xla_flags "
                 "xla_dump_to (one directory per rank) and xla_dump_hlo_as_text"
             )
-        self._collective_guard = _CollectiveGuard(
-            tag=f"SpmdDistMuon[{len(self._captured_plans)} buckets]",
-            dump_dir=dump_dir,
-            check_ranks=(
-                None
-                if collective_check_ranks is None
-                else tuple(sorted(set(collective_check_ranks)))
-            ),
-            expected_all_to_alls=sum(
-                int(schedule.has_remote_transfers)
-                for plan in self._captured_plans
-                for schedule in (
-                    getattr(plan, "storage_to_compute_schedule", None),
-                    getattr(plan, "compute_to_storage_schedule", None),
-                )
-                if schedule is not None
-            ),
+        size = max_buckets_per_program or max(len(self._captured_plans), 1)
+        if size < 1:
+            raise ValueError(f"max_buckets_per_program must be >= 1, got {size}")
+        self._program_plans = tuple(
+            self._captured_plans[i : i + size]
+            for i in range(0, len(self._captured_plans), size)
         )
-        self._compiled_run: Callable[..., None] | None = None
+        check_ranks = (
+            None
+            if collective_check_ranks is None
+            else tuple(sorted(set(collective_check_ranks)))
+        )
+        self._collective_guards = tuple(
+            _CollectiveGuard(
+                tag=(
+                    f"SpmdDistMuon[{len(plans)} buckets]"
+                    if len(self._program_plans) == 1
+                    else f"SpmdDistMuon[program {i}: {len(plans)} buckets]"
+                ),
+                dump_dir=dump_dir,
+                check_ranks=check_ranks,
+                expected_all_to_alls=sum(
+                    int(schedule.has_remote_transfers)
+                    for plan in plans
+                    for schedule in (
+                        getattr(plan, "storage_to_compute_schedule", None),
+                        getattr(plan, "compute_to_storage_schedule", None),
+                    )
+                    if schedule is not None
+                ),
+            )
+            for i, plans in enumerate(self._program_plans)
+        )
+        self._compiled_runs: tuple[Callable[..., None], ...] | None = None
         self._step_local_grads: dict[str, torch.Tensor] | None = None
 
     def _local_gradient_and_momentum(self, compute_layout: Any) -> Any:
@@ -368,16 +393,17 @@ class SpmdCompiledDistMuon(DistMuon):
         if closure is not None:
             raise ValueError("SpmdCompiledDistMuon does not support a closure")
         self._preflight_step()
-        if self._compiled_run is None:
-            self._compiled_run = torch.compile(
-                torch.tpu.distributed.spmd_safe(_run_buckets),
-                backend="tpu",
-                fullgraph=True,
-                dynamic=False,
-                options={
-                    "debug_callback": self._collective_guard,
-                    "serializable": False,
-                },
+        if self._compiled_runs is None:
+            # One torch.compile per program: each has its own guard and cache.
+            self._compiled_runs = tuple(
+                torch.compile(
+                    torch.tpu.distributed.spmd_safe(_run_buckets),
+                    backend="tpu",
+                    fullgraph=True,
+                    dynamic=False,
+                    options={"debug_callback": guard, "serializable": False},
+                )
+                for guard in self._collective_guards
             )
         group = self.param_groups[0]
         lr = group["lr"]
@@ -387,9 +413,12 @@ class SpmdCompiledDistMuon(DistMuon):
             layout.fqn: layout.param.grad.to_local()
             for layout in self._parameter_compute_layouts
         }
-        self._collective_guard.compile_start = time.time()
         try:
-            self._compiled_run(self, local_grads)
+            for program, (run, guard) in enumerate(
+                zip(self._compiled_runs, self._collective_guards)
+            ):
+                guard.compile_start = time.time()
+                run(self, program, local_grads)
         finally:
             group["lr"] = lr
             self._step_local_grads = None
