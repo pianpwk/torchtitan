@@ -59,6 +59,7 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
 )
 from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gathers import (
     _is_attention_output,
+    _is_gathered_expert_weight,
     apply_expert_all_gathers_under_attention,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
@@ -374,6 +375,7 @@ class GraphSplitter:
           prefetched_gathers_under_attention=(
               self.config.prefetched_gathers_under_attention
           ),
+          prefetch_skip_expert_gathers=self.config.prefetch_skip_expert_gathers,
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
@@ -407,6 +409,7 @@ class GraphSplitter:
           prefetched_gathers_under_attention=(
               self.config.prefetched_gathers_under_attention
           ),
+          pipeline_skip_expert_gathers=self.config.prefetch_skip_expert_gathers,
       )
       split.backward_graph = backward.module
       split.module.backward_graph = backward.module
@@ -682,6 +685,7 @@ def split_forward_graph_by_layer(
     prefetch_parameter_gathers: bool = False,
     prefetch_min_gather_bytes: int = 0,
     prefetched_gathers_under_attention: bool = False,
+    prefetch_skip_expert_gathers: bool = False,
 ) -> PartitionedGraph:
   """Split forward into ascending, complete transformer-layer ranges.
 
@@ -709,6 +713,10 @@ def split_forward_graph_by_layer(
         for launch, role in classify_fsdp_roles(chains).items()
         if role == "ag"
         and _gathered_bytes(launch) >= prefetch_min_gather_bytes
+        and not (
+            prefetch_skip_expert_gathers
+            and any(_is_gathered_expert_weight(n) for n in chains[launch])
+        )
     }
   gather_chain_nodes: set[torch.fx.Node] = set().union(
       *gather_chains.values()
@@ -988,6 +996,7 @@ def split_backward_graph_by_layer(
     defer_reduction_max_bytes: int = 0,
     cpu_offload_prefetch_executables: int = 0,
     prefetched_gathers_under_attention: bool = False,
+    pipeline_skip_expert_gathers: bool = False,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
 
@@ -1088,7 +1097,15 @@ def split_backward_graph_by_layer(
   last_partition = max(collective_partition("rs", l) for l in layer_ids)
   prefetched: list[tuple[set[torch.fx.Node], int]] = []
   for launch, (kind, layer_id) in owners.items():
-    if kind == "ag" and _gathered_bytes(launch) < pipeline_min_gather_bytes:
+    if kind == "ag" and (
+        _gathered_bytes(launch) < pipeline_min_gather_bytes
+        or (
+            pipeline_skip_expert_gathers
+            and any(
+                _is_gathered_expert_weight(n) for n in collective_chains[launch]
+            )
+        )
+    ):
       partition = raw_layer_to_partition[layer_id]
     elif kind == "rs" and _reduced_bytes(launch) < defer_reduction_max_bytes:
       partition = last_partition
