@@ -86,7 +86,11 @@ def _tiny() -> KimiK3Model.Config:
   return cfg
 
 
-def _k3_slice(num_experts: int, num_layers: int = 3) -> KimiK3Model.Config:
+def _k3_slice(
+    num_experts: int,
+    num_layers: int = 3,
+    full_attention_layers: set[int] | None = None,
+) -> KimiK3Model.Config:
   """K3 layers at the released widths (three by default, one of each type).
 
   Layer 0 is KDA + dense FFN, layer 1 KDA + LatentMoE, layer 2 gated MLA +
@@ -103,7 +107,8 @@ def _k3_slice(num_experts: int, num_layers: int = 3) -> KimiK3Model.Config:
   comm / memory benchmarks, not training.
 
   With ``num_layers`` > 3 the layers follow K3's own mix: gated MLA at every
-  fourth layer (3, 7, ...), KDA elsewhere, layer 0 dense.
+  fourth layer (3, 7, ...), KDA elsewhere, layer 0 dense, unless
+  ``full_attention_layers`` gives the MLA layers explicitly.
   """
   dim = 7168
   # pylint: disable-next=protected-access
@@ -112,7 +117,9 @@ def _k3_slice(num_experts: int, num_layers: int = 3) -> KimiK3Model.Config:
       vocab_size=163840,
       num_layers=num_layers,
       full_attention_layers=(
-          {2} if num_layers == 3 else set(range(3, num_layers, 4))
+          full_attention_layers
+          if full_attention_layers is not None
+          else {2} if num_layers == 3 else set(range(3, num_layers, 4))
       ),
       attn_res_block_size=12,
       num_heads=96,
@@ -150,6 +157,23 @@ kimi_k3_tpu_configs = {
     # Eight layers in K3's KDA:MLA mix (MLA at 3 and 7).
     "k3_deep8_e448": (lambda: _k3_slice(448, num_layers=8), 4096),
     "k3_deep8_e896": (lambda: _k3_slice(896, num_layers=8), 4096),
+    # Half of K3's 93 layers at full widths: K3 has MLA at range(3, 92, 4) plus
+    # the last layer (24 MLA + 68 KDA + MoE + layer 0 dense); halved, MLA at
+    # range(3, 46, 4) plus the last layer 46: 12 MLA + 34 KDA + MoE + 1 dense.
+    "k3_half47_e896": (
+        lambda: _k3_slice(
+            896, num_layers=47, full_attention_layers=set(range(3, 46, 4)) | {46}
+        ),
+        4096,
+    ),
+    # Full-depth K3 (93 layers, MLA at range(3, 92, 4) plus layer 92) at the
+    # released widths: 24 MLA + MoE, 68 KDA + MoE, 1 KDA + dense.
+    "k3_full93_e896": (
+        lambda: _k3_slice(
+            896, num_layers=93, full_attention_layers=set(range(3, 92, 4)) | {92}
+        ),
+        4096,
+    ),
 }
 
 

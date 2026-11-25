@@ -168,3 +168,20 @@ def graph_trainer_kimi_k3_slice_e64() -> TpuGraphTrainer.Config:
 def graph_trainer_kimi_k3_deep8_e448_fused_kda() -> TpuGraphTrainer.Config:
   """``k3_deep8_e448`` with the fused Pallas KDA kernels (``fused_kda.py``)."""
   return _graph_trainer_kimi_k3_slice("k3_deep8_e448", kda_override=_FUSED_KDA)
+
+
+def graph_trainer_kimi_k3_half47_e896_fused_kda() -> TpuGraphTrainer.Config:
+  """``k3_half47_e896`` (half-depth K3, full widths, 56 experts per core on
+  EP16) with the fused Pallas KDA kernels and host offload of the saved layer
+  boundaries (full recompute + ``full_and_offload``)."""
+  cfg = _graph_trainer_kimi_k3_slice("k3_half47_e896", kda_override=_FUSED_KDA)
+  cfg.compile.memory_policy = "full_and_offload"
+  return cfg
+
+
+def graph_trainer_kimi_k3_full93_e896_fused_kda() -> TpuGraphTrainer.Config:
+  """``k3_full93_e896`` (full-depth K3, 56 experts per core on EP16) with the
+  fused Pallas KDA kernels and host offload of the saved layer boundaries."""
+  cfg = _graph_trainer_kimi_k3_slice("k3_full93_e896", kda_override=_FUSED_KDA)
+  cfg.compile.memory_policy = "full_and_offload"
+  return cfg
