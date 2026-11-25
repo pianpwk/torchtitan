@@ -46,7 +46,7 @@ from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_
 import torchtitan.experiments.tpu.graph_trainer.scan_fsdp  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.graph_trainer import simple_fsdp as tpu_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.passes import (
-    expert_all_gathers_under_splash as under_splash_lib,
+    expert_all_gathers as expert_all_gathers_lib,
 )
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
@@ -186,10 +186,13 @@ class _AttentionMoELayer(nn.Module):
     super().__init__()
     self.attention = nn.Linear(8, 8, bias=False)
     self.splash = _SplashCore(_STOCK_STYLE_SPLASH, model_layout=False)
-    self.moe = nn.Linear(8, 8, bias=False)
+    self.moe = nn.Module()
+    self.moe.routed_experts = nn.Linear(8, 8, bias=False)
 
   def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-    return torch.relu(self.moe(self.splash(self.attention(inputs))))
+    return torch.relu(
+        self.moe.routed_experts(self.splash(self.attention(inputs)))
+    )
 
 
 class _AttentionMoEToy(_ToyTransformer):
@@ -750,7 +753,7 @@ class GraphSplitTest(absltest.TestCase):
             backward_layers_per_executable=1,
             cpu_offload_prefetch_executables=0,
             donate_internal_buffers=False,
-            expert_all_gathers_under_splash=False,
+            expert_all_gathers_under_attention=False,
         ),
         n_layers=3,
     )
@@ -806,7 +809,7 @@ class GraphSplitTest(absltest.TestCase):
     graph.output((gather,))
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    self.assertFalse(under_splash_lib._is_gathered_expert_weight(gather))
+    self.assertFalse(expert_all_gathers_lib._is_gathered_expert_weight(gather))
     roles = collectives_lib.classify_fsdp_roles(
         collectives_lib.collect_collective_chains(gm)
     )
@@ -816,7 +819,7 @@ class GraphSplitTest(absltest.TestCase):
     barriers = []
 
     def apply_deadline(gm: torch.fx.GraphModule) -> None:
-      under_splash_lib.apply_expert_all_gathers_under_splash(gm)
+      expert_all_gathers_lib.apply_expert_all_gathers_under_attention(gm)
       barriers.extend(
           node for node in gm.graph.nodes if node.target is _optimization_barrier
       )
@@ -828,7 +831,7 @@ class GraphSplitTest(absltest.TestCase):
     self.assertLen(barriers, 4)
     for barrier in barriers:
       anchor, *weights = barrier.args
-      self.assertTrue(under_splash_lib._is_splash_output(anchor))
+      self.assertTrue(expert_all_gathers_lib._is_attention_output(anchor))
       self.assertNotEmpty(weights)
       for weight in weights:
         self.assertIn(".moe", _get_module_fqn(weight))
@@ -872,9 +875,9 @@ class GraphSplitTest(absltest.TestCase):
     graph.output((ids_ag, tok_ag, weight_ag))
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    self.assertFalse(under_splash_lib._is_gathered_expert_weight(ids_ag))
-    self.assertFalse(under_splash_lib._is_gathered_expert_weight(tok_ag))
-    self.assertTrue(under_splash_lib._is_gathered_expert_weight(weight_ag))
+    self.assertFalse(expert_all_gathers_lib._is_gathered_expert_weight(ids_ag))
+    self.assertFalse(expert_all_gathers_lib._is_gathered_expert_weight(tok_ag))
+    self.assertTrue(expert_all_gathers_lib._is_gathered_expert_weight(weight_ag))
 
     chains = collectives_lib.collect_collective_chains(gm)
     roles = collectives_lib.classify_fsdp_roles(chains)
