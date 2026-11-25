@@ -419,14 +419,33 @@ def _validate_disjoint_regions_in_bounds(
         f"{direction} regions must be in bounds",
     )
 
-    positive_regions = sorted(
-        (region for region in regions if region.numel),
-        key=lambda region: region.offsets,
+    positive_regions = [region for region in regions if region.numel]
+    # Sweep along the first dim on which the regions' offsets differ: once a
+    # later region starts past ``first``'s end on that dim, so do all after it.
+    # (Sweeping dim 0 is quadratic for column shards, whose regions all start
+    # at row 0: 1M pairs per tensor at 1024 ranks.)
+    sweep_dim = next(
+        (
+            dim
+            for dim in range(len(bounds_shape))
+            if len({region.offsets[dim] for region in positive_regions}) > 1
+        ),
+        0,
+    )
+    positive_regions.sort(
+        key=lambda region: (
+            region.offsets[sweep_dim] if bounds_shape else 0,
+            region.offsets,
+        )
     )
     for index, first in enumerate(positive_regions):
         for other_index in range(index + 1, len(positive_regions)):
             second = positive_regions[other_index]
-            if bounds_shape and second.offsets[0] >= first.offsets[0] + first.shape[0]:
+            if (
+                bounds_shape
+                and second.offsets[sweep_dim]
+                >= first.offsets[sweep_dim] + first.shape[sweep_dim]
+            ):
                 break
             _require_valid_plan(
                 not all(
