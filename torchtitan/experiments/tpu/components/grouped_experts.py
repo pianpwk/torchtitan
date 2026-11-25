@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import torch
 import spmd_types as spmd
@@ -114,6 +115,12 @@ class TpuGroupedExperts(GroupedExperts):
         use_pallas_grouped_mm: bool = False
         # Share routed-token loads between the equal-shaped W1/W3 projections.
         use_pallas_paired_grouped_mm: bool = False
+        # Kernel for the unpaired BF16 Pallas grouped matmuls. "gmm_v2" runs
+        # Tokamax's gmm_v2 / tgmm_v2, which align M tiles to expert groups and
+        # pick their own tiles: the ``pallas_grouped_mm_tile_*`` and
+        # ``*_tgmm_tiling`` fields don't apply to it. It has no paired W1/W3
+        # or FP8 variant.
+        pallas_grouped_mm_kernel: Literal["megablox", "gmm_v2"] = "megablox"
         pallas_grouped_mm_tile_m: int = 1024
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
@@ -189,6 +196,7 @@ class TpuGroupedExperts(GroupedExperts):
         self.activation = config.activation
         self.use_pallas_grouped_mm = config.use_pallas_grouped_mm
         self.use_pallas_paired_grouped_mm = config.use_pallas_paired_grouped_mm
+        self.pallas_grouped_mm_kernel = config.pallas_grouped_mm_kernel
         self.pallas_grouped_mm_tile_m = config.pallas_grouped_mm_tile_m
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
@@ -216,6 +224,17 @@ class TpuGroupedExperts(GroupedExperts):
             raise ValueError(
                 "FP8 grouped matmul supports only the silu activation, got"
                 f" {self.activation!r}"
+            )
+
+        if self.pallas_grouped_mm_kernel == "gmm_v2" and (
+            not self.use_pallas_grouped_mm
+            or self.use_pallas_paired_grouped_mm
+            or self.use_fp8_grouped_mm
+        ):
+            raise ValueError(
+                "pallas_grouped_mm_kernel='gmm_v2' requires"
+                " use_pallas_grouped_mm without the paired or FP8 grouped"
+                " matmul"
             )
 
         if self.use_pallas_paired_grouped_mm:
@@ -495,6 +514,9 @@ class TpuGroupedExperts(GroupedExperts):
                 max(1, tiling[0])
                 for tiling in (*self.fp8_w13_tilings, *self.fp8_w2_tilings)
             )
+        elif self.pallas_grouped_mm_kernel == "gmm_v2":
+            # gmm_v2 takes any row count; its backward pads for tgmm_v2.
+            row_tiles = (1,)
         else:
             row_tiles = (tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0]))
         row_align = math.lcm(*row_tiles)
@@ -541,7 +563,21 @@ class TpuGroupedExperts(GroupedExperts):
             return self._fp8_experts_forward(
                 x_bf16, w1_EKN, w2_EKN, w3_EKN, fp8_tokens_per_expert_E
             )[:num_rows].type_as(x_RD)
-        if self.use_pallas_paired_grouped_mm:
+        if self.pallas_grouped_mm_kernel == "gmm_v2":
+            # Imported lazily, like the FP8 kernels: it pulls in tokamax.
+            from torchtitan.experiments.tpu.kernels import (
+                gmm_v2_segment_matmul,
+            )
+
+            grouped_mm_v2 = gmm_v2_segment_matmul.grouped_mm_v2
+            group_sizes_E = num_tokens_per_expert_E.to(torch.int32)
+            gate_RF = grouped_mm_v2(
+                x_bf16, w1_EKN.bfloat16(), group_sizes_E, False
+            )
+            up_RF = grouped_mm_v2(
+                x_bf16, w3_EKN.bfloat16(), group_sizes_E, False
+            )
+        elif self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16
             # reductions consume them as-is.
@@ -580,16 +616,25 @@ class TpuGroupedExperts(GroupedExperts):
             hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
                 hidden_RF.dtype
             )
-        return segment_matmul_pallas_2d(
-            hidden_RF,
-            w2_EKN.bfloat16(),
-            num_tokens_per_expert_E,
-            tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
-            tgmm_tiling=w2_tgmm_tiling,
-            transpose_rhs=self._use_transposed_w2_rhs,
-        )[:num_rows].type_as(x_RD)
+        if self.pallas_grouped_mm_kernel == "gmm_v2":
+            out_RD = grouped_mm_v2(
+                hidden_RF,
+                w2_EKN.bfloat16(),
+                group_sizes_E,
+                self._use_transposed_w2_rhs,
+            )
+        else:
+            out_RD = segment_matmul_pallas_2d(
+                hidden_RF,
+                w2_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                tgmm_tiling=w2_tgmm_tiling,
+                transpose_rhs=self._use_transposed_w2_rhs,
+            )
+        return out_RD[:num_rows].type_as(x_RD)
 
     def _fp8_experts_forward(
         self,
