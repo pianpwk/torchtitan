@@ -7,7 +7,7 @@ to 1), projects tokens down to the latent dim, runs the routed experts there,
 weights each expert output by its score after W2, sums the routes per token,
 then applies ``routed_norm`` and the up projection and adds the shared experts
 (a SiTU-GLU FFN on the model dim). Only the routed experts change on TPU, so
-the override keeps ``KimiLatentMoE`` and replaces its ``routed_experts``
+the overrides keep ``KimiLatentMoE`` and replace its ``routed_experts``
 children:
 
 * ``TpuKimiGroupedExperts``: ``TpuGroupedExperts`` (Pallas MegaBlox GMM,
@@ -15,6 +15,10 @@ children:
   ``KimiGroupedExperts`` subclasses the common ``GroupedExperts`` on
   ``torch._grouped_mm``; TPU runs the existing ``TpuGroupedExperts``
   component instead, so only the activation hook (``_glu``) is K3-specific.
+  ``tpu_latent_moe`` runs it on MegaBlox (the reference path);
+  ``tpu_latent_moe_gmm_v2`` (an option, used in its place) selects
+  ``pallas_grouped_mm_kernel="gmm_v2"``: all three expert GEMMs on Tokamax's
+  ``gmm_v2`` / ``tgmm_v2``, SiTU-GLU still in XLA between them.
 * ``TpuAllToAllTokenDispatcher``: TPU local-reorder VJPs without EP; with EP,
   the Ring-of-Experts transport (``ep_transport="ring_of_experts"``, set
   explicitly rather than ``"auto"``, which would switch to ragged all-to-all
@@ -112,25 +116,12 @@ class TpuKimiGroupedExperts(TpuGroupedExperts):
     return _situ_glu(gate_RF, up_RF, self.beta, self.linear_beta)
 
 
-@override(
-    target=KimiLatentMoE.Config,
-    description="Kimi K3 LatentMoE on TPU: MegaBlox experts, Ring-of-Experts EP.",
-)
-def tpu_latent_moe(
+def _tpu_latent_moe(
     cfg: KimiLatentMoE.Config,
     *,
-    ep_capacity_factor: float | None = None,
+    ep_capacity_factor: float | None,
+    expert_kernel_config: dict,
 ) -> KimiLatentMoE.Config:
-  """K3 LatentMoE with TPU experts and the TPU dispatcher.
-
-  The MoE keeps its config type: ``KimiLatentMoE`` or
-  ``QuantileBalancedKimiLatentMoE`` (``quantile_balance.py``).
-
-  ``ep_capacity_factor`` (Ring-of-Experts expert rows per EP rank, in units of
-  the local routes; None is drop-free) applies only under EP; see
-  ``TpuAllToAllTokenDispatcher.Config``. ``TpuRoutedExperts`` runs one token
-  chunk.
-  """
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
     raise ValueError(
@@ -146,9 +137,7 @@ def tpu_latent_moe(
           inner_experts=derive(
               routed.inner_experts,
               TpuKimiGroupedExperts.Config,
-              **_expert_kernel_config(
-                  routed.inner_experts.dim, routed.inner_experts.hidden_dim
-              ),
+              **expert_kernel_config,
           ),
           token_dispatcher=derive(
               routed.token_dispatcher,
@@ -157,5 +146,59 @@ def tpu_latent_moe(
               ep_transport="ring_of_experts",
               ep_capacity_factor=ep_capacity_factor,
           ),
+      ),
+  )
+
+
+@override(
+    target=KimiLatentMoE.Config,
+    description="Kimi K3 LatentMoE on TPU: MegaBlox experts, Ring-of-Experts EP.",
+)
+def tpu_latent_moe(
+    cfg: KimiLatentMoE.Config,
+    *,
+    ep_capacity_factor: float | None = None,
+) -> KimiLatentMoE.Config:
+  """K3 LatentMoE with TPU MegaBlox experts and the TPU dispatcher.
+
+  The MoE keeps its config type: ``KimiLatentMoE`` or
+  ``QuantileBalancedKimiLatentMoE`` (``quantile_balance.py``).
+
+  ``ep_capacity_factor`` (Ring-of-Experts expert rows per EP rank, in units of
+  the local routes; None is drop-free) applies only under EP; see
+  ``TpuAllToAllTokenDispatcher.Config``. ``TpuRoutedExperts`` runs one token
+  chunk.
+  """
+  inner = cfg.routed_experts.inner_experts
+  return _tpu_latent_moe(
+      cfg,
+      ep_capacity_factor=ep_capacity_factor,
+      expert_kernel_config=_expert_kernel_config(inner.dim, inner.hidden_dim),
+  )
+
+
+@override(
+    target=KimiLatentMoE.Config,
+    description=(
+        "Kimi K3 LatentMoE on TPU: gmm_v2 / tgmm_v2 experts, Ring-of-Experts EP."
+    ),
+)
+def tpu_latent_moe_gmm_v2(
+    cfg: KimiLatentMoE.Config,
+    *,
+    ep_capacity_factor: float | None = None,
+) -> KimiLatentMoE.Config:
+  """``tpu_latent_moe`` with every expert GEMM on gmm_v2 (an option).
+
+  Use it in place of ``tpu_latent_moe`` in ``override.imports``. gmm_v2
+  picks its own tiles, so the MegaBlox tiling does not apply.
+  """
+  return _tpu_latent_moe(
+      cfg,
+      ep_capacity_factor=ep_capacity_factor,
+      expert_kernel_config=dict(
+          use_pallas_grouped_mm=True,
+          use_kernel_native_weight_layout=True,
+          pallas_grouped_mm_kernel="gmm_v2",
       ),
   )

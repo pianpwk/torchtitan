@@ -91,9 +91,12 @@ def _is_gathered_expert_weight(node: torch.fx.Node) -> bool:
     return "EP" not in (launch.meta.get("custom") or {})
 
 
-# Kimi K3's KDA forward kernels (``kimi_k3/tokamax_kda.py``); the training
-# forward returns ``[out, *residuals]``.
-_KDA_FORWARD_OP_NAMES = frozenset({"tt_kimi_k3::kda_fwd_res"})
+# Kimi K3's KDA forward kernels (``kimi_k3/tokamax_kda.py``,
+# ``kernels/kda.py`` via ``kimi_k3/fused_kda.py``); the training forward
+# returns ``[out, *residuals]``.
+_KDA_FORWARD_OP_NAMES = frozenset(
+    {"tt_kimi_k3::kda_fwd_res", "tt_tpu_kernels::kda_fwd_res"}
+)
 
 
 def _is_attention_kernel(target: object) -> bool:

@@ -4,9 +4,15 @@
 
 * ``tokamax_kda.tokamax_kda_attention``: Kimi Delta Attention with Tokamax's
   Mosaic TPU kernels.
+* Options, each in place of the entry above it: ``tokamax_kda.
+  tokamax_kda_attention_pallas_norm`` (Pallas output norm) and
+  ``fused_kda.fused_kda_attention`` (the fused Pallas KDA kernels,
+  ``kernels/kda.py``, with the Pallas output norm).
 * ``tokamax_mla.tokamax_mla_attention``: gated MLA with Tokamax Splash.
 * ``latent_moe.tpu_latent_moe``: LatentMoE with MegaBlox experts and
   Ring-of-Experts expert parallelism.
+* Option, in place of it: ``latent_moe.tpu_latent_moe_gmm_v2`` (every expert
+  GEMM on Tokamax's ``gmm_v2`` / ``tgmm_v2``).
 
 The ``tiny`` flavor balances experts by quantile balancing alone
 (``quantile_balance``; auxiliary-loss-free, as in the Kimi K3 report).
