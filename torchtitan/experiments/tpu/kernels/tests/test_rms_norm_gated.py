@@ -36,6 +36,19 @@ def _reference_fp64(x, gate, weight, eps):
   return weight.double() * xd * F.silu(gate.double())
 
 
+def _reference_sigmoid_fp64(x, gate, weight, eps):
+  """``KimiRMSNormGated`` per ``V``-wide head of ``x [..., H * V]``, in FP64."""
+  head_dim = weight.shape[0]
+  xd = x.double().unflatten(-1, (-1, head_dim))
+  xd = xd * torch.rsqrt(xd.pow(2).mean(-1, keepdim=True) + eps)
+  out = (
+      xd
+      * weight.double()
+      * gate.double().unflatten(-1, (-1, head_dim)).sigmoid()
+  )
+  return out.flatten(-2)
+
+
 def _relative_l2_error(actual, expected):
   return float(
       (actual.double() - expected.double()).norm()
@@ -129,6 +142,80 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
       self.assertEqual(actual.shape, expected.shape, name)
       self.assertEqual(actual.dtype, expected.dtype, name)
       self.assertLess(_relative_l2_error(actual.cpu(), expected), tol, name)
+
+  @parameterized.named_parameters(
+      # [T, H * V] input: 24 heads = 2 lane blocks of 12, 4 row blocks.
+      dict(testcase_name="_sigmoid_bf16", dtype=torch.bfloat16, tol=1e-2),
+      dict(testcase_name="_sigmoid_fp32", dtype=torch.float32, tol=1e-5),
+      dict(
+          testcase_name="_sigmoid_fp32_v256",
+          dtype=torch.float32,
+          tol=1e-5,
+          heads=5,
+          head_dim=256,
+      ),
+  )
+  def test_sigmoid_gate_matches_fp64(self, dtype, tol, heads=24, head_dim=128):
+    """Sigmoid gate on flat heads vs ``KimiRMSNormGated``'s math in FP64."""
+    self._require_tpu()
+    torch.manual_seed(3)
+    shape = (2048, heads * head_dim)
+    x = (3.0 * torch.randn(*shape)).to(dtype)
+    gate = torch.randn(*shape).to(dtype)
+    weight = 1.0 + 0.1 * torch.randn(head_dim)
+    grad = torch.randn(*shape).to(dtype)
+    inputs_ref = [t.double().requires_grad_() for t in (x, gate, weight)]
+    out_ref = _reference_sigmoid_fp64(*inputs_ref, 1e-5)
+    grads_ref = torch.autograd.grad(out_ref, inputs_ref, grad.double())
+
+    dev = self.accelerator_device
+    inputs = [t.to(dev).requires_grad_() for t in (x, gate, weight)]
+    out = rms_norm_gated.rms_norm_gated(
+        *inputs, 1e-5, gate_activation="sigmoid"
+    )
+    grads = torch.autograd.grad(out, inputs, grad.to(dev))
+    self.assertEqual(out.dtype, dtype)
+    self.assertLess(_relative_l2_error(out.cpu(), out_ref), tol)
+    for name, actual, expected in zip(
+        ("x", "gate", "weight"), grads, grads_ref, strict=True
+    ):
+      self.assertLess(_relative_l2_error(actual.cpu(), expected), tol, name)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_silu", gate_activation="silu"),
+      dict(testcase_name="_sigmoid", gate_activation="sigmoid"),
+  )
+  def test_flat_heads_match_per_head_rows_bitwise(self, gate_activation):
+    """``[T, H * V]`` gives the same output, dx and dgate bits as ``[T, H, V]``.
+
+    The per-row math is the same; only dweight sums in another order.
+    """
+    self._require_tpu()
+    torch.manual_seed(5)
+    dev = self.accelerator_device
+    tokens, heads, head_dim = 2048, 16, 128
+    x, gate, grad = (
+        torch.randn(tokens, heads, head_dim, device=dev, dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    weight = 1.0 + 0.1 * torch.randn(head_dim, device=dev)
+
+    def run(x_in, gate_in, grad_in):
+      x_in, gate_in = x_in.requires_grad_(), gate_in.requires_grad_()
+      w_in = weight.detach().clone().requires_grad_()
+      out = rms_norm_gated.rms_norm_gated(
+          x_in, gate_in, w_in, 1e-6, gate_activation=gate_activation
+      )
+      grads = torch.autograd.grad(out, (x_in, gate_in, w_in), grad_in)
+      return out, *grads
+
+    rows = run(x.clone(), gate.clone(), grad)
+    flat = run(x.flatten(1), gate.flatten(1), grad.flatten(1))
+    for name, a, b in zip(("out", "dx", "dgate"), rows, flat):
+      torch.testing.assert_close(
+          a.flatten(1).cpu(), b.cpu(), rtol=0, atol=0, msg=name
+      )
+    self.assertLess(_relative_l2_error(flat[3].cpu(), rows[3].cpu()), 1e-6)
 
   def test_large_row_biased_bf16_weight_gradient_accumulates_in_fp32(self):
     self._require_tpu()
@@ -225,6 +312,11 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
         ),
         (x_ok, x_ok, torch.ones(256, device=dev, dtype=torch.bfloat16)),
         (
+            torch.zeros(2048, 384, device=dev, dtype=torch.bfloat16),
+            None,
+            torch.ones(256, device=dev, dtype=torch.bfloat16),
+        ),
+        (
             torch.zeros(2048, 128, device=dev, dtype=torch.float16),
             None,
             torch.ones(128, device=dev, dtype=torch.float16),
@@ -247,6 +339,12 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
 
       with self.assertRaisesRegex(ValueError, "eps must be non-negative"):
         rms_norm_gated.rms_norm_gated(x_ok, x_ok, w_ok, -1e-6)
+      with self.assertRaisesRegex(ValueError, "gate_activation"):
+        rms_norm_gated.rms_norm_gated(
+            x_ok, x_ok, w_ok, 1e-6, gate_activation="relu"
+        )
+      x_heads = torch.zeros(2048, 512, device=dev, dtype=torch.bfloat16)
+      self.assertTrue(rms_norm_gated.supports(x_heads, x_heads, w_ok))
 
     fake_dtensor = mock.MagicMock(spec=DTensor)
     self.assertFalse(rms_norm_gated.supports(fake_dtensor, x_ok, w_ok))
@@ -309,7 +407,7 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertTrue(rms_norm_gated.supports(x, gate, w))
         self.assertFalse(rms_norm_gated.supports(x_bad, gate, w))
         with self.assertRaises((spmd.SpmdTypeError, ValueError)):
-          rms_norm_gated._RmsNormGatedSpmdFn.apply(x_bad, gate, w, 1e-6)
+          rms_norm_gated._RmsNormGatedSpmdFn.apply(x_bad, gate, w, 1e-6, "silu")
         out = rms_norm_gated.rms_norm_gated(x, gate, w, 1e-6)
         expected_ps = spmd.PartitionSpec(
             spmd.normalize_axis(dp), spmd.normalize_axis(tp), None
