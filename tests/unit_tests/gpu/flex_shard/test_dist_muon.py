@@ -23,10 +23,10 @@ from torchtitan.components.optimizer.utils import (
     init_optim_state,
     load_flat_optim_state_dict,
 )
+from torchtitan.components.optimizer.optimizer import build_dist_muon
 from torchtitan.distributed.flex_shard import (
     BlockShard,
     BucketConfig,
-    build_dist_muon,
     ComputeLayout,
     Owned,
 )
@@ -88,14 +88,16 @@ class TestDistMuon(DTensorTestBase):
                         shardings_by_mesh_axis={
                             "dp_shard": Owned(),
                         },
+                        compute_dtype=torch.bfloat16,
                     ),
                     local_blocks_fqn: ComputeLayout(
                         shardings_by_mesh_axis={
                             "dp_shard": BlockShard(
                                 dim=0,
-                                block_size=matrix_rows,
+                                block_sizes=(matrix_rows,),
                             )
                         },
+                        compute_dtype=torch.bfloat16,
                     ),
                 },
                 bucket_configs=[
@@ -295,6 +297,7 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
                             "ep": Shard(0),
                         },
                         shard_order_by_tensor_dim=shard_order_by_tensor_dim,
+                        compute_dtype=torch.bfloat16,
                     )
                 },
                 bucket_configs=[BucketConfig(patterns=(fqn,))],

@@ -7,6 +7,7 @@
 from dataclasses import dataclass, replace
 from typing import cast
 
+import torch
 from torch.distributed.tensor import Shard
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -270,6 +271,7 @@ def _per_expert_compute_layout(parallelism: ParallelismConfig) -> ComputeLayout:
             shardings_by_mesh_axis={
                 MeshAxisName.DP_SHARD.value: Shard(0),
             },
+            compute_dtype=torch.bfloat16,
         )
 
     # Preserve exact EP-first DTensor ownership. If an EP-local expert count is
@@ -285,6 +287,7 @@ def _per_expert_compute_layout(parallelism: ParallelismConfig) -> ComputeLayout:
         shard_order_by_tensor_dim={
             0: (MeshAxisName.EP.value, MeshAxisName.EFSDP.value),
         },
+        compute_dtype=torch.bfloat16,
     )
 
 
@@ -300,22 +303,25 @@ def _dist_muon_optimizer(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: Owned(),
         },
+        compute_dtype=torch.bfloat16,
     )
     per_query_head = ComputeLayout(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: BlockShard(
                 dim=0,
-                block_size=(attention.qk_nope_head_dim + attention.qk_rope_head_dim),
+                block_sizes=(attention.qk_nope_head_dim + attention.qk_rope_head_dim,),
             )
         },
+        compute_dtype=torch.bfloat16,
     )
     per_key_value_head = ComputeLayout(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: BlockShard(
                 dim=0,
-                block_size=attention.qk_nope_head_dim + attention.v_head_dim,
+                block_sizes=(attention.qk_nope_head_dim + attention.v_head_dim,),
             )
         },
+        compute_dtype=torch.bfloat16,
     )
     per_expert = _per_expert_compute_layout(parallelism)
     query_shardings: dict[str, ComputeLayout] = (

@@ -4,22 +4,30 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import fnmatch
 import json
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any, cast, Generic, Literal, overload, Protocol, TypeVar
 
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.flex_shard import build_dist_muon
+from torchtitan.distributed.flex_shard import (
+    BucketConfig,
+    ComputeLayout,
+    DistMuon,
+    redistribution_mesh_axes,
+)
+from torchtitan.distributed.utils import build_transport_meshes
 from torchtitan.tools.logging import logger
 
 from .utils import (
@@ -38,6 +46,58 @@ __all__ = [
     "register_moe_load_balancing_hook",
     "set_moe_routing_metric_tensors",
 ]
+
+
+def build_dist_muon(
+    params: Iterable[dict[str, Any]],
+    *,
+    compute_sharding_by_fqn: Mapping[str, ComputeLayout],
+    bucket_configs: Sequence[BucketConfig],
+    **kwargs: Any,
+) -> DistMuon:
+    """Build FlexShard ``DistMuon`` with one transport mesh per bucket.
+
+    Port of upstream's ``DistMuon`` wrapper (pytorch/torchtitan#5678) onto this
+    fork's factory-based ``OptimizersContainer``. Recipes leave
+    ``BucketConfig.mesh`` unset; each bucket's transport mesh is built from the
+    storage layout of its first redistributed parameter (e.g. ``dp_shard_tp``
+    under FSDP x TP). The NCCL CTA cap is not supported here.
+    """
+    param_groups = tuple(params)
+    named_parameters = [
+        (fqn, param)
+        for group in param_groups
+        for fqn, param in zip(group["param_names"], group["params"], strict=True)
+        if isinstance(param, DTensor)
+    ]
+    transports = []
+    for bucket in bucket_configs:
+        if bucket.mesh is not None:
+            raise ValueError(
+                f"BucketConfig {bucket.patterns} sets mesh; build_dist_muon "
+                "builds every bucket's transport mesh"
+            )
+        transport = None
+        for fqn, param in named_parameters:
+            layout = compute_sharding_by_fqn.get(fqn)
+            if layout is None or not any(
+                fnmatch.fnmatchcase(fqn, pattern) for pattern in bucket.patterns
+            ):
+                continue
+            if axes := redistribution_mesh_axes(fqn, param, layout):
+                transport = (param.device_mesh, axes)
+                break
+        transports.append(transport)
+    meshes = build_transport_meshes(transports, max_ctas=None)
+    return DistMuon(
+        param_groups,
+        compute_sharding_by_fqn=compute_sharding_by_fqn,
+        bucket_configs=tuple(
+            bucket if mesh is None else replace(bucket, mesh=mesh)
+            for bucket, mesh in zip(bucket_configs, meshes, strict=True)
+        ),
+        **kwargs,
+    )
 
 
 @dataclass(kw_only=True, slots=True)

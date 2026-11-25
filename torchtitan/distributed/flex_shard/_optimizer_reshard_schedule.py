@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import itertools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from .optimizer_reshard import _BucketSpec, BucketConfig
 
@@ -37,12 +39,13 @@ def _bind_bucket_configs(
     get_fqn: Callable[[_ItemT], str],
     get_storage_dtensor: Callable[[_ItemT], DTensor],
     requires_redistribution: Callable[[_ItemT], bool],
-    get_redistribution_storage_mesh_axis: Callable[[_ItemT], int | None],
+    get_redistribution_storage_mesh_axes: Callable[[_ItemT], tuple[int, ...]],
 ) -> tuple[_BucketSpec, ...]:
     """Bind configs after each item's redistribution requirement is resolved.
 
-    Redistributed items determine the communication mesh. An entirely local
-    bucket remains mesh-free.
+    Redistributed items determine the communication axes. An explicit bucket
+    mesh may replace their process group while preserving the layout. An
+    entirely local bucket remains mesh-free.
     """
     specs = []
     for config in configs:
@@ -67,26 +70,82 @@ def _bind_bucket_configs(
         for item in redistributed_items:
             storage_mesh = get_storage_dtensor(item).device_mesh
             mesh_axis_names = storage_mesh.mesh_dim_names
-            storage_mesh_axis = get_redistribution_storage_mesh_axis(item)
-            if mesh_axis_names is None or storage_mesh_axis is None:
+            storage_mesh_axes = get_redistribution_storage_mesh_axes(item)
+            if mesh_axis_names is None or not storage_mesh_axes:
                 raise RuntimeError(
-                    "redistributed parameter has no resolved transport axis: "
+                    "redistributed parameter has no resolved transport axes: "
                     f"{get_fqn(item)!r}"
                 )
-            mesh_axis_name = mesh_axis_names[storage_mesh_axis]
-            transport_groups.append((mesh_axis_name, storage_mesh[mesh_axis_name]))
+            transport_axis_names = tuple(
+                mesh_axis_names[storage_mesh_axis]
+                for storage_mesh_axis in storage_mesh_axes
+            )
+            transport_mesh = storage_mesh[
+                (
+                    transport_axis_names[0]
+                    if len(transport_axis_names) == 1
+                    else transport_axis_names
+                )
+            ]
+            transport_groups.append(
+                (transport_axis_names, storage_mesh, transport_mesh.mesh)
+            )
 
-        mesh_axis_name, mesh = transport_groups[0]
+        transport_axis_names, storage_mesh, storage_transport_ranks = transport_groups[
+            0
+        ]
         if any(
-            candidate_axis_name != mesh_axis_name
-            or not torch.equal(candidate_mesh.mesh, mesh.mesh)
-            for candidate_axis_name, candidate_mesh in transport_groups[1:]
+            candidate_axis_names != transport_axis_names
+            or not torch.equal(candidate_ranks, storage_transport_ranks)
+            for candidate_axis_names, _candidate_mesh, candidate_ranks in transport_groups[
+                1:
+            ]
         ):
             raise NotImplementedError(
                 f"bucket {config.name!r} requires heterogeneous transport groups; "
                 "split its BucketConfig patterns"
             )
-        specs.append(config._bind(mesh))
+        if config.mesh is not None:
+            configured_axis_names = config.mesh.mesh_dim_names
+            if configured_axis_names == ("_".join(transport_axis_names),):
+                configured_transport_mesh = config.mesh
+            elif configured_axis_names is None or any(
+                axis_name not in configured_axis_names
+                for axis_name in transport_axis_names
+            ):
+                raise ValueError(
+                    f"bucket {config.name!r} mesh is missing redistribution axis "
+                    f"names {transport_axis_names!r}"
+                )
+            else:
+                configured_transport_mesh = config.mesh[
+                    transport_axis_names[0]
+                    if len(transport_axis_names) == 1
+                    else transport_axis_names
+                ]
+            if configured_transport_mesh.ndim > 1:
+                raise ValueError(
+                    f"bucket {config.name!r} requires a 1D mesh for its combined "
+                    f"transport axes {transport_axis_names!r}; flatten it before "
+                    "constructing DistMuon"
+                )
+            if not torch.equal(
+                configured_transport_mesh.mesh.flatten(),
+                storage_transport_ranks.flatten(),
+            ):
+                raise ValueError(
+                    f"bucket {config.name!r} mesh for axes {transport_axis_names!r} "
+                    "does not match the parameter storage mesh layout"
+                )
+            selected_transport_mesh = configured_transport_mesh
+        else:
+            if len(transport_axis_names) != 1:
+                raise ValueError(
+                    f"bucket {config.name!r} requires an explicit BucketConfig.mesh "
+                    f"for combined transport axes {transport_axis_names!r}"
+                )
+            selected_transport_mesh = storage_mesh[transport_axis_names[0]]
+        specs.append(config._bind(selected_transport_mesh))
     return tuple(specs)
 
 
@@ -122,12 +181,32 @@ class _TensorRegion:
         return math.prod(self.shape)
 
 
-# A mapping is (holder ranks, logical region); a domain is
-# (transport-local logical shape, storage region mappings).
-_StorageRegionMapping: TypeAlias = tuple[tuple[int, ...], _TensorRegion]
-_DTensorStorageDomain: TypeAlias = tuple[
-    tuple[int, ...], tuple[_StorageRegionMapping, ...]
-]
+_ComputeRegionMapping: TypeAlias = tuple[int, _TensorRegion]
+
+
+@dataclass(frozen=True, slots=True)
+class _StorageRegionMapping:
+    """Map one logical region to the same local tensor region on its holders."""
+
+    holders: tuple[int, ...]
+    logical_region: _TensorRegion
+    tensor_region: _TensorRegion
+
+
+@dataclass(frozen=True, slots=True)
+class _DTensorStorageDomain:
+    """Transport-local logical tensor and each participant's physical storage."""
+
+    logical_shape: tuple[int, ...]
+    tensor_shapes_by_participant: tuple[tuple[int, tuple[int, ...]], ...]
+    mappings: tuple[_StorageRegionMapping, ...]
+
+    def tensor_shape(self, participant: int) -> tuple[int, ...]:
+        return next(
+            shape
+            for candidate_participant, shape in self.tensor_shapes_by_participant
+            if candidate_participant == participant
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,181 +558,111 @@ def _validate_regions_cover_partition(
         )
 
 
-def _build_whole_tensor_redistribution_plan(
-    storage_regions: Sequence[_StorageRegionMapping],
-    *,
+def _build_storage_partitions(
+    storage_domain: _DTensorStorageDomain,
     participants: tuple[int, ...],
-    compute_participants: tuple[int, ...],
-    logical_shape: tuple[int, ...],
-) -> _RedistributionPlan:
-    """Build whole-tensor compute from a canonical region-to-holders mapping."""
-    participants = tuple(participants)
-    compute_participants = tuple(compute_participants)
+) -> tuple[_ParticipantPartition, ...]:
+    """Build each participant's physical and logical storage partition."""
     participant_set = set(participants)
-    _require_valid_plan(
-        bool(compute_participants)
-        and len(set(compute_participants)) == len(compute_participants)
-        and all(participant in participant_set for participant in compute_participants),
-        "compute participants must be unique redistribution participants",
-    )
-
-    storage_mappings = []
-    storage_mapping_by_participant = {}
-    for raw_holders, logical_region in storage_regions:
-        holders = tuple(raw_holders)
+    mappings_by_participant: dict[int, list[_StorageRegionMapping]] = {
+        participant: [] for participant in participants
+    }
+    for mapping in storage_domain.mappings:
         _require_valid_plan(
-            bool(holders)
-            and len(set(holders)) == len(holders)
-            and all(holder in participant_set for holder in holders),
+            bool(mapping.holders)
+            and len(set(mapping.holders)) == len(mapping.holders)
+            and set(mapping.holders) <= participant_set,
             "storage region holders must be unique redistribution participants",
         )
-        tensor_region = _TensorRegion(
-            offsets=(0,) * len(logical_region.shape),
-            shape=logical_region.shape,
-        )
-        storage_mappings.append((holders, logical_region, tensor_region))
-        for holder in holders:
-            _require_valid_plan(
-                holder not in storage_mapping_by_participant,
-                "multiple storage regions per participant are not supported",
-            )
-            storage_mapping_by_participant[holder] = (logical_region, tensor_region)
+        for holder in mapping.holders:
+            mappings_by_participant[holder].append(mapping)
     _require_valid_plan(
-        set(storage_mapping_by_participant) == participant_set,
+        all(
+            mappings or not math.prod(storage_domain.tensor_shape(participant))
+            for participant, mappings in mappings_by_participant.items()
+        ),
         "storage regions must cover every redistribution participant",
     )
-
-    storage_partitions = tuple(
+    return tuple(
         _ParticipantPartition(
             participant=participant,
-            tensor_shape=storage_mapping_by_participant[participant][1].shape,
-            logical_regions=(storage_mapping_by_participant[participant][0],),
+            tensor_shape=storage_domain.tensor_shape(participant),
+            logical_regions=tuple(
+                mapping.logical_region
+                for mapping in mappings_by_participant[participant]
+            ),
         )
         for participant in participants
     )
 
-    full_region = _TensorRegion(
-        offsets=(0,) * len(logical_shape),
-        shape=logical_shape,
+
+def _build_region_redistribution_plan(
+    storage_domain: _DTensorStorageDomain,
+    compute_regions: Sequence[_ComputeRegionMapping],
+    *,
+    participants: tuple[int, ...],
+    logical_shape: tuple[int, ...],
+) -> _RedistributionPlan:
+    """Pack assigned regions along dim 0 in their supplied order.
+
+    Each compute region spans every trailing tensor dimension. Multiple regions
+    can share a participant without merging their logical region boundaries.
+    """
+    participant_set = set(participants)
+    _require_valid_plan(
+        bool(logical_shape), "region packing requires a leading tensor dimension"
     )
-    compute_participant_set = set(compute_participants)
+    _validate_tensor_region_partition(
+        tuple(
+            dict.fromkeys(mapping.logical_region for mapping in storage_domain.mappings)
+        ),
+        logical_shape,
+        direction="storage",
+    )
+    storage_partitions = _build_storage_partitions(storage_domain, participants)
+
+    regions_by_participant: dict[int, list[_TensorRegion]] = {
+        participant: [] for participant in participants
+    }
+    packed_sizes = dict.fromkeys(participants, 0)
+    compute_endpoints = []
+    for participant, region in compute_regions:
+        _require_valid_plan(
+            participant in participant_set,
+            "compute region owners must be redistribution participants",
+        )
+        _require_valid_plan(
+            len(region.shape) == len(logical_shape)
+            and len(region.offsets) == len(logical_shape)
+            and region.shape[1:] == logical_shape[1:]
+            and region.offsets[1:] == (0,) * (len(logical_shape) - 1),
+            "compute regions must span every trailing tensor dimension",
+        )
+        if not region.numel:
+            continue
+        packed_offsets = (packed_sizes[participant],) + (0,) * (len(logical_shape) - 1)
+        compute_endpoints.append((participant, region, packed_offsets))
+        packed_sizes[participant] += region.shape[0]
+        regions_by_participant[participant].append(region)
+    _validate_tensor_region_partition(
+        tuple(region for _participant, region in compute_regions),
+        logical_shape,
+        direction="compute",
+    )
     compute_partitions = tuple(
         _ParticipantPartition(
             participant=participant,
-            tensor_shape=(
-                logical_shape if participant in compute_participant_set else (0,)
-            ),
-            logical_regions=(
-                (full_region,) if participant in compute_participant_set else ()
-            ),
-        )
-        for participant in participants
-    )
-    storage_to_compute_routes = tuple(
-        _TensorRegionRoute(
-            logical_region=logical_region,
-            source=_RouteEndpoint(tensor_region, holders),
-            destination=_RouteEndpoint(logical_region, compute_participants),
-        )
-        for holders, logical_region, tensor_region in storage_mappings
-    )
-    return _RedistributionPlan(
-        participants=participants,
-        logical_shape=logical_shape,
-        storage_partitions=storage_partitions,
-        compute_partitions=compute_partitions,
-        storage_to_compute_routes=storage_to_compute_routes,
-    )
-
-
-def _build_owned_redistribution_plan(
-    storage_regions: Sequence[_StorageRegionMapping],
-    *,
-    participants: tuple[int, ...],
-    owner_rank: int,
-    logical_shape: tuple[int, ...],
-) -> _RedistributionPlan:
-    """Build mirrored routes to one whole-tensor compute owner."""
-    return _build_whole_tensor_redistribution_plan(
-        storage_regions,
-        participants=participants,
-        compute_participants=(owner_rank,),
-        logical_shape=logical_shape,
-    )
-
-
-def _build_dim0_shard_redistribution_plan(
-    storage_regions: Sequence[_StorageRegionMapping],
-    *,
-    participants: tuple[int, ...],
-    shard_participants: tuple[int, ...],
-    logical_shape: tuple[int, ...],
-) -> _RedistributionPlan:
-    """Route storage regions to dim-0 compute shards."""
-    participant_set = set(participants)
-    _require_valid_plan(
-        len(shard_participants) == len(participants)
-        and set(shard_participants) == participant_set,
-        "shard participants must order the redistribution participants",
-    )
-    storage_endpoints = []
-    storage_by_participant = {}
-    for holders, logical_region in storage_regions:
-        _require_valid_plan(
-            bool(holders)
-            and len(set(holders)) == len(holders)
-            and set(holders) <= participant_set,
-            "storage region holders must be unique redistribution participants",
-        )
-        storage_endpoints.append((holders, logical_region))
-        for holder in holders:
-            _require_valid_plan(
-                holder not in storage_by_participant,
-                "multiple storage regions per participant are not supported",
-            )
-            storage_by_participant[holder] = logical_region
-    _require_valid_plan(
-        set(storage_by_participant) == participant_set,
-        "storage regions must cover every redistribution participant",
-    )
-    storage_partitions = tuple(
-        _ParticipantPartition(
-            participant=participant,
-            tensor_shape=storage_by_participant[participant].shape,
-            logical_regions=(storage_by_participant[participant],),
+            tensor_shape=(packed_sizes[participant], *logical_shape[1:]),
+            logical_regions=tuple(regions_by_participant[participant]),
         )
         for participant in participants
     )
 
-    compute_partitions = []
     storage_to_compute_routes = []
-    compute_endpoints = []
-    shard_index_by_participant = {
-        participant: index for index, participant in enumerate(shard_participants)
-    }
-    for participant in participants:
-        participant_index = shard_index_by_participant[participant]
-        local_dim0, dim0_offset = Shard.local_shard_size_and_offset(
-            logical_shape[0],
-            len(participants),
-            participant_index,
-        )
-        local_shape = (local_dim0, *logical_shape[1:])
-        logical_region = _TensorRegion(
-            offsets=(dim0_offset,) + (0,) * (len(logical_shape) - 1),
-            shape=local_shape,
-        )
-        compute_partitions.append(
-            _ParticipantPartition(
-                participant=participant,
-                tensor_shape=local_shape,
-                logical_regions=(logical_region,),
-            )
-        )
-        compute_endpoints.append((participant, logical_region))
-
-    for source_holders, storage_region in storage_endpoints:
-        for destination, compute_region in compute_endpoints:
+    for storage_mapping in storage_domain.mappings:
+        source_holders = storage_mapping.holders
+        storage_region = storage_mapping.logical_region
+        for destination, compute_region, packed_offsets in compute_endpoints:
             logical_region = _tensor_region_intersection(
                 storage_region,
                 compute_region,
@@ -662,8 +671,9 @@ def _build_dim0_shard_redistribution_plan(
                 continue
             storage_tensor_region = _TensorRegion(
                 offsets=tuple(
-                    logical_offset - storage_offset
-                    for logical_offset, storage_offset in zip(
+                    tensor_offset + logical_offset - storage_offset
+                    for tensor_offset, logical_offset, storage_offset in zip(
+                        storage_mapping.tensor_region.offsets,
                         logical_region.offsets,
                         storage_region.offsets,
                         strict=True,
@@ -673,8 +683,9 @@ def _build_dim0_shard_redistribution_plan(
             )
             compute_tensor_region = _TensorRegion(
                 offsets=tuple(
-                    logical_offset - compute_offset
-                    for logical_offset, compute_offset in zip(
+                    packed_offset + logical_offset - compute_offset
+                    for packed_offset, logical_offset, compute_offset in zip(
+                        packed_offsets,
                         logical_region.offsets,
                         compute_region.offsets,
                         strict=True,
@@ -697,7 +708,7 @@ def _build_dim0_shard_redistribution_plan(
         participants=participants,
         logical_shape=logical_shape,
         storage_partitions=storage_partitions,
-        compute_partitions=tuple(compute_partitions),
+        compute_partitions=compute_partitions,
         storage_to_compute_routes=tuple(storage_to_compute_routes),
     )
 
@@ -741,7 +752,6 @@ class _PackedAllToAllSchedule:
 class _RedistributionGroup:
     process_group: dist.ProcessGroup
     participants: tuple[int, ...]
-    mesh_axis_participants: tuple[int, ...]
     local_participant: int
 
 
@@ -765,7 +775,14 @@ class _RedistributionBucketPlan(Generic[_ItemT]):
     group: _RedistributionGroup
     storage_to_compute_schedule: _PackedAllToAllSchedule
     compute_to_storage_schedule: _PackedAllToAllSchedule
+    # Where returned fragments start in the compute exchange buffer. Each
+    # parameter's returned fragments overwrite its consumed received fragments
+    # only when both schedules pack it identically. A region with several
+    # storage holders is received once but returned to every holder, so its
+    # returned fragments would overwrite later parameters' unread input.
+    compute_to_storage_offset: int
     dtype: torch.dtype
+    compute_dtype: torch.dtype
     device: torch.device
 
 
@@ -899,50 +916,231 @@ def _device_mesh_ranks(mesh: DeviceMesh) -> tuple[int, ...]:
 def _redistribution_group(mesh: DeviceMesh) -> _RedistributionGroup:
     process_group = mesh.get_group()
     participants = tuple(dist.get_process_group_ranks(process_group))
-    mesh_axis_participants = _device_mesh_ranks(mesh)
-    if set(mesh_axis_participants) != set(participants):
+    if set(_device_mesh_ranks(mesh)) != set(participants):
         raise ValueError("bucket mesh and process group participants do not match")
     return _RedistributionGroup(
         process_group=process_group,
         participants=participants,
-        mesh_axis_participants=mesh_axis_participants,
         local_participant=participants[dist.get_rank(process_group)],
     )
+
+
+def _device_mesh_coordinate(
+    mesh: DeviceMesh,
+    participant: int,
+) -> list[int]:
+    mesh_shape = tuple(mesh.shape)
+    flat_mesh_index = _device_mesh_ranks(mesh).index(participant)
+    mesh_coordinate = [0] * len(mesh_shape)
+    for mesh_axis in range(len(mesh_shape) - 1, -1, -1):
+        flat_mesh_index, mesh_coordinate[mesh_axis] = divmod(
+            flat_mesh_index, mesh_shape[mesh_axis]
+        )
+    return mesh_coordinate
+
+
+def _slice_index_runs(
+    runs: tuple[tuple[int, int, int], ...],
+    *,
+    offset: int,
+    size: int,
+) -> tuple[tuple[int, int, int], ...]:
+    selected = []
+    selected_size = 0
+    end = offset + size
+    for global_offset, local_offset, run_size in runs:
+        intersection_start = max(offset, local_offset)
+        intersection_end = min(end, local_offset + run_size)
+        if intersection_start >= intersection_end:
+            continue
+        intersection_size = intersection_end - intersection_start
+        selected.append(
+            (
+                global_offset + intersection_start - local_offset,
+                selected_size,
+                intersection_size,
+            )
+        )
+        selected_size += intersection_size
+    return tuple(selected)
+
+
+def _select_sharded_runs(
+    runs: tuple[tuple[int, int, int], ...],
+    placement: Shard | _StridedShard,
+    *,
+    mesh_axis_size: int,
+    mesh_axis_coordinate: int,
+) -> tuple[tuple[int, int, int], ...]:
+    num_indices = sum(size for _global_offset, _local_offset, size in runs)
+    if type(placement) is Shard:
+        local_size, offset = Shard.local_shard_size_and_offset(
+            num_indices,
+            mesh_axis_size,
+            mesh_axis_coordinate,
+        )
+        return _slice_index_runs(runs, offset=offset, size=local_size)
+
+    selected = []
+    selected_size = 0
+    strided_placement = cast(_StridedShard, placement)
+    split_factor = int(strided_placement.split_factor)
+    for split_index in range(split_factor):
+        split_size, split_offset = Shard.local_shard_size_and_offset(
+            num_indices,
+            split_factor,
+            split_index,
+        )
+        local_size, local_offset = Shard.local_shard_size_and_offset(
+            split_size,
+            mesh_axis_size,
+            mesh_axis_coordinate,
+        )
+        split_runs = _slice_index_runs(
+            runs,
+            offset=split_offset + local_offset,
+            size=local_size,
+        )
+        selected.extend(
+            (global_offset, selected_size + tensor_offset, size)
+            for global_offset, tensor_offset, size in split_runs
+        )
+        selected_size += local_size
+    return tuple(selected)
+
+
+def _dtensor_global_runs_by_dim(
+    tensor: DTensor,
+    participant: int,
+) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+    """Return each tensor dimension's global-to-local index runs."""
+    mesh_coordinate = _device_mesh_coordinate(
+        tensor.device_mesh,
+        participant,
+    )
+    runs_by_dim: list[tuple[tuple[int, int, int], ...]] = [
+        ((0, 0, dim_size),) for dim_size in tensor.shape
+    ]
+    for mesh_axis, placement in enumerate(tensor.placements):
+        if tensor.device_mesh.size(mesh_axis) == 1 or type(placement) is Replicate:
+            continue
+        if type(placement) not in (Shard, _StridedShard):
+            raise ValueError(
+                "redistributed optimizer storage requires exact Shard, "
+                "_StridedShard, or Replicate placements"
+            )
+        sharded_placement = cast(Shard | _StridedShard, placement)
+        tensor_dim = sharded_placement.dim % tensor.ndim
+        runs_by_dim[tensor_dim] = _select_sharded_runs(
+            runs_by_dim[tensor_dim],
+            sharded_placement,
+            mesh_axis_size=tensor.device_mesh.size(mesh_axis),
+            mesh_axis_coordinate=mesh_coordinate[mesh_axis],
+        )
+    return tuple(runs_by_dim)
 
 
 def _dtensor_storage_region_for_participant(
     tensor: DTensor,
     participant: int,
 ) -> _TensorRegion:
-    mesh_shape = tuple(tensor.device_mesh.shape)
-    flat_mesh_index = _device_mesh_ranks(tensor.device_mesh).index(participant)
-    mesh_coordinate = [0] * len(mesh_shape)
-    for mesh_axis in range(len(mesh_shape) - 1, -1, -1):
-        flat_mesh_index, mesh_coordinate[mesh_axis] = divmod(
-            flat_mesh_index, mesh_shape[mesh_axis]
-        )
-
-    local_shape = list(tensor.shape)
-    global_offsets = [0] * tensor.ndim
-    for mesh_axis, placement in enumerate(tensor.placements):
-        if mesh_shape[mesh_axis] == 1 or type(placement) is Replicate:
-            continue
-        _require_valid_plan(
-            type(placement) is Shard,
-            "storage placement must be exact Shard or Replicate",
-        )
-        placement = cast(Shard, placement)
-        tensor_dim = placement.dim % tensor.ndim
-        local_size, global_offset = Shard.local_shard_size_and_offset(
-            tensor.shape[tensor_dim],
-            mesh_shape[mesh_axis],
-            mesh_coordinate[mesh_axis],
-        )
-        local_shape[tensor_dim] = local_size
-        global_offsets[tensor_dim] = global_offset
+    """Return one contiguous global region represented by local storage."""
+    runs_by_dim = _dtensor_global_runs_by_dim(tensor, participant)
+    _require_valid_plan(
+        all(not runs or (len(runs) == 1 and runs[0][1] == 0) for runs in runs_by_dim),
+        "local storage must represent one contiguous logical region",
+    )
     return _TensorRegion(
-        offsets=tuple(global_offsets),
-        shape=tuple(local_shape),
+        offsets=tuple(
+            runs[0][0] if runs else tensor.shape[tensor_dim]
+            for tensor_dim, runs in enumerate(runs_by_dim)
+        ),
+        shape=tuple(runs[0][2] if runs else 0 for runs in runs_by_dim),
+    )
+
+
+def _dtensor_storage_domain(
+    tensor: DTensor,
+    participants: tuple[int, ...],
+) -> _DTensorStorageDomain:
+    runs_by_participant = {
+        participant: _dtensor_global_runs_by_dim(tensor, participant)
+        for participant in participants
+    }
+
+    domain_offsets = []
+    domain_shape = []
+    for tensor_dim in range(tensor.ndim):
+        intervals = sorted(
+            (
+                global_offset,
+                global_offset + size,
+            )
+            for participant_runs in runs_by_participant.values()
+            for global_offset, _local_offset, size in participant_runs[tensor_dim]
+            if size
+        )
+        if not intervals:
+            domain_offsets.append(0)
+            domain_shape.append(0)
+            continue
+        domain_offset, domain_end = intervals[0]
+        for interval_start, interval_end in intervals[1:]:
+            if interval_start > domain_end:
+                raise NotImplementedError(
+                    "optimizer transport groups require a contiguous logical domain"
+                )
+            domain_end = max(domain_end, interval_end)
+        domain_offsets.append(domain_offset)
+        domain_shape.append(domain_end - domain_offset)
+
+    holders_by_regions: dict[tuple[_TensorRegion, _TensorRegion], list[int]] = {}
+    tensor_shapes_by_participant = []
+    for participant in participants:
+        participant_runs = runs_by_participant[participant]
+        tensor_shapes_by_participant.append(
+            (
+                participant,
+                tuple(
+                    sum(size for _global_offset, _local_offset, size in runs)
+                    for runs in participant_runs
+                ),
+            )
+        )
+        for runs in itertools.product(*participant_runs):
+            logical_region = _TensorRegion(
+                offsets=tuple(
+                    global_offset - domain_offset
+                    for (global_offset, _local_offset, _size), domain_offset in zip(
+                        runs,
+                        domain_offsets,
+                        strict=True,
+                    )
+                ),
+                shape=tuple(size for _global_offset, _local_offset, size in runs),
+            )
+            tensor_region = _TensorRegion(
+                offsets=tuple(
+                    local_offset for _global_offset, local_offset, _size in runs
+                ),
+                shape=logical_region.shape,
+            )
+            holders_by_regions.setdefault((logical_region, tensor_region), []).append(
+                participant
+            )
+
+    mappings = tuple(
+        _StorageRegionMapping(
+            holders=tuple(holders),
+            logical_region=logical_region,
+            tensor_region=tensor_region,
+        )
+        for (logical_region, tensor_region), holders in holders_by_regions.items()
+    )
+    return _DTensorStorageDomain(
+        logical_shape=tuple(domain_shape),
+        tensor_shapes_by_participant=tuple(tensor_shapes_by_participant),
+        mappings=mappings,
     )
 
 
@@ -950,7 +1148,7 @@ def _dtensor_storage_regions(
     tensor: DTensor,
     participants: tuple[int, ...],
     *,
-    required_storage_mesh_axis: int | None,
+    required_storage_mesh_axes: tuple[int, ...],
 ) -> _DTensorStorageDomain:
     """Return the transport-local shape and holder-to-region mappings."""
     storage_mesh = tensor.device_mesh
@@ -962,95 +1160,28 @@ def _dtensor_storage_regions(
         )
 
     reference_coordinate = reference_locations[0].tolist()
-    matching_storage_mesh_axes = []
-    participant_set = set(participants)
-    for storage_mesh_axis in range(storage_mesh.ndim):
-        coordinate = list(reference_coordinate)
+    if (
+        not required_storage_mesh_axes
+        or len(set(required_storage_mesh_axes)) != len(required_storage_mesh_axes)
+        or any(
+            storage_mesh_axis < 0 or storage_mesh_axis >= storage_mesh.ndim
+            for storage_mesh_axis in required_storage_mesh_axes
+        )
+    ):
+        raise ValueError("optimizer transport requires valid storage mesh axes")
+
+    coordinate = list(reference_coordinate)
+    for storage_mesh_axis in required_storage_mesh_axes:
         coordinate[storage_mesh_axis] = slice(None)
-        axis_participants = tuple(storage_ranks[tuple(coordinate)].flatten().tolist())
-        if (
-            len(axis_participants) == len(participants)
-            and set(axis_participants) == participant_set
-        ):
-            matching_storage_mesh_axes.append(storage_mesh_axis)
-
-    if required_storage_mesh_axis is not None:
-        if required_storage_mesh_axis not in matching_storage_mesh_axes:
-            raise ValueError(
-                "bucket mesh participants do not match the parameter storage "
-                "shard axis"
-            )
-        storage_mesh_axis = required_storage_mesh_axis
-    elif len(matching_storage_mesh_axes) == 1:
-        storage_mesh_axis = matching_storage_mesh_axes[0]
-    elif len(participants) == 1 and matching_storage_mesh_axes:
-        storage_mesh_axis = matching_storage_mesh_axes[0]
-    else:
+    axis_participants = tuple(storage_ranks[tuple(coordinate)].flatten().tolist())
+    if len(axis_participants) != len(participants) or set(axis_participants) != set(
+        participants
+    ):
         raise ValueError(
-            "bucket mesh participants must match exactly one DTensor storage "
-            "mesh axis"
+            "bucket mesh participants do not match the parameter optimizer "
+            "transport axes"
         )
-
-    transport_placement = tensor.placements[storage_mesh_axis]
-    preserved_shard_axis = None
-    for mesh_axis, placement in enumerate(tensor.placements):
-        if mesh_axis == storage_mesh_axis:
-            if type(placement) not in (Replicate, Shard):
-                raise ValueError(
-                    "redistributed optimizer storage requires exact Shard or "
-                    "Replicate on the communication mesh axis"
-                )
-        elif storage_mesh.size(mesh_axis) != 1 and type(placement) is not Replicate:
-            if not (
-                preserved_shard_axis is None
-                and type(transport_placement) is Shard
-                and type(placement) is Shard
-                and transport_placement.dim % tensor.ndim != placement.dim % tensor.ndim
-            ):
-                raise ValueError(
-                    "redistributed optimizer storage requires Replicate outside "
-                    "the communication mesh axis, except for one orthogonal "
-                    "exact Shard"
-                )
-            preserved_shard_axis = mesh_axis
-
-    domain_shape = list(tensor.shape)
-    domain_offsets = [0] * tensor.ndim
-    if preserved_shard_axis is not None:
-        placement = cast(Shard, tensor.placements[preserved_shard_axis])
-        tensor_dim = placement.dim % tensor.ndim
-        local_size, global_offset = Shard.local_shard_size_and_offset(
-            tensor.shape[tensor_dim],
-            storage_mesh.size(preserved_shard_axis),
-            reference_coordinate[preserved_shard_axis],
-        )
-        domain_shape[tensor_dim] = local_size
-        domain_offsets[tensor_dim] = global_offset
-
-    holders_by_region: dict[_TensorRegion, list[int]] = {}
-    for participant in participants:
-        global_region = _dtensor_storage_region_for_participant(tensor, participant)
-        region = _TensorRegion(
-            offsets=tuple(
-                offset - domain_offset
-                for offset, domain_offset in zip(
-                    global_region.offsets,
-                    domain_offsets,
-                    strict=True,
-                )
-            ),
-            shape=global_region.shape,
-        )
-        holders_by_region.setdefault(region, []).append(participant)
-    regions = tuple(
-        (tuple(holders), region) for region, holders in holders_by_region.items()
-    )
-    _validate_tensor_region_partition(
-        tuple(region for _holders, region in regions),
-        tuple(domain_shape),
-        direction="transport-subgroup storage",
-    )
-    return tuple(domain_shape), regions
+    return _dtensor_storage_domain(tensor, participants)
 
 
 def _require_valid_planner_result(condition: bool, message: str) -> None:
@@ -1069,6 +1200,7 @@ def _build_bucket_plans(
         [tuple[_BucketPlanningContext[_ItemT], ...]],
         Sequence[Sequence[_RedistributionPlan | None]],
     ],
+    get_compute_dtype: Callable[[_ItemT], torch.dtype],
 ) -> _BucketPlanningResult[_ItemT]:
     """Build ordered optimizer bucket plans with and without redistribution.
 
@@ -1183,27 +1315,39 @@ def _build_bucket_plans(
             tensor.dtype != dtype or tensor.device != device for tensor in local_tensors
         ):
             raise ValueError(f"bucket {context.name!r} mixes dtype or device")
+        compute_dtypes = {get_compute_dtype(item) for item in redistributed_items}
+        if len(compute_dtypes) != 1:
+            raise ValueError(f"bucket {context.name!r} mixes compute dtypes")
 
         redistribution_plans_tuple = tuple(redistribution_plans)
+        storage_to_compute_schedule = _build_packed_all_to_all_schedule(
+            redistribution_plans_tuple,
+            direction=_RedistributionDirection.STORAGE_TO_COMPUTE,
+            process_group=group.process_group,
+            local_participant=group.local_participant,
+        )
+        compute_to_storage_schedule = _build_packed_all_to_all_schedule(
+            redistribution_plans_tuple,
+            direction=_RedistributionDirection.COMPUTE_TO_STORAGE,
+            process_group=group.process_group,
+            local_participant=group.local_participant,
+        )
         plans.append(
             _RedistributionBucketPlan(
                 unredistributed_items=unredistributed_items,
                 redistributed_items=redistributed_items,
                 redistribution_plans=redistribution_plans_tuple,
                 group=group,
-                storage_to_compute_schedule=_build_packed_all_to_all_schedule(
-                    redistribution_plans_tuple,
-                    direction=_RedistributionDirection.STORAGE_TO_COMPUTE,
-                    process_group=group.process_group,
-                    local_participant=group.local_participant,
-                ),
-                compute_to_storage_schedule=_build_packed_all_to_all_schedule(
-                    redistribution_plans_tuple,
-                    direction=_RedistributionDirection.COMPUTE_TO_STORAGE,
-                    process_group=group.process_group,
-                    local_participant=group.local_participant,
+                storage_to_compute_schedule=storage_to_compute_schedule,
+                compute_to_storage_schedule=compute_to_storage_schedule,
+                compute_to_storage_offset=(
+                    0
+                    if compute_to_storage_schedule.input_spans_by_parameter
+                    == storage_to_compute_schedule.output_spans_by_parameter
+                    else storage_to_compute_schedule.output_buffer_numel
                 ),
                 dtype=dtype,
+                compute_dtype=next(iter(compute_dtypes)),
                 device=device,
             )
         )
@@ -1231,6 +1375,7 @@ def _validate_bucket_plans_across_ranks(
             continue
         description = (
             str(plan.dtype),
+            str(plan.compute_dtype),
             plan.device.type,
             tuple(
                 _redistribution_plan_key(redistribution_plan)
