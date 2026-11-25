@@ -19,6 +19,7 @@ from torchtitan.experiments.tpu.components.grouped_experts import (
 )
 from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
 from torchtitan.experiments.tpu.kernels import expert_segment_matmul
+from torchtitan.experiments.tpu.kernels import gmm_v2_segment_matmul
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
@@ -33,6 +34,7 @@ def _build_experts(
     *,
     use_pallas_grouped_mm=False,
     use_pallas_paired_grouped_mm=False,
+    pallas_grouped_mm_kernel="megablox",
     use_kernel_native_weight_layout=False,
     param_init=None,
 ):
@@ -42,6 +44,7 @@ def _build_experts(
         num_experts=num_experts,
         use_pallas_grouped_mm=use_pallas_grouped_mm,
         use_pallas_paired_grouped_mm=use_pallas_paired_grouped_mm,
+        pallas_grouped_mm_kernel=pallas_grouped_mm_kernel,
         pallas_grouped_mm_tgmm_tiling=(
             (128, 0, 0) if use_pallas_paired_grouped_mm else (128, 128, 128)
         ),
@@ -206,6 +209,24 @@ def test_graph_trainer_parallelize_forwards_to_the_graph_trainer():
 def test_kernel_native_layout_requires_pallas():
     with pytest.raises(ValueError, match="Kernel-native expert weights require Pallas"):
         _build_experts(use_kernel_native_weight_layout=True)
+
+
+def test_gmm_v2_requires_unpaired_bf16_pallas():
+    for kwargs in (
+        {},
+        {"use_pallas_grouped_mm": True, "use_pallas_paired_grouped_mm": True},
+    ):
+        with pytest.raises(ValueError, match="requires use_pallas_grouped_mm"):
+            _build_experts(pallas_grouped_mm_kernel="gmm_v2", **kwargs)
+    with pytest.raises(ValueError, match="requires use_pallas_grouped_mm"):
+        TpuGroupedExperts.Config(
+            dim=16,
+            hidden_dim=24,
+            num_experts=1,
+            use_pallas_grouped_mm=True,
+            use_fp8_grouped_mm=True,
+            pallas_grouped_mm_kernel="gmm_v2",
+        ).build()
 
 
 def test_paired_grouped_mm_validates_supported_configuration():
@@ -551,8 +572,8 @@ def test_kernel_native_layout_checkpoint_hook_order():
     assert not {"w1_EFD", "w2_EDF", "w3_EFD"} & load_keys
 
 
-@pytest.mark.parametrize("use_pair", [False, True])
-def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
+@pytest.mark.parametrize("kernel", ["megablox", "megablox_paired", "gmm_v2"])
+def test_kernel_native_layout_pallas_forward_and_backward(kernel):
     param_init = {
         name: lambda x: torch.nn.init.normal_(x, std=0.02)
         for name in ("w1_EFD", "w2_EDF", "w3_EFD")
@@ -563,7 +584,8 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     native = _build_experts(
         num_experts=2,
         use_pallas_grouped_mm=True,
-        use_pallas_paired_grouped_mm=use_pair,
+        use_pallas_paired_grouped_mm=kernel == "megablox_paired",
+        pallas_grouped_mm_kernel="gmm_v2" if kernel == "gmm_v2" else "megablox",
         use_kernel_native_weight_layout=True,
         param_init=param_init,
     )
@@ -581,6 +603,11 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     def paired_grouped_mm(x, w1, w3, counts, **kwargs):
         return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
 
+    def grouped_mm_v2(x, weight, counts, transpose_rhs):
+        # gmm_v2 gets int32 counts and the unpadded rows.
+        assert counts.dtype == torch.int32 and x.shape[0] == 7
+        return grouped_mm(x, weight.mT if transpose_rhs else weight, counts)
+
     expected = stock.forward(x, counts)
     with patch(
         "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
@@ -588,9 +615,12 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     ), patch(
         "torchtitan.experiments.tpu.components.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
-    ):
+    ), patch.object(
+        gmm_v2_segment_matmul, "grouped_mm_v2", side_effect=grouped_mm_v2
+    ) as v2:
         actual = native.forward(x_native, counts)
     torch.testing.assert_close(actual, expected)
+    assert v2.call_count == (3 if kernel == "gmm_v2" else 0)
 
     actual.float().square().sum().backward()
     expected.float().square().sum().backward()
