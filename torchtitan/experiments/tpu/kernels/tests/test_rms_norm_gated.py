@@ -36,6 +36,19 @@ def _reference_fp64(x, gate, weight, eps):
   return weight.double() * xd * F.silu(gate.double())
 
 
+def _reference_sigmoid_fp64(x, gate, weight, eps):
+  """``KimiRMSNormGated`` per ``V``-wide head of ``x [..., H * V]``, in FP64."""
+  head_dim = weight.shape[0]
+  xd = x.double().unflatten(-1, (-1, head_dim))
+  xd = xd * torch.rsqrt(xd.pow(2).mean(-1, keepdim=True) + eps)
+  out = (
+      xd
+      * weight.double()
+      * gate.double().unflatten(-1, (-1, head_dim)).sigmoid()
+  )
+  return out.flatten(-2)
+
+
 def _relative_l2_error(actual, expected):
   return float(
       (actual.double() - expected.double()).norm()
@@ -128,6 +141,36 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
     ):
       self.assertEqual(actual.shape, expected.shape, name)
       self.assertEqual(actual.dtype, expected.dtype, name)
+      self.assertLess(_relative_l2_error(actual.cpu(), expected), tol, name)
+
+  @parameterized.named_parameters(
+      # [T, H * V] input: 24 heads = 2 lane blocks of 12, 4 row blocks.
+      dict(testcase_name="_sigmoid_bf16", dtype=torch.bfloat16, tol=1e-2),
+  )
+  def test_sigmoid_gate_matches_fp64(self, dtype, tol, heads=24, head_dim=128):
+    """Sigmoid gate on flat heads vs ``KimiRMSNormGated``'s math in FP64."""
+    self._require_tpu()
+    torch.manual_seed(3)
+    shape = (2048, heads * head_dim)
+    x = (3.0 * torch.randn(*shape)).to(dtype)
+    gate = torch.randn(*shape).to(dtype)
+    weight = 1.0 + 0.1 * torch.randn(head_dim)
+    grad = torch.randn(*shape).to(dtype)
+    inputs_ref = [t.double().requires_grad_() for t in (x, gate, weight)]
+    out_ref = _reference_sigmoid_fp64(*inputs_ref, 1e-5)
+    grads_ref = torch.autograd.grad(out_ref, inputs_ref, grad.double())
+
+    dev = self.accelerator_device
+    inputs = [t.to(dev).requires_grad_() for t in (x, gate, weight)]
+    out = rms_norm_gated.rms_norm_gated(
+        *inputs, 1e-5, gate_activation="sigmoid"
+    )
+    grads = torch.autograd.grad(out, inputs, grad.to(dev))
+    self.assertEqual(out.dtype, dtype)
+    self.assertLess(_relative_l2_error(out.cpu(), out_ref), tol)
+    for name, actual, expected in zip(
+        ("x", "gate", "weight"), grads, grads_ref, strict=True
+    ):
       self.assertLess(_relative_l2_error(actual.cpu(), expected), tol, name)
 
   def test_large_row_biased_bf16_weight_gradient_accumulates_in_fp32(self):
@@ -309,7 +352,7 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertTrue(rms_norm_gated.supports(x, gate, w))
         self.assertFalse(rms_norm_gated.supports(x_bad, gate, w))
         with self.assertRaises((spmd.SpmdTypeError, ValueError)):
-          rms_norm_gated._RmsNormGatedSpmdFn.apply(x_bad, gate, w, 1e-6)
+          rms_norm_gated._RmsNormGatedSpmdFn.apply(x_bad, gate, w, 1e-6, "silu")
         out = rms_norm_gated.rms_norm_gated(x, gate, w, 1e-6)
         expected_ps = spmd.PartitionSpec(
             spmd.normalize_axis(dp), spmd.normalize_axis(tp), None
