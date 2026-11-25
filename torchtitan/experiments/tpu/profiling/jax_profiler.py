@@ -48,6 +48,7 @@ class JaxProfiler:
       )
       if "://" not in curr_trace_dir:
         os.makedirs(curr_trace_dir, exist_ok=True)
+      self.trace_dir = curr_trace_dir
       jax.profiler.start_trace(curr_trace_dir)
 
   def stop(self) -> None:
@@ -60,3 +61,11 @@ class JaxProfiler:
             # pytype: enable=attribute-error
         )
         jax.profiler.stop_trace()
+        # Live device buffers at the end of the profiled step, in pprof format
+        # (view as a flame graph with `pprof -http=: memory.prof`).
+        try:
+          jax.profiler.save_device_memory_profile(
+              os.path.join(self.trace_dir, "memory.prof")
+          )
+        except Exception as e:  # pylint: disable=broad-except
+          logger.warning("save_device_memory_profile failed: %s", e)
