@@ -94,10 +94,16 @@ class GraphSplitterConfig:
   # ``forward_layers_per_executable > 0``.
   forward_prefetch_parameter_gathers: bool = False
   # Parameter all-gathers with a smaller gathered output stay with their layer
-  # under ``forward_prefetch_parameter_gathers``. Moved ahead, tiny gathers (norm weights) queue behind the large
+  # under ``forward_prefetch_parameter_gathers`` and the backward "ag"
+  # pipeline. Moved ahead, tiny gathers (norm weights) queue behind the large
   # prefetched ones and, lowered as synchronous all-reduces, stall the
   # TensorCore until the queue drains; in place they cost almost nothing.
   prefetch_min_gather_bytes: int = 0
+  # Backward gradient reductions with a smaller unreduced input (norm weights)
+  # run in the last backward executable instead of with their layer. In
+  # place, each is a synchronous all-reduce over every rank, so each layer
+  # waits there for the slowest rank.
+  backward_defer_reduction_max_bytes: int = 0
   # Backward subdivision applied after the top-level forward/backward split.
   # ``by_layer`` groups adjacent layer backward computations and co-locates any
   # attributable FSDP collective chains with their layer. ``fsdp_pipeline``
