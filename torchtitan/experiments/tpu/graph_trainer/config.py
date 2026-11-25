@@ -99,6 +99,13 @@ class GraphSplitterConfig:
   # prefetched ones and, lowered as synchronous all-reduces, stall the
   # TensorCore until the queue drains; in place they cost almost nothing.
   prefetch_min_gather_bytes: int = 0
+  # Join gathers prefetched into an executable (forward
+  # ``forward_prefetch_parameter_gathers``, backward ``fsdp_pipeline`` "ag")
+  # with that executable's attention output in an optimization barrier, so XLA
+  # issues them at its top, under QKV / attention / recompute, instead of late
+  # and waited on at once (seen when they share a SparseCore with the
+  # executable's gradient reduce-scatters). Values unchanged.
+  prefetched_gathers_under_attention: bool = False
   # Backward gradient reductions with a smaller unreduced input (norm weights)
   # run in the last backward executable instead of with their layer. In
   # place, each is a synchronous all-reduce over every rank, so each layer

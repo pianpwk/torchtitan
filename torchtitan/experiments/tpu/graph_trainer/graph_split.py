@@ -27,6 +27,7 @@ indivisible.
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import chain
+import operator
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -57,7 +58,11 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
     op_name,
 )
 from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gathers import (
+    _is_attention_output,
     apply_expert_all_gathers_under_attention,
+)
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    _optimization_barrier,
 )
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
   HostDonorSpec,
@@ -366,6 +371,9 @@ class GraphSplitter:
               self.config.forward_prefetch_parameter_gathers
           ),
           prefetch_min_gather_bytes=self.config.prefetch_min_gather_bytes,
+          prefetched_gathers_under_attention=(
+              self.config.prefetched_gathers_under_attention
+          ),
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
@@ -395,6 +403,9 @@ class GraphSplitter:
           ),
           cpu_offload_prefetch_executables=(
               self.config.cpu_offload_prefetch_executables
+          ),
+          prefetched_gathers_under_attention=(
+              self.config.prefetched_gathers_under_attention
           ),
       )
       split.backward_graph = backward.module
@@ -593,6 +604,76 @@ def _reduced_bytes(launch: torch.fx.Node) -> int:
   )
 
 
+def _join_prefetched_gathers_with_attention(
+    gm: torch.fx.GraphModule,
+    partition_map: dict[torch.fx.Node, int],
+    prefetched: list[tuple[set[torch.fx.Node], int]],
+) -> int:
+  """Finish prefetched parameter gathers before their executable's attention output is read.
+
+  A gather prefetched into executable ``p`` (for a later executable) is
+  otherwise placed by XLA's scheduler, which can issue it late and wait on it
+  at once, e.g. queued with ``p``'s own gradient reduce-scatters on one
+  SparseCore. Joining the gathered results with ``p``'s attention kernel output
+  in one optimization barrier (as ``apply_expert_all_gathers_under_attention``
+  does for a layer's own gathers) makes everything after attention wait for
+  them, so they are issued at the top of ``p`` and run under its QKV,
+  attention and (backward) recompute. Values are unchanged. Executables
+  without an attention output are left alone. Returns the barrier count.
+  """
+  by_partition: dict[int, list[set[torch.fx.Node]]] = defaultdict(list)
+  for chain, partition in prefetched:
+    by_partition[partition].append(chain)
+  order = {node: index for index, node in enumerate(gm.graph.nodes)}
+  barriers = 0
+  for partition, chains in sorted(by_partition.items()):
+    anchors = [
+        node
+        for node in gm.graph.nodes
+        if partition_map.get(node) == partition and _is_attention_output(node)
+    ]
+    if not anchors:
+      continue
+    anchor = anchors[0]
+    members = set().union(*chains)
+    outputs = [
+        node
+        for node in gm.graph.nodes
+        if node in members and any(u not in members for u in node.users)
+    ]
+    values = [anchor, *outputs]
+    users = {
+        value: [u for u in value.users if u not in members] for value in values
+    }
+    with gm.graph.inserting_after(anchor):
+      barrier = gm.graph.call_function(
+          _optimization_barrier, args=tuple(values)
+      )
+    barrier.meta = {
+        **anchor.meta,
+        "val": tuple(v.meta["val"] for v in values),
+    }
+    partition_map[barrier] = partition
+    # The gather chains read only graph inputs: move the parts traced after
+    # the anchor ahead of the barrier.
+    for node in sorted(members, key=order.__getitem__):
+      if order[node] > order[anchor]:
+        barrier.prepend(node)
+    insertion_point = barrier
+    for index, value in enumerate(values):
+      with gm.graph.inserting_after(insertion_point):
+        output = gm.graph.call_function(operator.getitem, args=(barrier, index))
+      output.meta = {**value.meta}
+      partition_map[output] = partition
+      insertion_point = output
+      for user in users[value]:
+        if user is not barrier:
+          user.replace_input_with(value, output)
+    barriers += 1
+  gm.graph.lint()
+  return barriers
+
+
 def split_forward_graph_by_layer(
     gm: torch.fx.GraphModule,
     layers_per_executable: int,
@@ -600,6 +681,7 @@ def split_forward_graph_by_layer(
     isolate_prefix: bool = False,
     prefetch_parameter_gathers: bool = False,
     prefetch_min_gather_bytes: int = 0,
+    prefetched_gathers_under_attention: bool = False,
 ) -> PartitionedGraph:
   """Split forward into ascending, complete transformer-layer ranges.
 
@@ -717,6 +799,7 @@ def split_forward_graph_by_layer(
   # chain reads only graph inputs, so moving it earlier keeps every dependency
   # forward.
   num_prefetched = 0
+  prefetched: list[tuple[set[torch.fx.Node], int]] = []
   for launch, chain_nodes in gather_chains.items():
     _, users = chain_boundary(chain_nodes)
     consumer = min(
@@ -726,6 +809,8 @@ def split_forward_graph_by_layer(
     partition = max(consumer - 1, 0)
     num_prefetched += partition < consumer
     partition_map.update(dict.fromkeys(chain_nodes, partition))
+    if partition < consumer:
+      prefetched.append((chain_nodes, partition))
   if gather_chains:
     logger.info(
         "Prefetching %d of %d forward parameter all-gathers one executable "
@@ -755,6 +840,11 @@ def split_forward_graph_by_layer(
         dict(moved_views),
     )
 
+  if prefetched_gathers_under_attention:
+    logger.info(
+        "Joined forward prefetched gathers with attention in %d executables",
+        _join_prefetched_gathers_with_attention(gm, partition_map, prefetched),
+    )
   place_ao_transfer_pairs(gm, partition_map)
 
   chunked = _materialize_partitioned_graph(
@@ -897,6 +987,7 @@ def split_backward_graph_by_layer(
     pipeline_min_gather_bytes: int = 0,
     defer_reduction_max_bytes: int = 0,
     cpu_offload_prefetch_executables: int = 0,
+    prefetched_gathers_under_attention: bool = False,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
 
@@ -995,6 +1086,7 @@ def split_backward_graph_by_layer(
       "rs": {},
   }
   last_partition = max(collective_partition("rs", l) for l in layer_ids)
+  prefetched: list[tuple[set[torch.fx.Node], int]] = []
   for launch, (kind, layer_id) in owners.items():
     if kind == "ag" and _gathered_bytes(launch) < pipeline_min_gather_bytes:
       partition = raw_layer_to_partition[layer_id]
@@ -1002,6 +1094,8 @@ def split_backward_graph_by_layer(
       partition = last_partition
     else:
       partition = collective_partition(kind, layer_id)
+      if kind == "ag" and partition != raw_layer_to_partition[layer_id]:
+        prefetched.append((collective_chains[launch], partition))
     _assign_partition(
         partition_map,
         collective_chains[launch],
@@ -1036,6 +1130,11 @@ def split_backward_graph_by_layer(
           default=0,
       )
 
+  if prefetched_gathers_under_attention:
+    logger.info(
+        "Joined backward prefetched gathers with attention in %d executables",
+        _join_prefetched_gathers_with_attention(gm, partition_map, prefetched),
+    )
   place_ao_transfer_pairs(
       gm,
       partition_map,
