@@ -459,8 +459,8 @@ def splash_tbwd_call(
       `logsumexp` residual): lse2 = log2(sum_k 2 ** (q2 . k)), with
       q2 = bf16(bf16(q * q_scale) * log2(e)).
     o_BHDS: forward output, for di = rowsum(o * dO).
-    q_scale: the softmax scale exactly as the forward applied it to q (the
-      product of its bf16-rounded constants); also scales dq and dk.
+    q_scale: the softmax scale exactly as the forward applied it to q (in
+      FP32, rounding the product once); also scales dq and dk.
 
   Returns:
     dq [B, H, S, D], dk^T and dv^T [B, N, D, S], in the input dtype.
