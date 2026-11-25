@@ -330,14 +330,12 @@ class PartitionDonationTest(absltest.TestCase):
       kwargs["device"] = "cpu"
       return real_empty_strided(*args, **kwargs)
 
+    graph_fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+    with graph_fake_mode:
+      example_input = torch.randn(2, 3)
     with (
         mock.patch.object(
             tpu_backend_pass, "_import_static_compiler", return_value=compiler
-        ),
-        mock.patch.object(
-            tpu_backend_pass.torch._subclasses.fake_tensor,
-            "FakeTensorMode",
-            return_value=mock.MagicMock(),
         ),
         mock.patch.object(
             tpu_backend_pass.torch,
@@ -347,13 +345,20 @@ class PartitionDonationTest(absltest.TestCase):
     ):
       tpu_backend_pass.tpu_backend_compile_pass(
           gm,
-          (torch.randn(2, 3),),
+          (example_input,),
           is_fwd=False,
       )
 
     compile_inputs = compiler_instance.call_args.args[1]
     self.assertEqual(len(compile_inputs), 1)
     self.assertTrue(compile_inputs[0]._is_pinned_host)
+    # An async compile worker reads the input's device while the graph's fake
+    # mode may be inside a kernel on the main thread; it must not read "meta".
+    graph_fake_mode.in_kernel_invocation = True
+    try:
+      self.assertEqual(compile_inputs[0].device.type, "cpu")
+    finally:
+      graph_fake_mode.in_kernel_invocation = False
 
   def test_legacy_static_compiler_works_when_donation_is_disabled(self):
     gm = make_fx(lambda x: (x.sin(),))(torch.randn(2, 3))
@@ -376,6 +381,71 @@ class PartitionDonationTest(absltest.TestCase):
       )
 
     self.assertIs(gm._tpu_executable, executable)
+
+  def test_async_compile_submits_then_waits(self):
+    gm = make_fx(lambda x: (x.sin(),))(torch.randn(2, 3))
+    resolved = []
+
+    class Artifact:
+
+      def _resolve(self):
+        resolved.append(self)
+
+      def __call__(self, *args):
+        return (torch.randn(2, 3),)
+
+    artifact = Artifact()
+
+    class AsyncStaticCompiler:
+      _async_compile_executor = None
+      constructed_with = []
+
+      def __init__(self, *args, async_compile=False, **kwargs):
+        del args, kwargs
+        AsyncStaticCompiler.constructed_with.append(async_compile)
+
+      def __call__(self, gm, inputs, is_fwd=True):
+        del gm, inputs, is_fwd
+        return artifact
+
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=AsyncStaticCompiler,
+    ):
+      try:
+        tpu_backend_pass.configure_async_compile(4)
+        self.assertEqual(
+            AsyncStaticCompiler._async_compile_executor._max_workers, 4
+        )
+        tpu_backend_pass.tpu_backend_compile_pass(gm, (torch.randn(2, 3),))
+        self.assertEqual(AsyncStaticCompiler.constructed_with, [True])
+        self.assertEqual(resolved, [])
+        self.assertEqual(tpu_backend_pass.wait_for_pending_compiles(), 1)
+        self.assertEqual(resolved, [artifact])
+        self.assertEqual(tpu_backend_pass.wait_for_pending_compiles(), 0)
+        self.assertGreaterEqual(tpu_backend_pass.pop_compile_call_seconds(), 0)
+      finally:
+        AsyncStaticCompiler._async_compile_executor.shutdown()
+        tpu_backend_pass.configure_async_compile(0)
+
+  def test_async_compile_rejects_legacy_static_compiler(self):
+
+    class LegacyStaticCompiler:
+
+      def __call__(self, gm, inputs, is_fwd=True):
+        raise AssertionError("not called")
+
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=LegacyStaticCompiler,
+    ):
+      try:
+        with self.assertRaisesRegex(RuntimeError, "async_compile"):
+          tpu_backend_pass.configure_async_compile(2)
+      finally:
+        tpu_backend_pass.configure_async_compile(0)
 
 if __name__ == "__main__":
   absltest.main()

@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 from collections import Counter
+import concurrent.futures
 import functools
+import inspect
 import logging
 import operator
 import time
@@ -54,6 +56,67 @@ def _import_static_compiler():
     """Lazy import so this module is safe to import across environments."""
     from torch_tpu._internal.compile.compiler import StaticCompiler  # pytype: disable=import-error # noqa: F401
     return StaticCompiler
+
+
+# compile.async_compile_workers: 0 compiles each executable synchronously inside
+# tpu_backend_compile_pass. N > 0 submits each compile to a pool of N threads
+# and returns at once; wait_for_pending_compiles() joins them before the first
+# execution. TorchTPU releases the GIL across MLIR lowering and the XLA compile,
+# so the compiles of one rank run concurrently.
+_async_compile_workers = 0
+_pending_compiles: list[Any] = []
+_compile_call_seconds = 0.0
+
+
+def configure_async_compile(workers: int) -> None:
+    """Set the number of concurrent StaticCompiler compiles (0: synchronous)."""
+    global _async_compile_workers
+    if workers < 0:
+        raise ValueError(
+            f"compile.async_compile_workers must be >= 0, got {workers}"
+        )
+    _async_compile_workers = workers
+    if workers == 0:
+        return
+    StaticCompiler = _import_static_compiler()
+    if "async_compile" not in inspect.signature(StaticCompiler.__init__).parameters:
+        raise RuntimeError(
+            "compile.async_compile_workers > 0 requires a TorchTPU build whose "
+            "StaticCompiler accepts async_compile"
+        )
+    # The pool is a StaticCompiler class attribute with a fixed size; replace
+    # it to apply the configured width. No compile is pending at this point.
+    executor = getattr(StaticCompiler, "_async_compile_executor", None)
+    if getattr(executor, "_max_workers", None) != workers:
+        if executor is not None:
+            executor.shutdown(wait=True)
+        StaticCompiler._async_compile_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="tpu_async_compile"
+            )
+        )
+
+
+def wait_for_pending_compiles() -> int:
+    """Block until every asynchronously submitted compile has finished.
+
+    Returns the number of executables waited on. Compile errors surface here
+    rather than at the executable's first call.
+    """
+    pending = list(_pending_compiles)
+    _pending_compiles.clear()
+    for artifact in pending:
+        resolve = getattr(artifact, "_resolve", None)
+        if resolve is not None:
+            resolve()
+    return len(pending)
+
+
+def pop_compile_call_seconds() -> float:
+    """Return and reset the time spent inside StaticCompiler calls."""
+    global _compile_call_seconds
+    seconds, _compile_call_seconds = _compile_call_seconds, 0.0
+    return seconds
 
 
 def _optimization_barrier_fake(
@@ -306,7 +369,8 @@ def tpu_backend_compile_pass(
 
     This pass inspects the traced GraphModule (`gm`), logs op and collective statistics
     when debug logging is enabled, filters out non-Tensor slots if necessary, and
-    compiles the graph using `StaticCompiler` (`lazy PJRT/XLA lowering`). The forward
+    compiles the graph using `StaticCompiler` (synchronously, or on a background
+    thread when `configure_async_compile` set a pool). The forward
     method of the module is then rebound to execute the compiled XLA executable directly,
     eliminating per-node host dispatch overhead during training steps.
     """
@@ -374,12 +438,24 @@ def tpu_backend_compile_pass(
         # Added in TorchTPU PR #2800. Keep this keyword conditional so the
         # default no-donation path also works with older TorchTPU builds.
         compiler_kwargs["donated_inputs"] = donated_inputs
-    executable = StaticCompiler()(gm, list(example_inputs), **compiler_kwargs)
+    if _async_compile_workers > 0:
+        compiler = StaticCompiler(async_compile=True)
+    else:
+        compiler = StaticCompiler()
+    executable = compiler(gm, list(example_inputs), **compiler_kwargs)
     elapsed = time.time() - t0
-    logger.info(
-        f"[tpu_backend_pass] StaticCompiler ready in {elapsed:.1f}s "
-        "(PJRT compile finishes lazily on first execute)"
-    )
+    global _compile_call_seconds
+    _compile_call_seconds += elapsed
+    if _async_compile_workers > 0:
+        # An AsyncCompiledArtifact: it resolves on its first call, or earlier
+        # in wait_for_pending_compiles().
+        _pending_compiles.append(executable)
+        logger.info(
+            f"[tpu_backend_pass] StaticCompiler submitted in {elapsed:.1f}s "
+            f"(async, {_async_compile_workers} workers)"
+        )
+    else:
+        logger.info(f"[tpu_backend_pass] StaticCompiler ready in {elapsed:.1f}s")
 
     gm._tpu_executable = executable
 
@@ -435,11 +511,16 @@ def _restore_pinned_host_compile_inputs(
             f"{len(example_inputs)} != {len(placeholders)}"
         )
 
-    fake_mode = detect_fake_mode(example_inputs)
-    if fake_mode is None:
-        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+    # Build the pinned-host inputs in a fake mode of their own. With
+    # compile.async_compile_workers, StaticCompiler reads each input's
+    # ``.device`` on a worker thread while this thread keeps running fake ops
+    # in the graph's shared mode, and FakeTensor.device reports "meta" whenever
+    # its mode is inside a kernel (a flag on the mode, not per thread). The
+    # input then reads as not pinned and the executable expects device memory.
+    # TODO: drop the private mode once StaticCompiler snapshots pinned-host
+    # inputs on the submitting thread (or FakeTensor.device is thread-safe).
     compile_inputs = list(example_inputs)
-    with fake_mode:
+    with torch._subclasses.fake_tensor.FakeTensorMode():
         for index in pinned_positions:
             value = compile_inputs[index]
             if not isinstance(value, torch.Tensor):
@@ -671,6 +752,9 @@ def register() -> None:
 
 
 __all__ = [
+    "configure_async_compile",
+    "pop_compile_call_seconds",
+    "wait_for_pending_compiles",
     "tpu_backend_compile_pass",
     "tpu_backend_compile_partitioned_pass",
     "construct_tpu_transform_passes",
