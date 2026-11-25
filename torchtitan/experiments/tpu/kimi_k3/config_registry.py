@@ -22,6 +22,7 @@ from torchtitan.distributed.flex_shard import (
     ComputeLayout,
     Owned,
 )
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
@@ -36,6 +37,7 @@ from torchtitan.experiments.tpu.kimi_k3 import model_registry
 from torchtitan.experiments.tpu.kimi_k3.attention_residual import (
     use_tpu_attention_residual,
 )
+from torchtitan.experiments.tpu.spmd_dist_muon import TpuOptimizersContainer
 from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
@@ -215,6 +217,9 @@ _K3_MUON_PATTERN = (
     r"|moe\.routed_experts\.inner_experts\.w[123]_E[DF][DF]"
     r")$"
 )
+_K3_ROUTED_EXPERT_PATTERN = (
+    r"(?:^|\.)moe\.routed_experts\.inner_experts\.w[123]_E[DF][DF]$"
+)
 
 
 def _k3_muon_layouts(model_config) -> list[dict[str, ComputeLayout]]:
@@ -381,4 +386,107 @@ def graph_trainer_kimi_k3_deep8_e896_dist_muon() -> TpuGraphTrainer.Config:
   """``graph_trainer_kimi_k3_deep8_e896`` with DistMuon (eager, experts too)."""
   cfg = graph_trainer_kimi_k3_deep8_e896()
   cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
+def _k3_spmd_dist_muon_optimizer(
+    model_config, *, expert_bucket_size: int, lr: float = 8e-4
+) -> TpuOptimizersContainer.Config:
+  """``_k3_dist_muon_optimizer`` with the routed experts in ``SpmdDistMuon``.
+
+  ``SpmdDistMuon`` runs its buckets as one captured ``spmd_safe`` TPU program
+  (``experiments/tpu/spmd_dist_muon.py``); the dense matrices stay in the
+  eager DistMuon (their owner-based exchange differs per rank). Expert
+  buckets hold ``expert_bucket_size`` (``P``) same-shape tensors: w1 / w3 of
+  consecutive MoE layers, or w2. A bucket is captured when every rank runs
+  the same program: ``P`` tensors of ``E`` local experts over an ``N``-rank
+  transport group split into equal runs of ``k = P * E / N`` experts when
+  ``k`` divides ``E`` (``E`` = 56: ``N`` = 16 needs ``P`` = 2); other
+  buckets (e.g. a remainder) run eagerly after the program. Recipes using it
+  also need ``_with_spmd_dist_muon_flags``.
+  """
+  layer_fqns = _k3_muon_layouts(model_config)
+  layouts = {fqn: layout for d in layer_fqns for fqn, layout in d.items()}
+  routed_by_class = {
+      cls: [f for d in layer_fqns for f in d if f.rsplit(".", 1)[-1] in names]
+      for cls, names in (("w13", ("w1_EDF", "w3_EDF")), ("w2", ("w2_EFD",)))
+  }
+  expert_buckets = tuple(
+      BucketConfig(
+          name=f"routed-experts.{cls}.{i // expert_bucket_size}",
+          patterns=tuple(fqns[i:i + expert_bucket_size]),
+      )
+      for cls, fqns in routed_by_class.items()
+      for i in range(0, len(fqns), expert_bucket_size)
+  )
+  return TpuOptimizersContainer.Config(
+      implementation="for-loop",
+      param_groups=[
+          ParamGroupConfig(
+              pattern=_K3_ROUTED_EXPERT_PATTERN,
+              optimizer_name="SpmdDistMuon",
+              optimizer_kwargs=_k3_muon_kwargs(lr),
+          ),
+          ParamGroupConfig(
+              pattern=_K3_MUON_PATTERN,
+              optimizer_name="DistMuon",
+              optimizer_kwargs=_k3_muon_kwargs(lr),
+          ),
+          _k3_adamw_rest(lr),
+      ],
+      optimizer_factory_kwargs_by_name={
+          "SpmdDistMuon": {
+              "compute_sharding_by_fqn": {
+                  f: layouts[f] for b in expert_buckets for f in b.patterns
+              },
+              "bucket_configs": expert_buckets,
+          },
+          "DistMuon": {
+              "compute_sharding_by_fqn": {
+                  f: v for f, v in layouts.items() if ".routed_experts." not in f
+              },
+              "bucket_configs": tuple(
+                  _k3_layer_buckets(layer_fqns, routed_experts=False)
+              ),
+          },
+      },
+  )
+
+
+def _with_spmd_dist_muon_flags(cfg: TpuGraphTrainer.Config) -> None:
+  """Async all-to-all, which ``SpmdDistMuon`` needs to overlap exchanges.
+
+  XLA's TPU all-to-all is synchronous by default, so nothing could overlap a
+  bucket's exchange with another bucket's Newton-Schulz.
+  """
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, xla_tpu_enable_async_all_to_all=True
+  )
+
+
+def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e448_dist_muon`` with captured experts.
+
+  Buckets of two expert tensors split evenly at 56 local experts over eFSDP 16
+  (EP8 on 4x4x4) or 28 over eFSDP 8 (EP16).
+  """
+  cfg = graph_trainer_kimi_k3_deep8_e448()
+  cfg.optimizer = _k3_spmd_dist_muon_optimizer(
+      cfg.model_spec.model, expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e896_spmd_dist_muon() -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e896_dist_muon`` with captured experts.
+
+  56 local experts on EP16; at eFSDP 8 (4x4x4, TP1) each rank already holds
+  seven whole experts, so the expert buckets need no exchange.
+  """
+  cfg = graph_trainer_kimi_k3_deep8_e896()
+  cfg.optimizer = _k3_spmd_dist_muon_optimizer(
+      cfg.model_spec.model, expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg)
   return cfg
