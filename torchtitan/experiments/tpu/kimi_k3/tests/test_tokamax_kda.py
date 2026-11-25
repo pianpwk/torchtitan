@@ -8,12 +8,14 @@ gradient. It shares no code with Tokamax or ``attn_gym``.
 """
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 
 # Before `torchtitan.models.kimi_k3` (installs the `attn_gym` stub).
+from torchtitan.experiments.tpu.kimi_k3 import fused_kda
 from torchtitan.experiments.tpu.kimi_k3 import tokamax_kda
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.models import kimi_k3
@@ -101,19 +103,31 @@ class TokamaxKDATest(base_device_test.BaseAcceleratorDeviceTest):
           or "Tokamax KDA op is not installed."
       )
 
-  def test_layer_matches_reference(self):
+  @parameterized.named_parameters(
+      dict(testcase_name="_pallas_norm", kernel="tokamax"),
+      dict(testcase_name="_fused", kernel="fused"),
+  )
+  def test_layer_matches_reference(self, kernel: str):
     """Debug-flavor ``TpuKDA`` (via the override) vs an fp64 reference layer.
 
     Checks the plumbing around the kernel: the projections, the per-document
     causal conv (reference: ``F.conv1d`` per document), ``positions`` ->
-    segment ids, the output gate / norm and every parameter gradient.
+    segment ids, the output gate / norm and every parameter gradient, for
+    the two kernel paths the recipes use: Tokamax KDA with the Pallas output
+    norm, and the fused KDA kernels (with the Pallas output norm).
     """
-    self._require_mosaic_kda()
+    kda_cfg = _k3_kda_config("debugmodel")
+    if kernel == "tokamax":
+      self._require_mosaic_kda()
+      tpu_cfg = tokamax_kda.tokamax_kda_attention_pallas_norm(
+          kda_cfg, max_num_segments=8
+      )
+    else:
+      if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+        self.skipTest("The fused KDA kernels need a TPU.")
+      tpu_cfg = fused_kda.fused_kda_attention(kda_cfg)
     torch.manual_seed(0)
     dev = self.accelerator_device
-    tpu_cfg = tokamax_kda.tokamax_kda_attention(
-        _k3_kda_config("debugmodel"), max_num_segments=8
-    )
     layer = tpu_cfg.build()
     layer.init_states(buffer_device=torch.device("cpu"))
     with torch.no_grad():
