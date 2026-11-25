@@ -23,7 +23,10 @@ rank reads its post-optimization HLO from the XLA dump (``--xla_dump_to``, one
 directory per rank, and ``--xla_dump_hlo_as_text``), extracts the ordered
 collective sequence and compares it across ranks through the c10d store. The
 step refuses to run on any mismatch, or when the number of all-to-alls found
-differs from the bucket plan's.
+differs from the bucket plan's. ``collective_check_ranks`` limits the dump and
+the comparison to a few ranks (e.g. rank 0 and one rank on the last host) at
+scales where a dump on every rank costs too much host disk; the other ranks
+wait for the verdict.
 
     Example (one MoE layer, experts sharded on dim 1 over 4 ranks)::
 
@@ -149,8 +152,10 @@ class _CollectiveGuard:
     """
 
     tag: str
-    dump_dir: str
+    dump_dir: str | None
     expected_all_to_alls: int
+    # Ranks that read their dump and publish a digest; None means every rank.
+    check_ranks: tuple[int, ...] | None = None
     compile_start: float = 0.0
     num_compiles: int = 0
     verified_fingerprints: set[str] = field(default_factory=set)
@@ -172,10 +177,49 @@ class _CollectiveGuard:
             # A recompile that reused an executable this rank already checked
             # (XLA's cache hit dumps no new HLO).
             return
+        check_ranks = (
+            tuple(range(world_size)) if self.check_ranks is None else self.check_ranks
+        )
+        # TODO: Use a public c10d store accessor once one exists.
+        store = dist.distributed_c10d._get_default_store()
+        key = f"spmd_dist_muon/{self.tag}/{index}"
+        if rank in check_ranks:
+            self._publish_digest(store, f"{key}/{rank}")
+        peers = [store.get(f"{key}/{r}").decode().split(":") for r in check_ranks]
+        if len({p[0] for p in peers}) != 1:
+            raise RuntimeError(
+                f"{self.tag}: collective sequences differ across ranks "
+                f"(digest:all-to-alls:collectives of ranks {check_ranks}: {peers})"
+            )
+        if int(peers[0][1]) != self.expected_all_to_alls:
+            raise RuntimeError(
+                f"{self.tag}: found {peers[0][1]} all-to-alls in the captured "
+                f"program, the bucket plan issues {self.expected_all_to_alls}; "
+                "refusing"
+            )
+        self.verified_fingerprints |= fingerprints
+        if rank == 0:
+            logger.info(
+                f"{self.tag} compile {index}: {peers[0][2]} collectives "
+                f"({peers[0][1]} all-to-alls, {peers[0][3]} async) in the same "
+                f"order on ranks {self._describe(check_ranks, world_size)}"
+            )
+
+    @staticmethod
+    def _describe(check_ranks: tuple[int, ...], world_size: int) -> str:
+        if check_ranks == tuple(range(world_size)):
+            return f"all {world_size}"
+        return ", ".join(map(str, check_ranks))
+
+    def _publish_digest(self, store: Any, key: str) -> None:
+        assert self.dump_dir is not None
+        # Only DistMuon programs: the dump may hold every program of the step
+        # (e.g. a launcher's full dump on rank 0).
         files = [
             f
             for f in glob.glob(os.path.join(self.dump_dir, "*after_optimizations.txt"))
-            if os.path.getmtime(f) >= self.compile_start - 1
+            if "dist_muon" in os.path.basename(f)
+            and os.path.getmtime(f) >= self.compile_start - 1
         ]
         texts = [open(f).read() for f in files]
         candidates = [
@@ -190,32 +234,13 @@ class _CollectiveGuard:
         # this compile started.
         _, path, text = max(candidates)
         sequence = collective_sequence(text)
-        num_all_to_alls = _num_all_to_alls(sequence)
         digest = hashlib.sha256(json.dumps(sequence).encode()).hexdigest()[:16]
-        # TODO: Use a public c10d store accessor once one exists.
-        store = dist.distributed_c10d._get_default_store()
-        key = f"spmd_dist_muon/{self.tag}/{index}"
-        store.set(f"{key}/{rank}", f"{digest}:{num_all_to_alls}:{len(sequence)}")
-        peers = [store.get(f"{key}/{r}").decode().split(":") for r in range(world_size)]
-        if len({p[0] for p in peers}) != 1:
-            raise RuntimeError(
-                f"{self.tag}: collective sequences differ across ranks "
-                f"(digest:all-to-alls:collectives per rank {peers}); "
-                f"rank {rank} HLO {path}"
-            )
-        if num_all_to_alls != self.expected_all_to_alls:
-            raise RuntimeError(
-                f"{self.tag}: found {num_all_to_alls} all-to-alls in {path}, "
-                f"the bucket plan issues {self.expected_all_to_alls}; refusing"
-            )
-        self.verified_fingerprints |= fingerprints
-        if rank == 0:
-            logger.info(
-                f"{self.tag} compile {index}: {len(sequence)} collectives "
-                f"({num_all_to_alls} all-to-alls, "
-                f"{sum(op.startswith('async-start') for op, *_ in sequence)} "
-                f"async) in the same order on {world_size} ranks"
-            )
+        num_async = sum(op.startswith("async-start") for op, *_ in sequence)
+        logger.info(f"{self.tag}: rank {dist.get_rank()} digest {digest} of {path}")
+        store.set(
+            key,
+            f"{digest}:{_num_all_to_alls(sequence)}:{len(sequence)}:{num_async}",
+        )
 
 
 def _is_rank_symmetric(plan: Any) -> bool:
@@ -270,7 +295,12 @@ class SpmdCompiledDistMuon(DistMuon):
     not recompile it. See the module docstring for the collective check.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        collective_check_ranks: tuple[int, ...] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         # Buckets whose per-rank program would differ (e.g. a remainder bucket
         # whose experts do not split evenly over the transport group) run
@@ -288,7 +318,11 @@ class SpmdCompiledDistMuon(DistMuon):
                 "and run eagerly"
             )
         dump_dir = _xla_dump_dir()
-        if dump_dir is None:
+        checks_here = (
+            collective_check_ranks is None
+            or dist.get_rank() in collective_check_ranks
+        )
+        if dump_dir is None and checks_here:
             raise ValueError(
                 "SpmdDistMuon checks the compiled program's collective order "
                 "across ranks and needs the XLA dump: set xla_flags "
@@ -297,6 +331,11 @@ class SpmdCompiledDistMuon(DistMuon):
         self._collective_guard = _CollectiveGuard(
             tag=f"SpmdDistMuon[{len(self._captured_plans)} buckets]",
             dump_dir=dump_dir,
+            check_ranks=(
+                None
+                if collective_check_ranks is None
+                else tuple(sorted(set(collective_check_ranks)))
+            ),
             expected_all_to_alls=sum(
                 int(schedule.has_remote_transfers)
                 for plan in self._captured_plans
