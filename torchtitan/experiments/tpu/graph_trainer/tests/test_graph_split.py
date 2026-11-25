@@ -1047,6 +1047,30 @@ class GraphSplitTest(absltest.TestCase):
                 chunked.partition_map[cast], chunked.partition_map[node]
             )
 
+    # Deferred small reductions all land in the last executable, in by-layer
+    # and pipelined modes; everything else keeps its place.
+    for pipeline in (False, True):
+      with self.subTest("defer-small-reductions", pipeline=pipeline):
+        baseline = split_backward_graph_by_layer(
+            backward, n_layers=4, pipeline_collectives=pipeline
+        )
+        deferred = split_backward_graph_by_layer(
+            backward,
+            n_layers=4,
+            pipeline_collectives=pipeline,
+            defer_reduction_max_bytes=1 << 40,
+        )
+        last = max(deferred.partition_map.values())
+        self.assertEqual(
+            set(deferred.collective_layer_to_partition["rs"].values()), {last}
+        )
+        self.assertEqual(
+            deferred.layer_to_partition, baseline.layer_to_partition
+        )
+        self._assert_collective_chains_are_atomic(
+            backward, deferred.partition_map
+        )
+
     # Pipelining only RS keeps each AG with its layer's compute.
     rs_only = split_backward_graph_by_layer(
         backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=("rs",)
