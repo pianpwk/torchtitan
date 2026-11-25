@@ -1,3 +1,4 @@
+from collections import defaultdict
 import itertools
 from types import SimpleNamespace
 from unittest import mock
@@ -921,6 +922,50 @@ class GraphSplitTest(absltest.TestCase):
             isolate_prefix=isolate_prefix,
         )
         self.assertEqual(chunked.layer_to_partition, expected)
+
+    # Prefetch: [prefix,AG0] [L0,AG1] [L1,AG2] [L2,AG3] [L3]. Each layer's
+    # parameter gathers run one executable before the layer.
+    for graph in (forward, dim_split.forward_graph):
+      with self.subTest(direction="forward", prefetch=True):
+        chunked = split_forward_graph_by_layer(
+            graph, 1, isolate_prefix=True, prefetch_parameter_gathers=True
+        )
+        self.assertEqual(
+            chunked.layer_to_partition, {0: 1, 1: 2, 2: 3, 3: 4}
+        )
+        self._assert_collective_chains_are_atomic(
+            graph, chunked.partition_map
+        )
+        chains = collectives_lib.collect_collective_chains(graph)
+        gathered_layers = defaultdict(set)
+        for launch, nodes in chains.items():
+          if not collectives_lib.is_gather(launch):
+            continue
+          _, users = collectives_lib.chain_boundary(nodes)
+          layer = min(
+              chunked.layer_to_partition[i]
+              for i in map(_get_layer_id, users)
+              if i >= 0
+          )
+          gathered_layers[layer].add(chunked.partition_map[launch])
+        self.assertEqual(
+            dict(gathered_layers), {1: {0}, 2: {1}, 3: {2}, 4: {3}}
+        )
+        # Gathers below the size threshold stay with their layer.
+        in_place = split_forward_graph_by_layer(
+            graph,
+            1,
+            isolate_prefix=True,
+            prefetch_parameter_gathers=True,
+            prefetch_min_gather_bytes=1 << 40,
+        )
+        unprefetched = split_forward_graph_by_layer(
+            graph, 1, isolate_prefix=True
+        )
+        self.assertEqual(
+            {n.name: p for n, p in in_place.partition_map.items()},
+            {n.name: p for n, p in unprefetched.partition_map.items()},
+        )
 
     by_layer_one = (1, 2, 3, 4)
     by_layer_three = (1, 1, 1, 2)
