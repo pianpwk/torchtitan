@@ -124,6 +124,7 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
   trainer.train_context = contextlib.nullcontext
   trainer._collect_moe_routing_metrics = False
   trainer._ep_drop_stats_enabled = False
+  trainer._step_output_modules = []
   return trainer
 
 
