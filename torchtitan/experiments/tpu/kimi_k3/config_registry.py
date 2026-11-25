@@ -262,6 +262,7 @@ def _k3_dist_muon_optimizer(
     lr: float = 8e-4,
     bucketing: Literal["by_layer", "by_shape"] = "by_layer",
     spmd_expert_bucket_size: int | None = None,
+    spmd_max_buckets_per_program: int | None = None,
 ) -> OptimizersContainer.Config:
   """DistMuon on every K3 matrix (upstream K3's split), AdamW on the rest.
 
@@ -301,7 +302,9 @@ def _k3_dist_muon_optimizer(
   ``N``-rank transport group split into equal runs of ``k = P * E / N``
   experts when ``k`` divides ``E`` (``E`` = 56: ``N`` = 16 needs ``P`` = 2,
   ``N`` = 64 needs ``P`` = 8); other buckets run eagerly. Recipes using it also
-  need ``_with_spmd_dist_muon_flags``.
+  need ``_with_spmd_dist_muon_flags``. ``spmd_max_buckets_per_program``
+  splits the captured buckets into several programs (``SpmdDistMuon``'s
+  ``max_buckets_per_program``) to bound its HBM.
   """
   bf16 = torch.bfloat16
 
@@ -436,6 +439,7 @@ def _k3_dist_muon_optimizer(
                     f: layouts[f] for b in expert_buckets for f in b.patterns
                 },
                 "bucket_configs": expert_buckets,
+                "max_buckets_per_program": spmd_max_buckets_per_program,
             },
             "DistMuon": {
                 "compute_sharding_by_fqn": {
@@ -664,11 +668,18 @@ def graph_trainer_kimi_k3_full93_e896_fused_kda_spmd_dist_muon(
   TP1) eight tensors of 56 local experts split into equal runs of seven
   experts per eFSDP rank (two would give 1.75). 92 MoE layers give 23 w1 / w3
   buckets and 11 w2 buckets plus one remainder of four w2 tensors, which runs
-  eagerly. The collective check dumps on two ranks only.
+  eagerly. The 34 captured buckets run as five programs of at most seven:
+  one program would keep every bucket's buffers live (about 2.5 GiB of
+  temporaries per bucket of this size at 128 ranks) plus non-aliased new
+  parameters and momenta, beyond HBM next to ~30 GiB of fp32 expert
+  parameters, gradients and momenta per rank. The collective check dumps on
+  two ranks only.
   """
   cfg = graph_trainer_kimi_k3_full93_e896_fused_kda()
   cfg.optimizer = _k3_dist_muon_optimizer(
-      cfg.model_spec.model, spmd_expert_bucket_size=8
+      cfg.model_spec.model,
+      spmd_expert_bucket_size=8,
+      spmd_max_buckets_per_program=7,
   )
   _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
   return cfg
@@ -682,6 +693,21 @@ def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon_two_rank_check(
   cfg = graph_trainer_kimi_k3_deep8_e448()
   cfg.optimizer = _k3_dist_muon_optimizer(
       cfg.model_spec.model, spmd_expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon_split_check(
+) -> TpuGraphTrainer.Config:
+  """``..._deep8_e448_spmd_dist_muon_two_rank_check`` with the captured buckets
+  in programs of at most four (three programs), as the full93 recipe splits
+  them."""
+  cfg = graph_trainer_kimi_k3_deep8_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model,
+      spmd_expert_bucket_size=2,
+      spmd_max_buckets_per_program=4,
   )
   _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
   return cfg
