@@ -351,11 +351,9 @@ class TpuGroupedExperts(GroupedExperts):
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        h_RF = self._activation_fn(
-            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
-        )
-        h_RF = h_RF * self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
+        h_RF = self._glu(
+            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E),
+            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E),
         )
         return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
@@ -363,6 +361,19 @@ class TpuGroupedExperts(GroupedExperts):
         if self.activation == "gelu_tanh":
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
+
+    def _glu(self, gate_RF: torch.Tensor, up_RF: torch.Tensor) -> torch.Tensor:
+        """Gated hidden activation from the W1 (gate) and W3 (up) outputs.
+
+        A subclass that overrides it overrides ``_gmm_glu_act`` to match.
+        """
+        return self._activation_fn(gate_RF) * up_RF
+
+    def _gmm_glu_act(self):
+        """``_glu`` as the fused gmm_glu kernel's activation (silu only)."""
+        from torchtitan.experiments.tpu.kernels import gmm_glu
+
+        return gmm_glu.SwiGLU()
 
     def unshard_weights(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the local expert weights (w1, w2, w3) as ``forward`` uses them.
@@ -589,7 +600,7 @@ class TpuGroupedExperts(GroupedExperts):
                 w1_EKN.bfloat16(),
                 w3_EKN.bfloat16(),
                 group_sizes_E,
-                act=gmm_glu.SwiGLU(),
+                act=self._gmm_glu_act(),
             )
         elif self.pallas_grouped_mm_kernel == "gmm_v2":
             gate_RF = grouped_mm_v2(
@@ -631,7 +642,7 @@ class TpuGroupedExperts(GroupedExperts):
                 tgmm_tiling=tgmm_tiling,
             )
         if self.pallas_grouped_mm_kernel != "gmm_glu":
-            hidden_RF = self._activation_fn(gate_RF) * up_RF
+            hidden_RF = self._glu(gate_RF, up_RF)
         if row_scale_R is not None:
             if pad_rows:
                 row_scale_R = F.pad(row_scale_R, (0, pad_rows))
