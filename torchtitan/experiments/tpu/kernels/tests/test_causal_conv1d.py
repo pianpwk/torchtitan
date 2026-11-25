@@ -127,6 +127,62 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
           _relative_l2_error(actual.double().cpu(), expected), tol, name
       )
 
+  @parameterized.named_parameters(
+      dict(testcase_name="_fp32", dtype=torch.float32, tol=1e-5),
+      dict(testcase_name="_bf16", dtype=torch.bfloat16, tol=1e-2),
+  )
+  def test_segmented_matches_per_document_conv1d(self, dtype, tol):
+    """Documents shorter than the width, at row starts and across blocks."""
+    dev = self._require_tpu()
+    torch.manual_seed(0)
+    batch, seq_len, channels, width = 3, 264, 256, 4
+    doc_lens = ([1, 2, 3, 50, 208], [264], [7, 1, 128, 128])
+    segment_ids = torch.stack(
+        [
+            torch.repeat_interleave(torch.arange(len(lens)), torch.tensor(lens))
+            for lens in doc_lens
+        ]
+    ).to(torch.int32)
+    x = torch.randn(batch, seq_len, channels, dtype=torch.float64)
+    weight = torch.randn(channels, 1, width, dtype=torch.float64) * 0.5
+    grad = torch.randn(batch, seq_len, channels, dtype=torch.float64)
+    x_ref = x.clone().requires_grad_()
+    w_ref = weight.clone().requires_grad_()
+    out_ref = torch.cat(
+        [
+            torch.cat(
+                [
+                    _reference(row[None, start : start + n], w_ref)
+                    for start, n in zip(
+                        torch.tensor(lens)
+                        .cumsum(0)
+                        .sub(torch.tensor(lens))
+                        .tolist(),
+                        lens,
+                    )
+                ],
+                dim=1,
+            )
+            for row, lens in zip(x_ref, doc_lens)
+        ]
+    )
+    grads_ref = torch.autograd.grad(out_ref, (x_ref, w_ref), grad)
+
+    x_dev = x.to(dev, dtype).requires_grad_()
+    w_dev = weight.to(dev, dtype).requires_grad_()
+    out = causal_conv1d.causal_conv_silu_segmented(
+        x_dev, w_dev, segment_ids.to(dev)
+    )
+    grads = torch.autograd.grad(out, (x_dev, w_dev), grad.to(dev, dtype))
+    self.assertLess(_relative_l2_error(out.double().cpu(), out_ref), tol)
+    for name, actual, expected in zip(
+        ("x", "weight"), grads, grads_ref, strict=True
+    ):
+      self.assertEqual(actual.dtype, dtype, name)
+      self.assertLess(
+          _relative_l2_error(actual.double().cpu(), expected), tol, name
+      )
+
   def test_bf16_biased_dw_accumulation_and_mixed_fp32_weight(self):
     """Tests fp32 dw accumulation over 16K biased tokens and fp32 weights."""
     dev = self._require_tpu()

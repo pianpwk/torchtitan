@@ -204,9 +204,9 @@ def causal_conv_silu(
 ) -> torch.Tensor:
   """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
 
-  Whole-row TPU inputs within ``causal_conv1d.supports`` run the fused Pallas
-  kernels; packed documents or unsupported shapes/devices use
-  ``_CausalConvSilu``'s shifted slices.
+  TPU inputs within ``causal_conv1d.supports`` run the fused Pallas kernels
+  (``causal_conv_silu_segmented`` with packed documents); unsupported
+  shapes/devices use ``_CausalConvSilu``'s shifted slices.
 
   Args:
     x_BSC: ``[B, S, C]`` input.
@@ -217,10 +217,14 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
-  if segment_ids_BS is None and causal_conv1d is not None:
+  if causal_conv1d is not None:
     reason = causal_conv1d.unsupported_reason(x_BSC, weight_C1W)
-    if reason is None:
+    if reason is None and segment_ids_BS is None:
       return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+    if reason is None:
+      return causal_conv1d.causal_conv_silu_segmented(
+          x_BSC, weight_C1W, segment_ids_BS
+      )
     if (
         x_BSC.device.type == "tpu"
         and not torch.compiler.is_compiling()
