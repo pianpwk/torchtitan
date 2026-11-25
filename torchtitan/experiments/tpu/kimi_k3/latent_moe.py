@@ -7,16 +7,22 @@ to 1), projects tokens down to the latent dim, runs the routed experts there,
 weights each expert output by its score after W2, sums the routes per token,
 then applies ``routed_norm`` and the up projection and adds the shared experts
 (a SiTU-GLU FFN on the model dim). Only the routed experts change on TPU, so
-the override keeps ``KimiLatentMoE`` and its ``RoutedExperts`` and replaces
-two children:
+the override keeps ``KimiLatentMoE`` and replaces its ``routed_experts``
+children:
 
 * ``TpuKimiGroupedExperts``: ``TpuGroupedExperts`` (Pallas MegaBlox GMM,
   kernel-native weight layout) with K3's SiTU-GLU activation. Upstream's
   ``KimiGroupedExperts`` subclasses the common ``GroupedExperts`` on
   ``torch._grouped_mm``; TPU runs the existing ``TpuGroupedExperts``
   component instead, so only the activation hook (``_glu``) is K3-specific.
-* ``TpuAllToAllTokenDispatcher``: TPU local-reorder VJPs. The scores are
-  applied after W2, as upstream does.
+* ``TpuAllToAllTokenDispatcher``: TPU local-reorder VJPs without EP; with EP,
+  the Ring-of-Experts transport (``ep_transport="ring_of_experts"``, set
+  explicitly rather than ``"auto"``, which would switch to ragged all-to-all
+  above EP = top_k): all-gather of the latent tokens, scores and expert ids,
+  the local experts on a static buffer, and a reduce-scatter of the per-token
+  sums. The scores are applied after W2, as upstream does.
+* ``TpuRoutedExperts``: upstream's ``RoutedExperts`` over the TPU dispatcher
+  (one token chunk).
 """
 
 from dataclasses import dataclass
@@ -29,6 +35,7 @@ from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-i
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
 )
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.kimi_k3.moe import KimiLatentMoE
@@ -107,13 +114,22 @@ class TpuKimiGroupedExperts(TpuGroupedExperts):
 
 @override(
     target=KimiLatentMoE.Config,
-    description="Kimi K3 LatentMoE on TPU: MegaBlox experts.",
+    description="Kimi K3 LatentMoE on TPU: MegaBlox experts, Ring-of-Experts EP.",
 )
-def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
+def tpu_latent_moe(
+    cfg: KimiLatentMoE.Config,
+    *,
+    ep_capacity_factor: float | None = None,
+) -> KimiLatentMoE.Config:
   """K3 LatentMoE with TPU experts and the TPU dispatcher.
 
   The MoE keeps its config type: ``KimiLatentMoE`` or
   ``QuantileBalancedKimiLatentMoE`` (``quantile_balance.py``).
+
+  ``ep_capacity_factor`` (Ring-of-Experts expert rows per EP rank, in units of
+  the local routes; None is drop-free) applies only under EP; see
+  ``TpuAllToAllTokenDispatcher.Config``. ``TpuRoutedExperts`` runs one token
+  chunk.
   """
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
@@ -126,7 +142,7 @@ def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
       type(cfg),
       routed_experts=derive(
           routed,
-          type(routed),
+          TpuRoutedExperts.Config,
           inner_experts=derive(
               routed.inner_experts,
               TpuKimiGroupedExperts.Config,
@@ -138,6 +154,8 @@ def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
               routed.token_dispatcher,
               TpuAllToAllTokenDispatcher.Config,
               fuse_route_score_backward=True,
+              ep_transport="ring_of_experts",
+              ep_capacity_factor=ep_capacity_factor,
           ),
       ),
   )

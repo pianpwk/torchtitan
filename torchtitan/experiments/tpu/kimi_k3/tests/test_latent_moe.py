@@ -12,6 +12,13 @@ shares no code with the TPU modules or upstream's ``KimiLatentMoE``.
 Top-k selection is discontinuous, so the reference takes the expert ids the
 device chose and checks separately that they are the fp64 top-k of the biased
 scores up to near-ties.
+
+The EP test runs on 8 TPU cores: every rank routes its own tokens, and the
+same layer runs without EP (all experts on every rank) and with the
+Ring-of-Experts transport (drop-free, and with a tight capacity that drops
+routes); each is compared to the reference over
+the global batch. The upstream all-to-all transport is not tested: its
+variable splits give asymmetric all-to-all buffers, which torch_tpu rejects.
 """
 
 import dataclasses
@@ -20,21 +27,27 @@ import json
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torchtitan.config.override import apply_overrides, OverrideConfig
+from torchtitan.distributed.parallel_dims import init_device_mesh
+from torchtitan.distributed.spmd_types import set_spmd_meshes
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
 )
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.distributed import distributed
 
 # Before `torchtitan.models.kimi_k3` (installs the `attn_gym` stub).
 from torchtitan.experiments.tpu.kimi_k3 import latent_moe
 from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.models import kimi_k3
-from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.kimi_k3.moe import KimiLatentMoE
 
 _OVERRIDE = "torchtitan.experiments.tpu.kimi_k3.latent_moe.tpu_latent_moe"
+_EP = 8
 # Relative L2 bound vs the fp64 reference. The experts run in BF16 whatever
 # the layer dtype (as upstream's), so fp32 layers are bounded like bf16 ones.
 _BOUND = 3e-2
@@ -204,6 +217,7 @@ def _run_reference(params64, x, ids, grad_out, cfg, keep=None):
 
 
 def _log(tag, name, results):
+  # print, not absl logging: EP workers are spawned without absl's handlers.
   print(f"{tag} {json.dumps({'case': name, **results})}", flush=True)
 
 
@@ -216,14 +230,16 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_override_replaces_every_latent_moe(self):
     model_cfg = kimi_k3.model_registry("Kimi-K3").model
-    replaced = apply_overrides(OverrideConfig(imports=[_OVERRIDE]), model_cfg)
+    override = (_OVERRIDE, {"ep_capacity_factor": 2.0})
+    replaced = apply_overrides(OverrideConfig(imports=[override]), model_cfg)
     moes = [layer.moe for layer in model_cfg.layers if layer.moe]
     self.assertLen(moes, 92)
     self.assertLen(replaced, 92)
     for moe in moes:
       routed = moe.routed_experts
       self.assertIs(type(moe), KimiLatentMoE.Config)
-      self.assertIs(type(routed), RoutedExperts.Config)
+      self.assertIs(type(routed), TpuRoutedExperts.Config)
+      self.assertEqual(routed.num_token_chunks, 1)
       self.assertIs(
           type(routed.inner_experts), latent_moe.TpuKimiGroupedExperts.Config
       )
@@ -231,8 +247,11 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
           (routed.inner_experts.beta, routed.inner_experts.linear_beta),
           (4.0, 25.0),
       )
-      self.assertIs(
-          type(routed.token_dispatcher), TpuAllToAllTokenDispatcher.Config
+      dispatcher = routed.token_dispatcher
+      self.assertIs(type(dispatcher), TpuAllToAllTokenDispatcher.Config)
+      self.assertEqual(
+          (dispatcher.ep_transport, dispatcher.ep_capacity_factor),
+          ("ring_of_experts", 2.0),
       )
 
   @parameterized.named_parameters(
@@ -315,6 +334,160 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
       results.append([out.detach()] + [p.grad for p in experts.parameters()])
     for full, padded in zip(*results):
       torch.testing.assert_close(padded, full, rtol=0, atol=0)
+
+
+def _ep_worker(device, rank, world_size, flavor, num_experts, top_k, tokens):
+  """Runs the layer without EP and with AG/RS EP on this rank's tokens."""
+  dtype = torch.bfloat16
+  mesh = init_device_mesh(
+      "tpu", (world_size,), ("ep",), enable_tpu_topo_mesh=True
+  )
+  set_spmd_meshes(dense_mesh=mesh, sparse_mesh=mesh)
+  # The topology-aware EP order need not be the global rank order: gather in
+  # EP order.
+  group = mesh.get_group()
+  ep_rank = mesh.get_local_rank()
+  num_local = num_experts // world_size
+  local = slice(ep_rank * num_local, (ep_rank + 1) * num_local)
+  dim = None
+  modes = {
+      "single": (_OVERRIDE, False),
+      "ep_roe": (_OVERRIDE, True),
+      # One routed row per local route on average: busy ranks drop routes.
+      "ep_roe_capacity1": ((_OVERRIDE, {"ep_capacity_factor": 1.0}), True),
+  }
+  runs = {}
+  for mode, (override, use_ep) in modes.items():
+    cfg = _moe_config(flavor, override, num_experts=num_experts, top_k=top_k)
+    layer = _build_layer(cfg, seed=0)
+    params64 = _params64(layer, dtype)
+    bias_E = layer.expert_bias_E.clone().double()
+    dim = cfg.router.gate.in_features
+    torch.manual_seed(1)
+    x_global = torch.randn(world_size * tokens, dim).to(dtype)
+    grad_global = torch.randn(world_size * tokens, dim).to(dtype)
+    mine = slice(ep_rank * tokens, (ep_rank + 1) * tokens)
+    experts = layer.routed_experts.inner_experts
+    if use_ep:
+      with torch.no_grad():
+        for name in ("w1_EDF", "w2_EFD", "w3_EDF"):
+          full = getattr(experts, name)
+          setattr(experts, name, torch.nn.Parameter(full[local].clone()))
+    layer = _to_device(layer, device, dtype)
+    if use_ep:
+      layer.routed_experts.token_dispatcher.wire_meshes(ep_mesh=mesh)
+    ids = []
+    hook = layer.router.register_forward_hook(
+        lambda m, i, o: ids.append(o[1].detach())
+    )
+    x_dev = x_global[mine].to(device).requires_grad_()
+    out = layer(x_dev)
+    out.backward(grad_global[mine].to(device))
+    hook.remove()
+
+    ids_GK = torch.empty(
+        world_size * tokens, top_k, dtype=ids[0].dtype, device=device
+    )
+    dist.all_gather_into_tensor(ids_GK, ids[0].contiguous(), group=group)
+    out_G = torch.empty(world_size * tokens, dim, dtype=dtype, device=device)
+    dist.all_gather_into_tensor(out_G, out.detach().contiguous(), group=group)
+    dx_G = torch.empty_like(out_G)
+    dist.all_gather_into_tensor(dx_G, x_dev.grad.contiguous(), group=group)
+    grads = {}
+    for name, p in layer.named_parameters():
+      g = p.grad.float()
+      if use_ep and "routed_experts" in name:
+        full = torch.empty(
+            world_size * g.shape[0], *g.shape[1:], device=device
+        )
+        dist.all_gather_into_tensor(full, g.contiguous(), group=group)
+        grads[name] = full.cpu()
+      else:
+        dist.all_reduce(g, group=group)
+        grads[name] = g.cpu()
+    ids_GK = ids_GK.cpu()
+    keep = None
+    if mode == "ep_roe_capacity1":
+      keep = _capacity_keep(
+          ids_GK, layer.routed_experts.token_dispatcher, world_size, tokens
+      )
+    agree = _check_routing(x_global.double(), ids_GK, params64, bias_E)
+    actual = {"out": out_G.cpu(), "dx": dx_G.cpu()}
+    actual.update({f"d{n}": g for n, g in grads.items()})
+    expected = _run_reference(
+        params64, x_global, ids_GK, grad_global, cfg, keep
+    )
+    results = {k: _errors(actual[k], e) for k, e in expected.items()}
+    results["routing_agreement"] = agree
+    if keep is not None:
+      results["dropped_routes"] = int((~keep).sum())
+    runs[mode] = (actual, ids_GK)
+    if rank == 0:
+      _log("MOE_EP_NUMERICS", f"{mode}_{flavor}_E{num_experts}_K{top_k}",
+           results)
+    for key in expected:
+      assert torch.isfinite(actual[key]).all(), f"{mode} {key}"
+      assert results[key]["rel_l2"] < _BOUND, f"{mode} {key}: {results[key]}"
+    if keep is not None:
+      assert not keep.all(), "the tight capacity should drop routes"
+
+  # Every mode routes the same per-rank tokens, so the ids are identical and
+  # the modes differ only in the order of their sums.
+  base, base_ids = runs["single"]
+  for mode in ("ep_roe",):
+    actual, ids_GK = runs[mode]
+    assert torch.equal(ids_GK, base_ids), mode
+    results = {k: _errors(actual[k], base[k]) for k in base}
+    if rank == 0:
+      _log("MOE_EP_VS_SINGLE", f"{mode}_{flavor}_E{num_experts}_K{top_k}",
+           results)
+    for key, err in results.items():
+      assert err["rel_l2"] < 1e-2, f"{mode} vs single {key}: {err}"
+
+
+def _capacity_keep(ids_GK, dispatcher, world_size, tokens):
+  """Which gathered routes a capacity-limited Ring-of-Experts rank computes.
+
+  Each rank takes the routes to its experts in (local expert, gathered route)
+  order and keeps the first ``max_rows``: ``int(T * top_k * factor)`` rounded
+  up to the kernels' 1024-row block, at most the drop-free worst case.
+  """
+  num_routes, top_k = ids_GK.numel(), ids_GK.shape[1]
+  num_local = dispatcher.num_experts // world_size
+  num_routed = tokens * top_k
+  max_rows = max(int(num_routed * dispatcher.ep_capacity_factor), 1)
+  max_rows = min(-(-max_rows // 1024) * 1024, world_size * num_routed)
+  keep = torch.zeros(num_routes, dtype=torch.bool)
+  flat = ids_GK.flatten()
+  for r in range(world_size):
+    mine = ((flat // num_local) == r).nonzero().flatten()
+    order = mine[torch.argsort(flat[mine] - r * num_local, stable=True)]
+    keep[order[:max_rows]] = True
+  return keep.reshape(ids_GK.shape)
+
+
+class LatentMoEDistributedTest(
+    base_distributed_device_test.BaseDistributedDeviceTest
+):
+  """EP over 8 TPU cores (2x2x1 slice) vs single device and fp64."""
+
+  @parameterized.named_parameters(
+      # K3's routing ratio: top-16, 16 experts per rank (K3 at EP16 has 56).
+      dict(testcase_name="_debug_k16", flavor="debugmodel", num_experts=128,
+           top_k=16, tokens=512),
+  )
+  def test_ep_matches_reference(self, flavor, num_experts, top_k, tokens):
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("EP test needs 8 TPU cores.")
+    distributed.run_distributed(
+        _EP,
+        self.accelerator_device_type,
+        _ep_worker,
+        flavor,
+        num_experts,
+        top_k,
+        tokens,
+    )
 
 
 if __name__ == "__main__":
