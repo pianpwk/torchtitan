@@ -1316,8 +1316,14 @@ def _roe_unsort_fwd(
   else:
     w_rows_cap = jnp.zeros((cap,), dtype=jnp.float32)
 
-  safe_src = jnp.clip(src_rows, 0, max(cap - 1, 0))
-  weights_compacted_S = w_rows_cap[safe_src]
+  # Every compacted slot reads exactly one of the [cap] rows, so scaling the
+  # rows here is bitwise equal to the reduce kernel's per-slot weights (FP32
+  # multiply, rounded to the row dtype, FP32 accumulation). It avoids an XLA
+  # gather of a weight per slot over all ep_size * T * top_k slots (98 ms per
+  # layer at 2M slots on TPU7x) for one elementwise pass over [cap, D].
+  scaled_RD = (
+      routed_output_RD.astype(jnp.float32) * w_rows_cap[:, None]
+  ).astype(routed_output_RD.dtype)
 
   meta = RaggedGatherReduceMetadata(
       src_rows=src_rows,
@@ -1327,11 +1333,10 @@ def _roe_unsort_fwd(
       num_indices=token_ids_sorted_M.shape[0],
   )
   out3d = ragged_gather_reduce_tc(
-      _repack_2d_to_3d_valid_tc(routed_output_RD, count),
+      _repack_2d_to_3d_valid_tc(scaled_RD, count),
       meta,
       num_out_tokens=num_out_tokens,
       top_k=top_k,
-      weights=weights_compacted_S,
   )
   return out3d.reshape(num_out_tokens, d_dim)
 
