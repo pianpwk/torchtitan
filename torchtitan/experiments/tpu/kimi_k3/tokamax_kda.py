@@ -15,6 +15,20 @@ varlen causal ``conv1d`` and the chunked delta rule with CUDA-only
   backward kernels, which also L2-normalize Q/K in-kernel as ``attn_gym``'s
   ``l2norm`` does (fp32, ``eps=1e-6``, rounded to the input dtype).
 
+The short convolution and the output norm are selected by config type; the
+reference paths are the defaults:
+
+* ``TpuInnerKDA.Config.conv``: ``CausalConvSilu`` (XLA, the reference) or
+  ``PallasCausalConvSilu`` (with documents, the Pallas
+  ``causal_conv1d.causal_conv_silu_segmented``).
+* ``TpuKDA.Config.output_norm``: upstream's ``KimiRMSNormGated`` (XLA) or
+  ``PallasGatedHeadRMSNorm`` (one Pallas pass per direction,
+  ``kernels/rms_norm_gated.py`` with the sigmoid gate).
+
+``tokamax_kda_attention`` keeps the reference conv and norm;
+``tokamax_kda_attention_pallas_conv_norm`` selects the Pallas ones, and so does
+``fused_kda.fused_kda_attention``.
+
 Why ``KDA`` and ``InnerKDA`` are forked (subclassed with a copied forward)
 rather than only the kernel swapped:
 
@@ -52,7 +66,7 @@ a 64-token chunk boundary, so each row always costs
 """
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import functools
 
 import jax
@@ -64,6 +78,8 @@ from torchtitan.config.override import derive, override
 # Before `torchtitan.models.kimi_k3`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.components import unflatten_shim
+from torchtitan.experiments.tpu.kernels import causal_conv1d
+from torchtitan.experiments.tpu.kernels.rms_norm_gated import rms_norm_gated
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import causal_conv_silu, per_row_segment_ids
 from torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta import (
     MIN_NUM_SEGMENTS,
@@ -74,7 +90,8 @@ from torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta import (
     tokamax_kda_import_error,
 )
 from torchtitan.models.common.attention import segment_ids_from_positions
-from torchtitan.models.kimi_k3.kda import InnerKDA, KDA, KDAKernel
+from torchtitan.models.kimi_k3.kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
+from torchtitan.protocols.module import Module
 
 # Shape suffixes:
 # T = packed tokens, B = rows, S = tokens per row, D = model dimension,
@@ -369,17 +386,97 @@ class TokamaxKDAKernel(KDAKernel):
     )
 
 
+class CausalConvSilu(Module):
+  """Per-row depthwise causal ``conv1d`` + SiLU, restarting at every document.
+
+  The reference path: ``qwen3_5.gated_delta.causal_conv_silu`` in XLA.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Module.Config):
+    pass
+
+  def __init__(self, config: Config):
+    del config  # No options.
+    super().__init__()
+
+  def forward(
+      self,
+      x_BSC: torch.Tensor,
+      weight_C1W: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None,
+  ) -> torch.Tensor:
+    return causal_conv_silu(x_BSC, weight_C1W, segment_ids_BS)
+
+
+class PallasCausalConvSilu(CausalConvSilu):
+  """``CausalConvSilu`` on the Pallas segmented kernel when documents are given.
+
+  K3's KDA always has packed documents, where the XLA path takes shifted
+  slices (misaligned copies, several masked passes);
+  ``causal_conv1d.causal_conv_silu_segmented`` runs it in one Pallas pass per
+  direction. TPU7x, B=8, S=4096, C=6144, bf16, 8 documents per row: fwd
+  1.68 -> 0.82 ms, bwd 4.97 -> 1.86 ms per tensor. Forward bits equal the XLA
+  path; the backward (dw summation order) is not verified bitwise.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(CausalConvSilu.Config):
+    pass
+
+  def forward(
+      self,
+      x_BSC: torch.Tensor,
+      weight_C1W: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None,
+  ) -> torch.Tensor:
+    if segment_ids_BS is None:
+      return super().forward(x_BSC, weight_C1W, segment_ids_BS)
+    return causal_conv1d.causal_conv_silu_segmented(
+        x_BSC, weight_C1W, segment_ids_BS
+    )
+
+
+class PallasGatedHeadRMSNorm(KimiRMSNormGated):
+  """``KimiRMSNormGated`` as one Pallas pass per direction.
+
+  Left to XLA, the per-head RMSNorm + sigmoid gate fuses into the
+  ``output_proj`` / ``output_gate`` GEMMs (57-65% of peak instead of ~77%)
+  and adds fp32 ``[T, H, V]`` passes; ``kernels/rms_norm_gated.py``
+  (``gate_activation="sigmoid"``) computes the same fp32 math in one pass per
+  direction (same weight and eps) on the flat ``[T, H * V]`` heads, with no
+  relayout. Not verified bitwise vs the XLA path (dweight summation order).
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(KimiRMSNormGated.Config):
+    pass
+
+  def forward(self, x_THV: torch.Tensor, gate_THV: torch.Tensor) -> torch.Tensor:
+    return rms_norm_gated(
+        x_THV.flatten(-2),
+        gate_THV.flatten(-2),
+        self.weight,
+        self.eps,
+        gate_activation="sigmoid",
+    ).view_as(x_THV)
+
+
 class TpuInnerKDA(InnerKDA):
   """``InnerKDA`` that convolves each ``[B, S]`` row on its own.
 
   Given ``positions``, the convolution and the recurrence also restart at
   every document packed into a row (``positions == 0``), as upstream's varlen
-  kernels do at ``cu_seqlens``.
+  kernels do at ``cu_seqlens``. ``conv`` selects the convolution.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(InnerKDA.Config):
-    pass
+    conv: CausalConvSilu.Config = field(default_factory=CausalConvSilu.Config)
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+    self.conv = config.conv.build()
 
   def forward(  # pyrefly: ignore [bad-override]
       self,
@@ -419,7 +516,7 @@ class TpuInnerKDA(InnerKDA):
           )
       )
     q_BSHK, k_BSHK, v_BSHV = (
-        causal_conv_silu(x_BSC, weight_C1W, segment_ids_BS).unflatten(
+        self.conv(x_BSC, weight_C1W, segment_ids_BS).unflatten(
             -1, (-1, self.head_dim)
         )
         for x_BSC, weight_C1W in (
@@ -490,6 +587,40 @@ class TpuKDA(KDA):
     )
 
 
+def tpu_kda_config(
+    cfg: KDA.Config,
+    kernel: type[KDAKernel.Config],
+    *,
+    conv: CausalConvSilu.Config,
+    output_norm: type[KimiRMSNormGated.Config],
+    **kernel_fields,
+) -> TpuKDA.Config:
+  """``TpuKDA.Config`` for an upstream ``KDA.Config`` with these modules.
+
+  ``kernel`` and ``output_norm`` are derived from upstream's configs
+  (``kernel_fields`` set on the kernel).
+  """
+  inner = cfg.inner_kda
+  if not isinstance(inner, InnerKDA.Config) or not isinstance(
+      inner.kernel, KDAKernel.Config
+  ):
+    raise ValueError(
+        "TPU KDA overrides expect upstream InnerKDA / KDAKernel configs,"
+        f" got {type(inner).__name__}"
+    )
+  return derive(
+      cfg,
+      TpuKDA.Config,
+      inner_kda=derive(
+          inner,
+          TpuInnerKDA.Config,
+          kernel=derive(inner.kernel, kernel, **kernel_fields),
+          conv=conv,
+      ),
+      output_norm=derive(cfg.output_norm, output_norm),
+  )
+
+
 @override(
     target=KDA.Config,
     exact=True,
@@ -500,7 +631,8 @@ def tokamax_kda_attention(
 ) -> TpuKDA.Config:
   """``TpuKDA.Config`` with ``TokamaxKDAKernel`` for an upstream ``KDA.Config``.
 
-  For example ``(TOKAMAX_KDA_OVERRIDE, {"max_num_segments": 16})`` in
+  The reference conv and output norm. For example
+  ``(TOKAMAX_KDA_OVERRIDE, {"max_num_segments": 16})`` in
   ``override.imports`` keeps up to 16 packed documents per row apart.
 
   Args:
@@ -510,24 +642,32 @@ def tokamax_kda_attention(
   Returns:
     The TPU layer's config.
   """
-  inner = cfg.inner_kda
-  if not isinstance(inner, InnerKDA.Config) or not isinstance(
-      inner.kernel, KDAKernel.Config
-  ):
-    raise ValueError(
-        "tokamax_kda_attention expects upstream InnerKDA / KDAKernel configs,"
-        f" got {type(inner).__name__}"
-    )
-  return derive(
+  return tpu_kda_config(
       cfg,
-      TpuKDA.Config,
-      inner_kda=derive(
-          inner,
-          TpuInnerKDA.Config,
-          kernel=derive(
-              inner.kernel,
-              TokamaxKDAKernel.Config,
-              max_num_segments=max_num_segments,
-          ),
-      ),
+      TokamaxKDAKernel.Config,
+      conv=CausalConvSilu.Config(),
+      output_norm=KimiRMSNormGated.Config,
+      max_num_segments=max_num_segments,
+  )
+
+
+@override(
+    target=KDA.Config,
+    exact=True,
+    description=(
+        "Run Kimi K3's KDA layers with Tokamax's TPU kernels and the Pallas"
+        " short conv / output norm."
+    ),
+)
+def tokamax_kda_attention_pallas_conv_norm(
+    cfg: KDA.Config, *, max_num_segments: int | None = None
+) -> TpuKDA.Config:
+  """``tokamax_kda_attention`` with ``PallasCausalConvSilu`` and
+  ``PallasGatedHeadRMSNorm`` (an option; use it in its place)."""
+  return tpu_kda_config(
+      cfg,
+      TokamaxKDAKernel.Config,
+      conv=PallasCausalConvSilu.Config(),
+      output_norm=PallasGatedHeadRMSNorm.Config,
+      max_num_segments=max_num_segments,
   )

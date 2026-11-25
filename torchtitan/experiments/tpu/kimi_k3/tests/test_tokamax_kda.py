@@ -150,16 +150,20 @@ class TokamaxKDATest(base_device_test.BaseAcceleratorDeviceTest):
       heads: list[int] | None = None,
       bounds: dict[str, float],
       max_num_segments: int | None = None,
+      kernel_config=None,
   ) -> dict[str, dict[str, float]]:
     """Runs the kernel module and the reference; checks and logs errors.
 
     ``heads`` restricts the reference (heads are independent) to a subset.
+    ``kernel_config``: the kernel module to test (default Tokamax's).
     """
     dev = self.accelerator_device
     batch, seq_len = inputs["q"].shape[:2]
-    kernel = tokamax_kda.TokamaxKDAKernel.Config(
-        lower_bound=_LOWER_BOUND, max_num_segments=max_num_segments
-    ).build()
+    if kernel_config is None:
+      kernel_config = tokamax_kda.TokamaxKDAKernel.Config(
+          lower_bound=_LOWER_BOUND, max_num_segments=max_num_segments
+      )
+    kernel = kernel_config.build()
     doc_ids_BS = None
     segment_ids_BS = None
     if positions is not None:
@@ -271,6 +275,30 @@ class TokamaxKDATest(base_device_test.BaseAcceleratorDeviceTest):
         bounds=bounds,
     )
 
+  def test_fused_kernel_k3_shape_matches_reference(self):
+    """``fused_kda.FusedKDAKernel`` (kernels/kda.py), K3 heads, bf16."""
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Pallas kernels are TPU-only.")
+    from torchtitan.experiments.tpu.kimi_k3 import fused_kda  # pylint: disable=g-import-not-at-top
+
+    torch.manual_seed(0)
+    inputs = _make_kernel_inputs(
+        2, 4096, 96, 128, torch.bfloat16, self.accelerator_device
+    )
+    positions = _positions(
+        ((1000, 37, 2048, 700, 311), (1500, 2596)), row1_offset=311
+    )
+    # The fused kernels keep the gate gradient chain in ~fp32 (TPU7x: every
+    # tensor <= 3.0e-3), tighter than Tokamax's _BF16_BOUNDS.
+    self._compare_kernel(
+        "fused_k3_4096x2_bfloat16",
+        inputs,
+        positions,
+        heads=[0, 33, 66, 95],
+        bounds=dict(default=1e-2),
+        kernel_config=fused_kda.FusedKDAKernel.Config(lower_bound=_LOWER_BOUND),
+    )
+
   @parameterized.named_parameters(
       dict(testcase_name="_all", all_at_bound=True),
   )
@@ -306,17 +334,25 @@ class TokamaxKDATest(base_device_test.BaseAcceleratorDeviceTest):
         bounds=_FP32_BOUNDS,
     )
 
-  def test_layer_matches_reference(self):
+  @parameterized.named_parameters(
+      dict(testcase_name="", override="tokamax_kda_attention"),
+      dict(
+          testcase_name="_pallas_conv_norm",
+          override="tokamax_kda_attention_pallas_conv_norm",
+      ),
+  )
+  def test_layer_matches_reference(self, override: str):
     """Debug-flavor ``TpuKDA`` (via the override) vs an fp64 reference layer.
 
     Checks the plumbing around the kernel: the projections, the per-document
     causal conv (reference: ``F.conv1d`` per document), ``positions`` ->
-    segment ids, the output gate / norm and every parameter gradient.
+    segment ids, the output gate / norm and every parameter gradient, with
+    the reference (XLA) or the Pallas conv and output norm.
     """
     self._require_mosaic_kda()
     torch.manual_seed(0)
     dev = self.accelerator_device
-    tpu_cfg = tokamax_kda.tokamax_kda_attention(
+    tpu_cfg = getattr(tokamax_kda, override)(
         _k3_kda_config("debugmodel"), max_num_segments=8
     )
     self.assertIsInstance(tpu_cfg, tokamax_kda.TpuKDA.Config)
@@ -375,7 +411,8 @@ class TokamaxKDATest(base_device_test.BaseAcceleratorDeviceTest):
 
     results = {k: _errors(actual[k], e) for k, e in expected.items()}
     logging.info(
-        "KDA_NUMERICS %s", json.dumps({"case": "layer_debug_bf16", **results})
+        "KDA_NUMERICS %s",
+        json.dumps({"case": f"layer_debug_bf16{override}", **results}),
     )
     for key, err in results.items():
       self.assertTrue(torch.isfinite(actual[key]).all().item(), msg=key)

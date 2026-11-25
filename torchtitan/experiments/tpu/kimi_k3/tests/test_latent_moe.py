@@ -47,6 +47,7 @@ from torchtitan.models import kimi_k3
 from torchtitan.models.kimi_k3.moe import KimiLatentMoE
 
 _OVERRIDE = "torchtitan.experiments.tpu.kimi_k3.latent_moe.tpu_latent_moe"
+_GMM_GLU_OVERRIDE = _OVERRIDE + "_gmm_glu"
 _EP = 8
 # Relative L2 bound vs the fp64 reference. The experts run in BF16 whatever
 # the layer dtype (as upstream's), so fp32 layers are bounded like bf16 ones.
@@ -226,11 +227,16 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
 
   def _require_tpu(self) -> None:
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
-      self.skipTest("MegaBlox grouped matmul needs a TPU.")
+      self.skipTest("The Pallas grouped matmuls need a TPU.")
 
-  def test_override_replaces_every_latent_moe(self):
+  @parameterized.named_parameters(
+      dict(testcase_name="", override=_OVERRIDE, kernel="megablox"),
+      dict(testcase_name="_gmm_glu", override=_GMM_GLU_OVERRIDE,
+           kernel="gmm_glu"),
+  )
+  def test_override_replaces_every_latent_moe(self, override, kernel):
     model_cfg = kimi_k3.model_registry("Kimi-K3").model
-    override = (_OVERRIDE, {"ep_capacity_factor": 2.0})
+    override = (override, {"ep_capacity_factor": 2.0})
     replaced = apply_overrides(OverrideConfig(imports=[override]), model_cfg)
     moes = [layer.moe for layer in model_cfg.layers if layer.moe]
     self.assertLen(moes, 92)
@@ -247,6 +253,7 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
           (routed.inner_experts.beta, routed.inner_experts.linear_beta),
           (4.0, 25.0),
       )
+      self.assertEqual(routed.inner_experts.pallas_grouped_mm_kernel, kernel)
       dispatcher = routed.token_dispatcher
       self.assertIs(type(dispatcher), TpuAllToAllTokenDispatcher.Config)
       self.assertEqual(
@@ -261,15 +268,21 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
       # and top-16, with 32 experts so the fp64 reference fits in memory.
       dict(testcase_name="_k3dims_bf16", flavor="Kimi-K3",
            dtype=torch.bfloat16, num_experts=32, top_k=16, tokens=1024),
+      dict(testcase_name="_debug_bf16_gmm_glu", flavor="debugmodel",
+           dtype=torch.bfloat16, num_experts=32, top_k=4, tokens=2048,
+           override=_GMM_GLU_OVERRIDE),
+      dict(testcase_name="_k3dims_bf16_gmm_glu", flavor="Kimi-K3",
+           dtype=torch.bfloat16, num_experts=32, top_k=16, tokens=1024,
+           override=_GMM_GLU_OVERRIDE),
   )
   def test_layer_matches_reference(
-      self, flavor, dtype, num_experts, top_k, tokens
+      self, flavor, dtype, num_experts, top_k, tokens, override=_OVERRIDE
   ):
     """Output, dx and every parameter gradient; training-mode bookkeeping."""
     self._require_tpu()
     dev = self.accelerator_device
     cfg = _moe_config(
-        flavor, _OVERRIDE, num_experts=num_experts, top_k=top_k
+        flavor, override, num_experts=num_experts, top_k=top_k
     )
     layer = _build_layer(cfg, seed=0)
     params64 = _params64(layer, dtype)
@@ -301,22 +314,27 @@ class LatentMoETest(base_device_test.BaseAcceleratorDeviceTest):
     expected = _run_reference(params64, x, ids_TK, grad_out, cfg)
     results = {k: _errors(actual[k], e) for k, e in expected.items()}
     results["routing_agreement"] = agree
-    _log("MOE_NUMERICS", f"single_{flavor}_{str(dtype)[6:]}", results)
+    _log(
+        "MOE_NUMERICS",
+        f"single_{flavor}_{str(dtype)[6:]}_{override.rsplit('.', 1)[1]}",
+        results,
+    )
     for key, e in expected.items():
       self.assertTrue(torch.isfinite(actual[key]).all().item(), msg=key)
       self.assertLess(results[key]["rel_l2"], _BOUND, msg=f"{key}: {results}")
 
-  def test_rows_past_the_groups_are_ignored(self):
+  @parameterized.parameters(_OVERRIDE, _GMM_GLU_OVERRIDE)
+  def test_rows_past_the_groups_are_ignored(self, override):
     """Rows outside every expert group (capacity padding) never leak.
 
-    MegaBlox leaves those output rows uninitialized; the AG/RS dispatcher
+    The grouped matmul may leave those output rows unset; the AG/RS dispatcher
     depends on the experts producing correct rows inside the groups and on
     the padding rows' input gradient being dropped.
     """
     self._require_tpu()
     dev = self.accelerator_device
     cfg = _moe_config(
-        "debugmodel", _OVERRIDE, num_experts=4, top_k=1
+        "debugmodel", override, num_experts=4, top_k=1
     ).routed_experts.inner_experts
     torch.manual_seed(0)
     experts = cfg.build()
