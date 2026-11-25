@@ -473,6 +473,62 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
           got.cpu(), want, rtol=5e-2, atol=5e-2, msg=name
       )
 
+  @parameterized.parameters(128, 192)
+  def test_scale_rounds_q_once(self, head_dim):
+    """q is scaled by the exact softmax scale in FP32 and rounded once; dq too.
+
+    So a call with ``scale`` equals, bitwise, a call with scale 1 on that
+    rounded q, with its dq scaled in FP32 and rounded once. Head dims whose
+    ``head_dim ** -0.5`` is not a bf16 value (128, 192) catch a scale rounded
+    to bf16 first (``bf16(192 ** -0.5)`` is 0.135% high).
+    """
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Tokamax Splash kernels are TPU-only.")
+    device = self.accelerator_device
+    torch.manual_seed(13)
+    b, s, h = 1, 256, 2
+    scale = head_dim**-0.5
+    q, k, v, g = (
+        torch.randn(b, s, h, head_dim, dtype=torch.bfloat16, device=device)
+        for _ in range(4)
+    )
+    q_scaled = (q.float() * scale).bfloat16()
+
+    def run(q_in, scale_in):
+      q_in, k_in, v_in = (x.clone().requires_grad_() for x in (q_in, k, v))
+      out = tokamax_splash_attention.splash_sdpa(
+          q_in, k_in, v_in, is_causal=True, scale=scale_in
+      )
+      out.backward(g)
+      return out, q_in.grad, k_in.grad, v_in.grad
+
+    out, dq, dk, dv = run(q, scale)
+    out1, dq1, dk1, dv1 = run(q_scaled, 1.0)
+    want = (out1, (dq1.float() * scale).bfloat16(), dk1, dv1)
+    got_all = (out, dq, dk, dv)
+    for name, got, expected in zip(("out", "dq", "dk", "dv"), got_all, want):
+      torch.testing.assert_close(
+          got.detach().cpu(), expected.detach().cpu(), rtol=0, atol=0, msg=name
+      )
+
+  def test_rejects_bad_inputs(self):
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Tokamax Splash kernels are TPU-only.")
+    device = self.accelerator_device
+    q = torch.zeros(1, 256, 4, 128, dtype=torch.bfloat16, device=device)
+    kv = torch.zeros(1, 256, 3, 128, dtype=torch.bfloat16, device=device)
+    with self.assertRaisesRegex(ValueError, "multiple of n_kv_heads"):
+      tokamax_splash_attention.splash_sdpa(q, kv, kv, enable_gqa=True)
+    with self.assertRaisesRegex(ValueError, "segment_ids"):
+      tokamax_splash_attention.splash_sdpa(
+          q,
+          q,
+          q,
+          segment_ids=torch.zeros(1, 128, dtype=torch.int32, device=device),
+      )
+    with self.assertRaisesRegex(ValueError, "dtypes differ"):
+      tokamax_splash_attention.splash_sdpa(q, q, q.float())
+
   def test_gpu_available(self):
     device = self.accelerator_device
     self.assertEqual(device.type, "tpu")

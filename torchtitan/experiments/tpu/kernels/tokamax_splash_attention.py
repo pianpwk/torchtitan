@@ -102,8 +102,14 @@ def _make_splash_attention_fn(
     kv_seq_len: int | None = None,
     num_stacked_q_heads: int = 1,
     use_batch_loop_fwd: bool = False,
+    scale: float | None = None,
 ):
   """Create JAX splash attention forward and backward functions using Tokamax.
+
+  ``scale`` is the softmax scale (default ``1 / sqrt(head_dim)``). It is
+  applied to q in FP32 and rounded to q's dtype once: rounding the scale
+  itself to bf16 first would bias every logit (``bf16(192 ** -0.5)`` is 0.13%
+  high).
 
   Returns:
     (splash_fn, splash_bwd_fn): forward function taking (q, k, v) returning
@@ -198,17 +204,32 @@ def _make_splash_attention_fn(
         cp_rank,
     )
 
+  def _q_scale(q):
+    return scale if scale is not None else 1.0 / math.sqrt(q.shape[-1])
+
+  def _scale_q(x):
+    """``x * scale`` rounded to x's dtype once (scale applied in FP32)."""
+    scale_q = _q_scale(x)
+    if float(np.asarray(scale_q, x.dtype)) == scale_q:
+      # Exact in x's dtype (head_dim 64, 256): the product is rounded once
+      # either way, and a multiply in x's dtype keeps XLA's fusion of it into
+      # the kernel input.
+      return x * jnp.asarray(scale_q, x.dtype)
+    # TODO: at 128 heads XLA turns this FP32 convert and q's transpose into
+    # one FP32 copy (+4% Splash forward at head_dim 192); an
+    # optimization_barrier after the transpose avoids it but costs +1.6% at
+    # head_dim 128 / 64 heads.
+    return (x.astype(jnp.float32) * scale_q).astype(x.dtype)
+
   @jax.jit
   def splash_fn(q, k, v, segment_ids=None, cp_rank=None):
     """Forward: returns (out, logsumexp) for the whole batch."""
-    head_dim = q.shape[-1]
-    scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
-    q_scaled = q * scale
+    q_scaled = _scale_q(q)
     fwd_mask_info_sliced = _slice_mask_info(fwd_mask_info, cp_size, cp_rank)
 
     def _single_fwd_with_lse(q_b, k_b, v_b, segment_ids_b):
       """Forward for one batch element; returns (out_b, logsumexp_b)."""
-      # q_b is already scaled (q * 1/sqrt(head_dim)) from the caller.
+      # q_b is already scaled by the softmax scale.
       # pylint: disable=protected-access
       out_b, stats_b = splash_attention_kernel._splash_attention_forward(
           fwd_mask_info_sliced,
@@ -247,10 +268,8 @@ def _make_splash_attention_fn(
 
   @jax.jit
   def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None, cp_rank=None):
-    """Backward: uses saved (out, logsumexp) — no extra forward pass."""
-    head_dim = q.shape[-1]
-    scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
-    q_scaled = q * scale
+    """Backward: uses saved (out, logsumexp) -- no extra forward pass."""
+    q_scaled = _scale_q(q)
     dkv_mask_info_sliced = _slice_mask_info(dkv_mask_info, cp_size, cp_rank)
 
     def _single_bwd(
@@ -303,10 +322,37 @@ def _make_splash_attention_fn(
         scan_xs += (segment_ids,)
       _, (dq_scaled, dk, dv) = jax.lax.scan(_scan_bwd_body, None, scan_xs)
     # Chain rule: q_scaled = q * scale  =>  dq = dq_scaled * scale
-    dq = dq_scaled * scale
+    dq = _scale_q(dq_scaled)
     return dq, dk, dv
 
   return splash_fn, splash_bwd_fn
+
+
+def _validate_inputs(q, k, v, segment_ids):
+  """Static checks the Tokamax kernels would otherwise fail on obscurely."""
+  if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+    raise ValueError(
+        "splash attention expects q, k, v as [batch, seq, heads, head_dim],"
+        f" got {q.shape}, {k.shape}, {v.shape}"
+    )
+  if not q.shape[0] == k.shape[0] == v.shape[0]:
+    raise ValueError(f"batch sizes differ: {q.shape}, {k.shape}, {v.shape}")
+  if k.shape[:3] != v.shape[:3]:
+    raise ValueError(f"k {k.shape} and v {v.shape} must match up to head_dim")
+  if k.shape[-1] != q.shape[-1]:
+    raise ValueError(f"q / k head_dims differ: {q.shape[-1]} vs {k.shape[-1]}")
+  if q.shape[2] % k.shape[2]:
+    raise ValueError(
+        f"n_heads ({q.shape[2]}) must be a multiple of n_kv_heads"
+        f" ({k.shape[2]})"
+    )
+  if not q.dtype == k.dtype == v.dtype:
+    raise ValueError(f"q, k, v dtypes differ: {q.dtype}, {k.dtype}, {v.dtype}")
+  if segment_ids is not None and segment_ids.shape != (k.shape[0], k.shape[1]):
+    raise ValueError(
+        f"segment_ids must be [batch, kv_seq_len] = {(k.shape[0], k.shape[1])},"
+        f" got {segment_ids.shape}"
+    )
 
 
 def jax_attention_fwd(
@@ -343,6 +389,7 @@ def jax_attention_fwd(
   _kernel_config_args) so they are part of the jax_op compile-cache key.
   """
   del use_transposed_bwd  # backward only
+  _validate_inputs(q, k, v, segment_ids)
   seq_len = q.shape[1]
   kv_seq_len = k.shape[1]
   n_heads = q.shape[2]
@@ -382,12 +429,8 @@ def jax_attention_fwd(
       v_layout=v_layout,
       num_stacked_q_heads=num_stacked_q_heads,
       use_batch_loop_fwd=use_batch_loop_fwd,
+      scale=scale,
   )
-
-  # Apply scaling inside the compiled JAX pipeline
-  default_scale = 1.0 / math.sqrt(q.shape[-1])
-  if abs(scale - default_scale) > 1e-6:
-    q_tr = q_tr * (scale / default_scale)
 
   out_tr, logsumexp = splash_fn(q_tr, k_tr, v_tr, segment_ids, cp_rank)
 
@@ -428,21 +471,6 @@ def _transposed_bwd_unsupported_reason(
     # TPU7x shape sweep: 0.51-0.90x Tokamax's best backward config.
     return "with one q head per kv head the Tokamax backward is faster"
   return splash_tbwd.unsupported_reason(q.shape, k.shape, v.shape, q.dtype)
-
-
-def _forward_q_scale(q: jax.Array, scale: float) -> float:
-  """The softmax scale as the forward applies it to q, before the Tokamax kernel.
-
-  jax_attention_fwd multiplies q by scale / default_scale when the scale is not
-  the default, then splash_fn by 1 / sqrt(head_dim); both constants are rounded
-  to q.dtype (bf16(1/sqrt(128)) is 1.1e-4 below the exact value). XLA fuses the
-  two multiplies and rounds q once, so their product (exact in f32) is enough.
-  """
-  default_scale = 1.0 / math.sqrt(q.shape[-1])
-  q_scale = float(np.asarray(default_scale, dtype=q.dtype))
-  if abs(scale - default_scale) > 1e-6:
-    q_scale *= float(np.asarray(scale / default_scale, dtype=q.dtype))
-  return q_scale
 
 
 @functools.cache
@@ -508,10 +536,10 @@ def jax_attention_bwd(
   if use_transposed_bwd and tbwd_reason is None:
     # Tokamax's logsumexp residual is in the log2 domain splash_tbwd takes
     # (SplashConfig.use_base2_exp, the default). splash_tbwd rounds q as the
-    # forward does to rebuild P from it, so P matches the saved lse.
+    # forward does (q * scale in FP32, rounded once) to rebuild P from it, so
+    # P matches the saved lse.
     return splash_tbwd.transposed_attention_bwd(
-        q, k, v, out, logsumexp, grad_out, segment_ids,
-        q_scale=_forward_q_scale(q, scale),
+        q, k, v, out, logsumexp, grad_out, segment_ids, q_scale=scale,
     )
 
   # 1. Transpose/Squeeze inputs inside JAX
@@ -548,21 +576,12 @@ def jax_attention_bwd(
       v_layout=v_layout,
       num_stacked_q_heads=num_stacked_q_heads,
       use_batch_loop_fwd=use_batch_loop_fwd,
+      scale=scale,
   )
-
-  default_scale = 1.0 / math.sqrt(q.shape[-1])
-  if abs(scale - default_scale) > 1e-6:
-    q_tr = q_tr * (scale / default_scale)
 
   dq_tr, dk_tr, dv_tr = splash_bwd_fn(
       q_tr, k_tr, v_tr, out_tr, logsumexp, grad_out_tr, segment_ids, cp_rank
   )
-
-  # Chain rule for the q pre-scaling above: splash_bwd_fn returns the
-  # gradient wrt the SCALED q, so a non-default scale needs the same
-  # ratio applied to dq (without it, dq is off by default_scale/scale).
-  if abs(scale - default_scale) > 1e-6:
-    dq_tr = dq_tr * (scale / default_scale)
 
   # Transpose/Expand back to original PyTorch layouts
   dq = jnp.transpose(dq_tr, (0, 2, 1, 3))
