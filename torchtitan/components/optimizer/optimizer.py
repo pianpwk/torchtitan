@@ -53,6 +53,7 @@ def build_dist_muon(
     *,
     compute_sharding_by_fqn: Mapping[str, ComputeLayout],
     bucket_configs: Sequence[BucketConfig],
+    optimizer_cls: type[DistMuon] = DistMuon,
     **kwargs: Any,
 ) -> DistMuon:
     """Build FlexShard ``DistMuon`` with one transport mesh per bucket.
@@ -62,6 +63,8 @@ def build_dist_muon(
     ``BucketConfig.mesh`` unset; each bucket's transport mesh is built from the
     storage layout of its first redistributed parameter (e.g. ``dp_shard_tp``
     under FSDP x TP). The NCCL CTA cap is not supported here.
+    ``optimizer_cls`` selects a ``DistMuon`` subclass (e.g. a backend's
+    captured variant).
     """
     param_groups = tuple(params)
     named_parameters = [
@@ -89,7 +92,7 @@ def build_dist_muon(
                 break
         transports.append(transport)
     meshes = build_transport_meshes(transports, max_ctas=None)
-    return DistMuon(
+    return optimizer_cls(
         param_groups,
         compute_sharding_by_fqn=compute_sharding_by_fqn,
         bucket_configs=tuple(
