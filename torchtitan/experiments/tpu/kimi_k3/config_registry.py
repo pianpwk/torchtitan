@@ -1,5 +1,7 @@
 """TPU recipes for Kimi K3 (text only) on the TPU GraphTrainer."""
 
+import dataclasses
+
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -19,6 +21,9 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.kimi_k3 import model_registry
+from torchtitan.experiments.tpu.kimi_k3.attention_residual import (
+    use_tpu_attention_residual,
+)
 from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
@@ -85,3 +90,77 @@ def graph_trainer_kimi_k3_tiny() -> TpuGraphTrainer.Config:
       memory_policy="full",
   )
   return cfg
+
+
+# Benchmark recipes use every K3 KDA kernel option (see the kimi_k3 module
+# docstring): the Pallas output norm, with the Tokamax or the fused KDA
+# kernel.
+_PALLAS_TOKAMAX_KDA = (
+    f"{_OVERRIDES}.tokamax_kda.tokamax_kda_attention_pallas_norm",
+    {"max_num_segments": 8},
+)
+_FUSED_KDA = f"{_OVERRIDES}.fused_kda.fused_kda_attention"
+
+
+def _graph_trainer_kimi_k3_slice(
+    flavor: str, *, kda_override: str | tuple = _PALLAS_TOKAMAX_KDA
+) -> TpuGraphTrainer.Config:
+  """A K3-width ``k3_slice_*`` flavor for comm / memory benchmarks.
+
+  Eight packed 4096-token rows (32,768 tokens) per data-parallel rank and
+  microbatch; pass ``--training.num_tokens_per_microbatch_per_dp_rank
+  16384`` for half of that. Balanced forced routing (see the flavor)
+  and Ring-of-Experts at capacity factor 1.0; full rematerialization, the
+  whole step as one compiled executable, AdamW eager. The K3 kernel options
+  are on: ``kda_override`` (Tokamax KDA with the Pallas output norm, or the
+  fused KDA) and the TPU attention residual.
+  """
+  cfg = graph_trainer_kimi_k3_tiny()
+  seq_len = 4096
+  tokens = 8 * seq_len
+  cfg.model_spec = dataclasses.replace(
+      graph_trainer_model_registry(flavor), max_context_length=seq_len
+  )
+  use_tpu_attention_residual(cfg.model_spec.model)
+  cfg.override.imports = [
+      kda_override,
+      f"{_OVERRIDES}.tokamax_mla.tokamax_mla_attention",
+      (f"{_OVERRIDES}.latent_moe.tpu_latent_moe", {"ep_capacity_factor": 1.0}),
+  ]
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = tokens
+  cfg.training.steps = 8
+  # Balanced round-robin routing. The trainer sets every router's
+  # ``_debug_force_load_balance`` from this field when it finalizes the model
+  # config, so a flag set in the flavor alone is overwritten with False.
+  cfg.debug.moe_force_load_balance = True
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e448() -> TpuGraphTrainer.Config:
+  """``k3_slice_e448``: 56 experts per core on EP8."""
+  return _graph_trainer_kimi_k3_slice("k3_slice_e448")
+
+
+def graph_trainer_kimi_k3_slice_e896() -> TpuGraphTrainer.Config:
+  """``k3_slice_e896``: 56 experts per core on EP16."""
+  return _graph_trainer_kimi_k3_slice("k3_slice_e896")
+
+
+def graph_trainer_kimi_k3_deep8_e448() -> TpuGraphTrainer.Config:
+  """``k3_deep8_e448``: eight layers in K3's KDA:MLA mix, EP8."""
+  return _graph_trainer_kimi_k3_slice("k3_deep8_e448")
+
+
+def graph_trainer_kimi_k3_deep8_e896() -> TpuGraphTrainer.Config:
+  """``k3_deep8_e896``: eight layers in K3's KDA:MLA mix, EP16."""
+  return _graph_trainer_kimi_k3_slice("k3_deep8_e896")
+
+
+def graph_trainer_kimi_k3_slice_e64() -> TpuGraphTrainer.Config:
+  """``k3_slice_e64``: small expert count for debugging on 2x2x1."""
+  return _graph_trainer_kimi_k3_slice("k3_slice_e64")
+
+
+def graph_trainer_kimi_k3_deep8_e448_fused_kda() -> TpuGraphTrainer.Config:
+  """``k3_deep8_e448`` with the fused Pallas KDA kernels (``fused_kda.py``)."""
+  return _graph_trainer_kimi_k3_slice("k3_deep8_e448", kda_override=_FUSED_KDA)
