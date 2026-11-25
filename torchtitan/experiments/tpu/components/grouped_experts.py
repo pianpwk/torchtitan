@@ -119,8 +119,11 @@ class TpuGroupedExperts(GroupedExperts):
         # Tokamax's gmm_v2 / tgmm_v2, which align M tiles to expert groups and
         # pick their own tiles: the ``pallas_grouped_mm_tile_*`` and
         # ``*_tgmm_tiling`` fields don't apply to it. It has no paired W1/W3
-        # or FP8 variant.
-        pallas_grouped_mm_kernel: Literal["megablox", "gmm_v2"] = "megablox"
+        # or FP8 variant. "gmm_glu" runs W1/W3 and the SwiGLU as one fused
+        # gmm_v2-based kernel (silu activation only) and W2 on gmm_v2.
+        pallas_grouped_mm_kernel: Literal["megablox", "gmm_v2", "gmm_glu"] = (
+            "megablox"
+        )
         pallas_grouped_mm_tile_m: int = 1024
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
@@ -226,15 +229,23 @@ class TpuGroupedExperts(GroupedExperts):
                 f" {self.activation!r}"
             )
 
-        if self.pallas_grouped_mm_kernel == "gmm_v2" and (
+        if self.pallas_grouped_mm_kernel != "megablox" and (
             not self.use_pallas_grouped_mm
             or self.use_pallas_paired_grouped_mm
             or self.use_fp8_grouped_mm
         ):
             raise ValueError(
-                "pallas_grouped_mm_kernel='gmm_v2' requires"
-                " use_pallas_grouped_mm without the paired or FP8 grouped"
-                " matmul"
+                f"pallas_grouped_mm_kernel={self.pallas_grouped_mm_kernel!r}"
+                " requires use_pallas_grouped_mm without the paired or FP8"
+                " grouped matmul"
+            )
+        if (
+            self.pallas_grouped_mm_kernel == "gmm_glu"
+            and self.activation != "silu"
+        ):
+            raise ValueError(
+                "pallas_grouped_mm_kernel='gmm_glu' supports only the silu"
+                f" activation, got {self.activation!r}"
             )
 
         if self.use_pallas_paired_grouped_mm:
@@ -514,7 +525,7 @@ class TpuGroupedExperts(GroupedExperts):
                 max(1, tiling[0])
                 for tiling in (*self.fp8_w13_tilings, *self.fp8_w2_tilings)
             )
-        elif self.pallas_grouped_mm_kernel == "gmm_v2":
+        elif self.pallas_grouped_mm_kernel != "megablox":
             # gmm_v2 takes any row count; its backward pads for tgmm_v2.
             row_tiles = (1,)
         else:
@@ -563,14 +574,24 @@ class TpuGroupedExperts(GroupedExperts):
             return self._fp8_experts_forward(
                 x_bf16, w1_EKN, w2_EKN, w3_EKN, fp8_tokens_per_expert_E
             )[:num_rows].type_as(x_RD)
-        if self.pallas_grouped_mm_kernel == "gmm_v2":
-            # Imported lazily, like the FP8 kernels: it pulls in tokamax.
+        if self.pallas_grouped_mm_kernel != "megablox":
+            # Imported lazily, like the FP8 kernels: they pull in tokamax.
             from torchtitan.experiments.tpu.kernels import (
+                gmm_glu,
                 gmm_v2_segment_matmul,
             )
 
             grouped_mm_v2 = gmm_v2_segment_matmul.grouped_mm_v2
             group_sizes_E = num_tokens_per_expert_E.to(torch.int32)
+        if self.pallas_grouped_mm_kernel == "gmm_glu":
+            hidden_RF = gmm_glu.grouped_glu(
+                x_bf16,
+                w1_EKN.bfloat16(),
+                w3_EKN.bfloat16(),
+                group_sizes_E,
+                act=gmm_glu.SwiGLU(),
+            )
+        elif self.pallas_grouped_mm_kernel == "gmm_v2":
             gate_RF = grouped_mm_v2(
                 x_bf16, w1_EKN.bfloat16(), group_sizes_E, False
             )
@@ -609,14 +630,15 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
             )
-        hidden_RF = self._activation_fn(gate_RF) * up_RF
+        if self.pallas_grouped_mm_kernel != "gmm_glu":
+            hidden_RF = self._activation_fn(gate_RF) * up_RF
         if row_scale_R is not None:
             if pad_rows:
                 row_scale_R = F.pad(row_scale_R, (0, pad_rows))
             hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
                 hidden_RF.dtype
             )
-        if self.pallas_grouped_mm_kernel == "gmm_v2":
+        if self.pallas_grouped_mm_kernel != "megablox":
             out_RD = grouped_mm_v2(
                 hidden_RF,
                 w2_EKN.bfloat16(),
