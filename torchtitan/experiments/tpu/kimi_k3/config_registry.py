@@ -197,6 +197,9 @@ def graph_trainer_kimi_k3_full93_e896_fused_kda() -> TpuGraphTrainer.Config:
   fused Pallas KDA kernels and host offload of the saved layer boundaries."""
   cfg = _graph_trainer_kimi_k3_slice("k3_full93_e896", kda_override=_FUSED_KDA)
   cfg.compile.memory_policy = "full_and_offload"
+  return cfg
+
+
 # Mesh axes a dense K3 parameter can be stored on: SimpleFSDP's ``fsdp`` (FSDP2
 # names it ``dp_shard``) and ``tp``. Layout axes absent from a parameter's mesh
 # are ignored, so one layout covers FSDP and FSDP x TP.
