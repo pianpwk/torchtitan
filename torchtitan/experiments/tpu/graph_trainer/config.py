@@ -106,6 +106,11 @@ class GraphSplitterConfig:
   # and waited on at once (seen when they share a SparseCore with the
   # executable's gradient reduce-scatters). Values unchanged.
   prefetched_gathers_under_attention: bool = False
+  # Keep routed-expert weight gathers in their own executable (forward
+  # parameter prefetch and backward fsdp_pipeline "ag" move only the other
+  # gathers): in-executable they get the kernel-native layout with no boundary
+  # copy. Pair with expert_all_gathers_under_attention to issue them early.
+  prefetch_skip_expert_gathers: bool = False
   # Backward gradient reductions with a smaller unreduced input (norm weights)
   # run in the last backward executable instead of with their layer. In
   # place, each is a synchronous all-reduce over every rank, so each layer
