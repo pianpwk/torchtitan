@@ -56,8 +56,8 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
     is_reduce_scatter,
     op_name,
 )
-from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gathers_under_splash import (
-    apply_expert_all_gathers_under_splash,
+from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gathers import (
+    apply_expert_all_gathers_under_attention,
 )
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
   HostDonorSpec,
@@ -334,8 +334,8 @@ class GraphSplitter:
     if not self.enabled:
       raise RuntimeError("GraphSplitter is disabled")
 
-    if self.config.expert_all_gathers_under_splash:
-      apply_expert_all_gathers_under_splash(traced.gm)
+    if self.config.expert_all_gathers_under_attention:
+      apply_expert_all_gathers_under_attention(traced.gm)
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
     # Host-slot recurrence belongs to the top-level forward signature, whether

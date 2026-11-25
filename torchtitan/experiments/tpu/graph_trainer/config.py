@@ -107,11 +107,12 @@ class GraphSplitterConfig:
   # reload pair relative to its first consumer.
   cpu_offload_prefetch_executables: int = 0
   # Join each layer's gathered MoE weights (FSDP all-gathers under ``moe``)
-  # with its Splash attention output in an optimization barrier, so they
-  # finish while attention runs instead of queueing on the SparseCore behind
-  # the routed-token gathers. Values are unchanged. Applies to layers that
-  # have both an MoE and Splash; raises if no layer does.
-  expert_all_gathers_under_splash: bool = False
+  # with its attention kernel output (Splash, or Kimi K3's KDA) in an
+  # optimization barrier, so they finish while attention runs instead of
+  # queueing on the SparseCore behind the routed-token gathers. Values are
+  # unchanged. Applies to layers that have both an MoE and such a kernel;
+  # raises if no layer does.
+  expert_all_gathers_under_attention: bool = False
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``
