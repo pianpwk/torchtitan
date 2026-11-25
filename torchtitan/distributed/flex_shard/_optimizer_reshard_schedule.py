@@ -847,10 +847,26 @@ def _build_packed_all_to_all_schedule(
         for routes in routes_by_parameter
     )
 
+    # Equal splits: every (source, destination) segment is padded to the
+    # largest pair in the group, so all ranks run the same dense all-to-all
+    # with the same buffer sizes. Every participant derives the same pair
+    # sizes from the global routes, so no communication is needed.
+    split_stride = None
+    if _requires_equal_all_to_all_splits(process_group):
+        pair_numel: dict[tuple[int, int], int] = {}
+        for transfers in transfers_by_parameter:
+            for source, destination, source_region, _region in transfers:
+                pair_numel[source, destination] = (
+                    pair_numel.get((source, destination), 0) + source_region.numel
+                )
+        split_stride = max(pair_numel.values(), default=0)
+
     input_split_sizes = []
     input_spans = []
     input_cursor = 0
-    for destination in participants:
+    for destination_index, destination in enumerate(participants):
+        if split_stride is not None:
+            input_cursor = destination_index * split_stride
         split_start = input_cursor
         for parameter_index, transfers in enumerate(transfers_by_parameter):
             for (
@@ -865,12 +881,16 @@ def _build_packed_all_to_all_schedule(
                     (parameter_index, _PackedSpan(source_region, input_cursor))
                 )
                 input_cursor += source_region.numel
-        input_split_sizes.append(input_cursor - split_start)
+        input_split_sizes.append(
+            input_cursor - split_start if split_stride is None else split_stride
+        )
 
     output_split_sizes = []
     output_spans = []
     output_cursor = 0
-    for source in participants:
+    for source_index, source in enumerate(participants):
+        if split_stride is not None:
+            output_cursor = source_index * split_stride
         split_start = output_cursor
         for parameter_index, transfers in enumerate(transfers_by_parameter):
             for (
@@ -885,7 +905,9 @@ def _build_packed_all_to_all_schedule(
                     (parameter_index, _PackedSpan(destination_region, output_cursor))
                 )
                 output_cursor += destination_region.numel
-        output_split_sizes.append(output_cursor - split_start)
+        output_split_sizes.append(
+            output_cursor - split_start if split_stride is None else split_stride
+        )
 
     return _PackedAllToAllSchedule(
         process_group=process_group,
@@ -905,6 +927,20 @@ def _build_packed_all_to_all_schedule(
             output_spans, len(redistribution_plans)
         ),
     )
+
+
+def _requires_equal_all_to_all_splits(process_group: dist.ProcessGroup) -> bool:
+    """Whether to pad every ``all_to_all_single`` split to one size.
+
+    TorchTPU lowers uneven ``all_to_all_single`` to a ragged all-to-all that
+    needs the same buffer size on every rank and coordinates offsets through
+    the c10d store on every call. Owner-based Muon gathers are uneven by
+    construction (the owner receives a whole matrix, the others receive
+    nothing), so TPU pads every split to the largest pair and runs the dense,
+    equal-split all-to-all instead.
+    TODO: Drop once TorchTPU supports asymmetric ragged all-to-all buffers.
+    """
+    return "tpu" in str(dist.get_backend(process_group))
 
 
 def _device_mesh_ranks(mesh: DeviceMesh) -> tuple[int, ...]:

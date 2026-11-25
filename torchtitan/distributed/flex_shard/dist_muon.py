@@ -39,6 +39,7 @@ from ._optimizer_reshard_schedule import (
     _ParticipantPartition,
     _RedistributionGroup,
     _RedistributionPlan,
+    _requires_equal_all_to_all_splits,
     _tensor_region_intersection,
     _TensorRegion,
     _validate_bucket_plans_across_ranks,
@@ -1234,12 +1235,25 @@ def _assign_balanced_compute_regions(
         (load, 0, cumulative_loads[position] + load)
         for position, load in enumerate(bucket_loads)
     ]
+    # Preferring a rank that already stores part of a chunk saves bytes on a
+    # packed all-to-all, but on an equal-split one (TPU) it concentrates many
+    # chunks with the same storage rows (e.g. head h of every layer) on one
+    # holder, and every rank's buffer grows with the largest (source,
+    # destination) pair. There, spread chunks by load, bytes and cumulative
+    # load only.
+    prefer_stored = not _requires_equal_all_to_all_splits(group.process_group)
     assignments: list[list[_ComputeRegionMapping]] = [[] for _layout in compute_layouts]
     for job in sorted(
         jobs, key=lambda entry: (-entry.cost, -entry.num_bytes, entry.stable_key)
     ):
         *_key, position = min(
-            (load, -stored_numel, num_bytes, cumulative, position)
+            (
+                load,
+                -stored_numel if prefer_stored else 0,
+                num_bytes,
+                cumulative,
+                position,
+            )
             for position, ((load, num_bytes, cumulative), stored_numel) in enumerate(
                 zip(loads, job.stored_numel_by_position, strict=True)
             )
