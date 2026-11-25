@@ -559,7 +559,9 @@ def graph_trainer_kimi_k3_deep8_e896_dist_muon() -> TpuGraphTrainer.Config:
   return cfg
 
 
-def _with_spmd_dist_muon_flags(cfg: TpuGraphTrainer.Config) -> None:
+def _with_spmd_dist_muon_flags(
+    cfg: TpuGraphTrainer.Config, *, check_two_ranks: bool = False
+) -> None:
   """TPU flags ``SpmdDistMuon`` needs (see ``_k3_dist_muon_optimizer``).
 
   * Async all-to-all: XLA's TPU all-to-all is synchronous by default, so
@@ -568,11 +570,28 @@ def _with_spmd_dist_muon_flags(cfg: TpuGraphTrainer.Config) -> None:
     programs: the startup check compares the captured program's collective
     order across ranks. This process's rank is read from torchrun's ``RANK``
     because XLA latches the dump flags before the trainer exists.
+
+  ``check_two_ranks`` dumps and compares only on rank 0 and the first rank of
+  the last host (torchrun's ``WORLD_SIZE`` / ``LOCAL_WORLD_SIZE``), for
+  full-slice runs where a dump on every rank costs too much host disk. A rank
+  whose environment already sets an XLA dump (e.g. a launcher's full dump)
+  keeps it; the check picks the DistMuon programs out of it.
   """
-  rank = os.environ.get("RANK", "0")
+  rank = int(os.environ.get("RANK", "0"))
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, xla_tpu_enable_async_all_to_all=True
   )
+  if check_two_ranks:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    last_host = world_size - int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    check_ranks = tuple(sorted({0, last_host}))
+    cfg.optimizer.optimizer_factory_kwargs_by_name["SpmdDistMuon"][
+        "collective_check_ranks"
+    ] = check_ranks
+    if rank not in check_ranks or "--xla_dump_to" in os.environ.get(
+        "XLA_FLAGS", ""
+    ):
+      return
   cfg.xla_flags = tpu_flags.merge_flags(
       cfg.xla_flags,
       xla_dump_to=f"/tmp/spmd_dist_muon_xla_dump/r{rank}",
@@ -633,4 +652,36 @@ def graph_trainer_kimi_k3_deep8_e896_spmd_dist_muon() -> TpuGraphTrainer.Config:
       cfg.model_spec.model, spmd_expert_bucket_size=2
   )
   _with_spmd_dist_muon_flags(cfg)
+  return cfg
+
+
+def graph_trainer_kimi_k3_full93_e896_fused_kda_spmd_dist_muon(
+) -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_full93_e896_fused_kda`` with DistMuon, routed
+  experts captured in ``SpmdDistMuon``, dense matrices eager (``by_layer``).
+
+  Expert buckets hold eight same-shape tensors: at EP16 x eFSDP64 (8x8x8,
+  TP1) eight tensors of 56 local experts split into equal runs of seven
+  experts per eFSDP rank (two would give 1.75). 92 MoE layers give 23 w1 / w3
+  buckets and 11 w2 buckets plus one remainder of four w2 tensors, which runs
+  eagerly. The collective check dumps on two ranks only.
+  """
+  cfg = graph_trainer_kimi_k3_full93_e896_fused_kda()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, spmd_expert_bucket_size=8
+  )
+  _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon_two_rank_check(
+) -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon`` with the collective
+  check on two ranks only (as in the full93 recipe), for a 128-rank check of
+  that path before a full-slice run."""
+  cfg = graph_trainer_kimi_k3_deep8_e448()
+  cfg.optimizer = _k3_dist_muon_optimizer(
+      cfg.model_spec.model, spmd_expert_bucket_size=2
+  )
+  _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
   return cfg
