@@ -256,6 +256,20 @@ class _BucketWork(Generic[_ItemT]):
     compute_fragment_buffer: Tensor
 
 
+def _stream_device_module(device: torch.device) -> ModuleType:
+    """Device module whose streams and events order the transfer pipeline.
+
+    TorchTPU runs every op on one deferred stream and exposes no public
+    multi-stream API, so TPU uses ``torch.cpu``'s no-op streams and events, the
+    same single-stream path DistMuon takes on the host. XLA schedules the
+    collectives asynchronously within the compiled programs.
+    TODO: Use ``torch.accelerator`` streams once TorchTPU implements them.
+    """
+    if device.type == "tpu":
+        return torch.cpu
+    return torch.get_device_module(device)
+
+
 @dataclass(slots=True)
 class _CommunicationContext:
     device_handle: ModuleType
@@ -267,7 +281,7 @@ class _CommunicationContext:
         cls,
         device: torch.device,
     ) -> _CommunicationContext:
-        device_handle = torch.get_device_module(device)
+        device_handle = _stream_device_module(device)
         with device_handle.stream(device_handle.current_stream(device)):
             transfer_stream = device_handle.Stream(priority=0)
 
@@ -350,7 +364,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         device_handle = (
             context.device_handle
             if context is not None
-            else torch.get_device_module(self._device)
+            else _stream_device_module(self._device)
         )
         compute_stream = device_handle.current_stream(self._device)
         local_requirements: dict[_BufferKey, _BufferRequirements] = {}
@@ -445,7 +459,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         handle = (
             context.device_handle
             if context is not None
-            else torch.get_device_module(self._device)
+            else _stream_device_module(self._device)
         )
         caller = handle.current_stream(self._device)
         self._local_slot.allocate()
