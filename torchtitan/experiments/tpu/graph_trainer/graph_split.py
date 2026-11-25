@@ -745,6 +745,11 @@ def _collect_backward_collective_owners(
   }
   for launch, role in roles.items():
     if role is None:
+      # Token traffic annotated "EP" (Ring-of-Experts' all-gather /
+      # reduce-scatter) is activation traffic, not FSDP: it stays with its
+      # inputs.
+      if "EP" in (launch.meta.get("custom") or {}):
+        continue
       # Without a recognized gradient reduction there is no FSDP group to
       # tell CP traffic apart by, so keep the strict check.
       on_fsdp_group = (

@@ -3,8 +3,11 @@
 The model config comes from ``experiments.tpu.kimi_k3.model_registry``; the
 recipes swap in the TPU KDA, MLA and LatentMoE layers through
 ``override.imports``. ``parallelize_kimi_k3`` follows upstream GraphTrainer's
-``parallelize_deepseekv3`` (``model.parallelize``, SimpleFSDP, compile) plus
-the TPU SimpleFSDP policy of ``graph_trainer/deepseek_v3.py``.
+``parallelize_deepseekv3`` (``model.parallelize`` for the declared EP
+layout, SimpleFSDP, compile) plus the TPU SimpleFSDP policy of
+``graph_trainer/deepseek_v3.py``. Upstream's ``apply_simple_fsdp`` shards the
+routed experts on the expert-FSDP mesh only inside ``TransformerBlock``\\ s,
+and ``KimiK3TransformerBlock`` is not one, so the experts are sharded here.
 """
 
 import dataclasses
@@ -24,6 +27,7 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
+    annotate_moe_ep_regions,
     apply_simple_fsdp,
     get_simple_fsdp_mesh,
 )
@@ -60,6 +64,41 @@ class GraphTrainerKimiK3Model(KimiK3Model):
   def init_states(self, *, buffer_device: torch.device | None = None) -> None:
     with disable_active_parametrization():
       super().init_states(buffer_device=buffer_device)
+
+
+def _shard_routed_experts(
+    model: GraphTrainerKimiK3Model,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+) -> None:
+  """SimpleFSDP for the EP-sharded experts on the expert-FSDP mesh.
+
+  The K3 counterpart of the ``TransformerBlock`` loop in upstream's
+  ``apply_simple_fsdp``; it runs first, so that call skips these modules.
+  """
+  edp_mesh = parallel_dims.get_optional_mesh(["efsdp"])
+  assert edp_mesh is not None
+  mp_policy = MixedPrecisionPolicy(
+      param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+      reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+  )
+  for block in model.layers.values():
+    if block.moe is None:
+      continue
+    routed = block.moe.routed_experts
+    # Shard the expert dim only when it splits evenly over expert FSDP (56
+    # local experts over 16 or 64 eFSDP ranks do not); otherwise dim 1 (the
+    # latent / hidden dim of the kernel-native weights).
+    num_local_experts = routed.inner_experts.num_experts // parallel_dims.ep
+    shard_dim = 1 if num_local_experts % edp_mesh.size() else 0
+    routed.inner_experts = data_parallel(
+        routed.inner_experts,
+        edp_mesh,
+        "fully_shard",
+        mp_policy=mp_policy,
+        shard_dim=shard_dim,
+        non_dp_mesh=parallel_dims.get_optional_mesh("ep"),
+    )
 
 
 # FSDP placement of the K3 dense parameters whose dim 0 does not divide an FSDP
@@ -166,7 +205,7 @@ def parallelize_kimi_k3(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
-  """Applies SimpleFSDP and GraphTrainer compile to text-only K3."""
+  """Applies EP, SimpleFSDP and GraphTrainer compile to text-only K3."""
   # GraphTrainer recomputes per `compile.memory_policy`.
   del ac_config
   # The TPU registry has no pipelining_fn; CP is not wired for KDA / MLA.
@@ -174,15 +213,17 @@ def parallelize_kimi_k3(
     raise NotImplementedError("TPU GraphTrainer K3 does not support CP or PP.")
   if parallel_dims.tp_enabled:
     raise ValueError("TP is not supported for TPU K3 yet.")
-  if parallel_dims.ep_enabled:
-    raise NotImplementedError("TPU GraphTrainer K3 does not support EP.")
-  # `_apply_k3_fsdp_placements` replicates over the FSDP mesh only.
+  # `_shard_routed_experts` and `_apply_k3_fsdp_placements` use the FSDP
+  # meshes only.
   if parallel_dims.dp_replicate_enabled:
     raise NotImplementedError("TPU GraphTrainer K3 does not support HSDP.")
+  annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
   model.parallelize(parallel_dims)
   configure_simple_fsdp_shard_dims(model, parallel_dims)
+  if parallel_dims.ep_enabled:
+    _shard_routed_experts(model, parallel_dims, training)
   _apply_k3_fsdp_placements(model, parallel_dims, training)
   model = apply_simple_fsdp(
       model, parallel_dims=parallel_dims, training=training
