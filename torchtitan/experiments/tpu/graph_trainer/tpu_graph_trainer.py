@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 import logging
 import os
+import time
 from typing import Any, cast, NamedTuple
 
 import torch
@@ -58,8 +59,11 @@ from torchtitan.experiments.tpu.graph_trainer.graph_split import (
 from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     PASS_PIPELINE_REGISTRY,
+    configure_async_compile,
     construct_tpu_transform_passes,
+    pop_compile_call_seconds,
     register as register_tpu_pipeline,
+    wait_for_pending_compiles,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
@@ -568,6 +572,9 @@ class TpuGraphTrainer(GraphTrainer):
             self._step_output_modules = _step_output_modules(model)
             for module in self._step_output_modules:
                 module.emit_step_output = True
+            configure_async_compile(self.config.compile.async_compile_workers)
+            pop_compile_call_seconds()
+            t_trace = time.perf_counter()
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
@@ -599,6 +606,7 @@ class TpuGraphTrainer(GraphTrainer):
                         global_valid_tokens,
                         extra_kwargs,
                     )
+            t_transform = time.perf_counter()
             if self.config.compile.enable_passes:
                 if self._graph_splitter.enabled:
                     # Remat and FSDP transforms annotate the joint graph and must
@@ -626,6 +634,30 @@ class TpuGraphTrainer(GraphTrainer):
                 self._traced_step.gm = self._graph_splitter.split_and_compile(
                     self._traced_step
                 )
+            t_wait = time.perf_counter()
+            n_async = wait_for_pending_compiles()
+            t_done = time.perf_counter()
+            compile_call = pop_compile_call_seconds()
+            if n_async:
+                logger.info(
+                    f"[tpu_backend_pass] StaticCompiler ready: {n_async} async "
+                    f"executables in {t_done - t_wait:.1f}s after submission"
+                )
+            # compile_submit is the time inside StaticCompiler calls: the whole
+            # compile when synchronous, graph passes and submission when async.
+            # transform_split excludes it.
+            logger.info(
+                "[tpu_compile_phases] trace=%.1fs transform_split=%.1fs "
+                "compile_submit=%.1fs compile_wait=%.1fs total=%.1fs "
+                "(async_compile_workers=%d, async executables=%d)",
+                t_transform - t_trace,
+                t_wait - t_transform - compile_call,
+                compile_call,
+                t_done - t_wait,
+                t_done - t_trace,
+                self.config.compile.async_compile_workers,
+                n_async,
+            )
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
                 inputs,

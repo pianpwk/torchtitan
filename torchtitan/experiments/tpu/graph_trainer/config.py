@@ -205,6 +205,12 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+  # Number of executables StaticCompiler compiles concurrently on each rank.
+  # 0 compiles each executable synchronously as it is produced. N > 0 submits
+  # every compile to a pool of N threads and waits for all of them before the
+  # first step executes. Each XLA compile already uses several host cores, so
+  # the useful width is bounded by host cores divided by ranks per host.
+  async_compile_workers: int = 0
 
 
 def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:
