@@ -13,10 +13,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+from torchtitan.components.optimizer.optimizer import build_dist_muon
 from torchtitan.distributed.flex_shard import (
     BlockShard,
     BucketConfig,
-    build_dist_muon,
     ComputeLayout,
     dist_muon,
 )
@@ -54,15 +54,16 @@ class TestMuonPlanConstruction(unittest.TestCase):
             patch.object(_BucketedRedistributionRuntime, "reserve_buffers"),
             patch.object(
                 dist_muon,
-                "_build_parameter_redistribution_plan",
-                wraps=dist_muon._build_parameter_redistribution_plan,
+                "_build_region_redistribution_plan",
+                wraps=dist_muon._build_region_redistribution_plan,
             ) as build_plan,
         ):
             build_dist_muon(
                 [{"params": params, "param_names": names}],
                 compute_sharding_by_fqn={
                     name: ComputeLayout(
-                        {"dp_shard": BlockShard(dim=0, block_size=matrix_rows)}
+                        {"dp_shard": BlockShard(dim=0, block_sizes=(matrix_rows,))},
+                        compute_dtype=torch.bfloat16,
                     )
                     for name in names
                 },
