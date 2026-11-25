@@ -1,4 +1,5 @@
-"""Tests Tokamax's Mosaic KDA GatedDeltaNet kernels against the XLA path."""
+"""Tests the Tokamax Mosaic (and, at module level, the fused) KDA GatedDeltaNet
+kernels against the XLA path."""
 
 import contextlib
 import copy
@@ -13,6 +14,7 @@ from torchtitan.experiments.tpu.distributed import accelerator_device_type as de
 from torchtitan.experiments.tpu.kernels import pallas_vmem
 from torchtitan.experiments.tpu.testing import base_device_test
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
+from torchtitan.experiments.tpu.qwen3_5 import fused_gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
@@ -519,23 +521,36 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         5e-2,
     )
 
-  def test_gated_delta_net_module_matches_xla(self):
+  @parameterized.named_parameters(("_tokamax", "tokamax"), ("_fused", "fused"))
+  def test_gated_delta_net_module_matches_xla(self, kernel: str):
     """Tests full 35B TpuGatedDeltaNet (conv, GQA, gates, norm) vs XLA."""
-    self._require_mosaic_kda()
+    if kernel == "tokamax":
+      self._require_mosaic_kda()
+      kernel_cfg = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
+          min_log_decay=-5.0
+      )
+      # The XLA fallback is the reference itself.
+      no_xla_fallback = contextlib.nullcontext()
+    else:
+      if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+        self.skipTest("The fused KDA kernels need a TPU.")
+      kernel_cfg = fused_gated_delta.FusedGatedDeltaKernel.Config()
+      no_xla_fallback = mock.patch.object(
+          gated_delta.TpuGatedDeltaKernel, "forward", side_effect=AssertionError
+      )
 
     torch.manual_seed(0)
     dev = self.accelerator_device
     base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=256).model
     xla_cfg = copy.deepcopy(base_cfg.layers[0].delta_net)
     tok_cfg = copy.deepcopy(xla_cfg)
-    tok_cfg.inner_gated_delta_net.kernel = (
-        tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(min_log_decay=-5.0)
-    )
+    tok_cfg.inner_gated_delta_net.kernel = kernel_cfg
 
     xla_gdn = xla_cfg.build()
     xla_gdn.init_states(buffer_device=torch.device("cpu"))
-    # Keep decays above the -5 clamp (`exp(A_log) <= 0.5`) so XLA and Tokamax
-    # evaluate the exact same mathematical function across all parameters.
+    # Keep decays above the -5 clamp (`exp(A_log) <= 0.5`) so XLA and the
+    # kernel evaluate the exact same mathematical function across all
+    # parameters.
     with torch.no_grad():
       xla_gdn.A_log.uniform_(-3.0, -0.7)
       xla_gdn.dt_bias.uniform_(-0.5, 0.5)
@@ -570,7 +585,8 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
       return out, x_in.grad, grads
 
     expected_out, expected_dx, expected_grads = run_module(xla_gdn)
-    actual_out, actual_dx, actual_grads = run_module(tok_gdn)
+    with no_xla_fallback:
+      actual_out, actual_dx, actual_grads = run_module(tok_gdn)
 
     self.assertLess(_relative_l2_error(actual_out, expected_out), 1.5e-2)
     self.assertLess(_relative_l2_error(actual_dx, expected_dx), 1.5e-2)
