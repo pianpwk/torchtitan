@@ -77,11 +77,14 @@ class TpuKimiGroupedExperts(TpuGroupedExperts):
 
 @override(
     target=KimiLatentMoE.Config,
-    exact=True,
     description="Kimi K3 LatentMoE on TPU grouped experts.",
 )
 def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
-  """K3 LatentMoE with TPU gmm_v2 experts and the TPU dispatcher."""
+  """K3 LatentMoE with TPU gmm_v2 experts and the TPU dispatcher.
+
+  The MoE keeps its config type: ``KimiLatentMoE`` or
+  ``QuantileBalancedKimiLatentMoE`` (``quantile_balance.py``).
+  """
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
     raise ValueError(
@@ -90,7 +93,7 @@ def tpu_latent_moe(cfg: KimiLatentMoE.Config) -> KimiLatentMoE.Config:
     )
   return derive(
       cfg,
-      KimiLatentMoE.Config,
+      type(cfg),
       routed_experts=derive(
           routed,
           type(routed),
