@@ -33,7 +33,8 @@ def graph_trainer_kimi_k3_tiny() -> TpuGraphTrainer.Config:
   One packed 4096-token row per step (``c4_test``, documents kept apart in
   KDA and MLA), AdamW with FP32 master weights and BF16 compute, full
   rematerialization, the whole step (forward, loss, backward) as one compiled
-  executable.
+  executable. With ``--parallelism.expert_parallel_degree`` > 1 the routed
+  experts use Ring-of-Experts at capacity factor 1.0.
   """
   seq_len = 4096
   base = TPUTrainerConfig(
@@ -72,7 +73,7 @@ def graph_trainer_kimi_k3_tiny() -> TpuGraphTrainer.Config:
       (f"{_OVERRIDES}.tokamax_kda.tokamax_kda_attention",
        {"max_num_segments": 8}),
       f"{_OVERRIDES}.tokamax_mla.tokamax_mla_attention",
-      f"{_OVERRIDES}.latent_moe.tpu_latent_moe",
+      (f"{_OVERRIDES}.latent_moe.tpu_latent_moe", {"ep_capacity_factor": 1.0}),
   ]
   cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
       base, graph_trainer_model_registry
