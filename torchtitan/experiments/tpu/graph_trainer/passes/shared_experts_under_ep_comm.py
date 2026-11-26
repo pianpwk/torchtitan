@@ -209,6 +209,41 @@ def _reach(
   return seen
 
 
+class _CycleError(Exception):
+  pass
+
+
+class _Edit:
+  """One window's barriers and rewired inputs, reverted if they close a cycle."""
+
+  def __init__(self, gm: torch.fx.GraphModule):
+    self.gm = gm
+    self.inserted: list[torch.fx.Node] = []
+    self.rewired: list[tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node]] = []
+
+  def barrier(self, values: list[torch.fx.Node], tag: str) -> list[torch.fx.Node]:
+    outputs = _barrier(self.gm, values, tag)
+    self.inserted += [outputs[0].args[0], *outputs]
+    return outputs
+
+  def rewire(self, user: torch.fx.Node, old: torch.fx.Node, new: torch.fx.Node) -> None:
+    user.replace_input_with(old, new)
+    self.rewired.append((user, old, new))
+
+  def commit(self, what: str) -> bool:
+    """Re-sort the graph; on a cycle undo this edit, log it and return False."""
+    try:
+      _stable_topological_sort(self.gm)
+      return True
+    except _CycleError as e:
+      for user, old, new in reversed(self.rewired):
+        user.replace_input_with(new, old)
+      for node in reversed(self.inserted):
+        self.gm.graph.erase_node(node)
+      logger.warning("%s: skipped (would create a cycle): %s", what, str(e)[:300])
+      return False
+
+
 def _stable_topological_sort(gm: torch.fx.GraphModule) -> None:
   """Reorder nodes topologically, keeping the current order where allowed."""
   nodes = list(gm.graph.nodes)
@@ -234,7 +269,7 @@ def _stable_topological_sort(gm: torch.fx.GraphModule) -> None:
       path.append(node)
       node = next(i for i in node.all_input_nodes if i in stuck)
     cycle = path[seen[node]:]
-    raise AssertionError(
+    raise _CycleError(
         f"{_TAG} created a cycle: "
         + " <- ".join(f"{n.name}[{n.meta.get(_TAG, '')}]" for n in cycle[:40])
     )
@@ -347,13 +382,14 @@ def apply_shared_experts_under_ep_comm(
         for n in segment:
           seg_down |= _reach(n, upstream=False, order=order, bound=bound)
         ext_in = [i for i in ext_in if i not in seg_down]
+      edit = _Edit(gm)
       gate = [coll_in, *(i for i in ext_in if i is not coll_in)]
       if len(gate) > 1:
-        start = _barrier(gm, gate, f"{tag}_start")
+        start = edit.barrier(gate, f"{tag}_start")
         for value, gated in zip(gate, start):
           for user in list(value.users):
             if user in seg:
-              user.replace_input_with(value, gated)
+              edit.rewire(user, value, gated)
       outs = [
           n for n in segment if _is_tensor(n) and any(u not in seg for u in n.users)
       ]
@@ -362,10 +398,12 @@ def apply_shared_experts_under_ep_comm(
       # other users too would make them wait for the collective, a cycle when
       # one of them feeds the collective's input.
       consumers = [u for u in coll_out.users if _group(u) == group]
-      end = _barrier(gm, [coll_out, *outs], f"{tag}_end")
+      end = edit.barrier([coll_out, *outs], f"{tag}_end")
       for user in consumers:
-        user.replace_input_with(coll_out, end[0])
-      _stable_topological_sort(gm)
+        edit.rewire(user, coll_out, end[0])
+      if not edit.commit(f"{_TAG} {tag}"):
+        skipped += 1
+        continue
       pinned += 1
 
   if not pinned:
@@ -449,15 +487,18 @@ def apply_routing_metadata_under_ep_comm(
       continue
     tag = f"meta_{meta.name}"
     gate = [coll_in, *(i for i in meta.all_input_nodes if _is_tensor(i) and i.op != "placeholder" and i is not coll_in)]
+    edit = _Edit(gm)
     if len(gate) > 1:
-      start = _barrier(gm, gate, f"{tag}_start")
+      start = edit.barrier(gate, f"{tag}_start")
       for value, gated in zip(gate[1:], start[1:]):
-        meta.replace_input_with(value, gated)
+        edit.rewire(meta, value, gated)
     consumers = [u for u in coll_out.users if _group(u) == _group(meta)]
-    end = _barrier(gm, [coll_out, *outs], f"{tag}_end")
+    end = edit.barrier([coll_out, *outs], f"{tag}_end")
     for user in consumers:
-      user.replace_input_with(coll_out, end[0])
-    _stable_topological_sort(gm)
+      edit.rewire(user, coll_out, end[0])
+    if not edit.commit(f"routing_metadata_under_ep_comm {tag}"):
+      skipped += 1
+      continue
     pinned += 1
   if not pinned:
     raise ValueError(
@@ -525,12 +566,15 @@ def apply_combine_transpose_gather_early(
     if not anchors:
       skipped += 1
       continue
-    gated = _barrier(gm, [coll_in, *anchors], f"L{layer}_dy_early")
+    edit = _Edit(gm)
+    gated = edit.barrier([coll_in, *anchors], f"L{layer}_dy_early")
     for value, out in zip(anchors, gated[1:]):
       for user in list(value.users):
         if _is_recomputed(user) and _get_layer_id(user) == layer:
-          user.replace_input_with(value, out)
-    _stable_topological_sort(gm)
+          edit.rewire(user, value, out)
+    if not edit.commit(f"combine_transpose_gather_early L{layer}"):
+      skipped += 1
+      continue
     pinned += 1
   if not pinned:
     raise ValueError(
