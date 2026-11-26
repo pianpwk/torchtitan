@@ -32,11 +32,13 @@ A "layer copy" is a layer's forward (one group) or its backward executable
 floating-point token all-gathers / reduce-scatters of at least
 ``_MIN_WINDOW_NUMEL`` elements, except the backward's dispatch-transpose
 reduce-scatters (they return token gradients at the end of the layer, after
-the shared-expert backward is needed anyway). With EP token chunking only the
-first window of each kind is used per phase (the first dispatch all-gather and
-the last combine reduce-scatter of the forward / recompute, the first
-transposed all-gather of the backward): the chunks hide the others under each
-other's expert GEMMs.
+the shared-expert backward is needed anyway). Per phase only the first
+all-gather and the last reduce-scatter are used. With EP token chunking the
+chunks hide the other exchanges under each other's expert GEMMs, and the
+forward / recompute phase's first window is the first all-gather of every
+chunk (one start barrier on all their inputs, one end barrier per gather):
+the scheduler runs whichever chunk is unconstrained first, so pinning into a
+single chunk's gather leaves the gather that runs first empty.
 
 A window is skipped (and logged) when pinning it would create a cycle: when a
 segment node is upstream of the collective's input or downstream of its result
@@ -63,7 +65,6 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
     collect_collective_chains,
     is_gather,
     is_reduce_scatter,
-    op_name,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _is_recomputed,
@@ -95,9 +96,15 @@ def _is_tensor(node: torch.fx.Node) -> bool:
 
 def _matmul_flops(node: torch.fx.Node) -> int:
   target = node.target
-  if not (
-      isinstance(target, torch._ops.OpOverload) and target.name() in _MATMULS
-  ):
+  if not isinstance(target, torch._ops.OpOverload):
+    return 0
+  if target.name() == "aten::linear_backward":
+    # (input, grad_output, weight, output_mask): dInput and dWeight each cost
+    # 2 * input.numel() * out_features.
+    x, _, weight, mask = node.args[:4]
+    per_grad = 2 * x.meta["val"].numel() * weight.meta["val"].shape[0]
+    return per_grad * sum(bool(m) for m in mask[:2])
+  if target.name() not in _MATMULS:
     return 0
   out = node.meta.get("val")
   lhs = node.args[1] if target.name() == "aten::addmm" else node.args[0]
@@ -246,16 +253,19 @@ class _Edit:
     user.replace_input_with(old, new)
     self.rewired.append((user, old, new))
 
+  def revert(self) -> None:
+    for user, old, new in reversed(self.rewired):
+      user.replace_input_with(new, old)
+    for node in reversed(self.inserted):
+      self.gm.graph.erase_node(node)
+
   def commit(self, what: str) -> bool:
     """Re-sort the graph; on a cycle undo this edit, log it and return False."""
     try:
       _stable_topological_sort(self.gm)
       return True
     except _CycleError as e:
-      for user, old, new in reversed(self.rewired):
-        user.replace_input_with(new, old)
-      for node in reversed(self.inserted):
-        self.gm.graph.erase_node(node)
+      self.revert()
       logger.warning("%s: skipped (would create a cycle): %s", what, str(e)[:300])
       return False
 
@@ -333,106 +343,138 @@ def apply_shared_experts_under_ep_comm(
     ):
       shared[group].append(node)
 
-  pinned, skipped = 0, 0
-  for group, group_launches in sorted(launches.items()):
-    nodes = shared.get(group)
-    if not nodes:
-      continue
-    windows = _select_windows(group_launches)
-    segments = _segments(nodes, len(windows))
-    logger.info(
-        "%s L%d%s: windows %s; %d shared nodes, segment sizes %s",
-        _TAG,
-        group[0],
-        "b" if group[1] else "f",
-        [
-            "+".join(f"{n.name}:{tuple(n.args[0].meta['val'].shape)}" for n in w)
-            for w in windows
-        ],
-        len(nodes),
-        [len(s) for s in segments],
-    )
-    for k, (window, segment) in enumerate(zip(windows, segments)):
-      if not segment:
+  def pin(sort_each: bool) -> tuple[int, int, list[_Edit]]:
+    """Pin every window. ``sort_each`` re-sorts the graph after each window
+    and skips a window that would close a cycle; otherwise the graph is sorted
+    once by the caller (one sort instead of one per window: minutes at full
+    depth)."""
+    pinned, skipped, edits = 0, 0, []
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    for group, group_launches in sorted(launches.items()):
+      nodes = shared.get(group)
+      if not nodes:
         continue
-      seg = set(segment)
-      ends = [_window_ends(launch) for launch in window]
-      coll_ins = list(dict.fromkeys(i for i, _ in ends))
-      coll_outs = [o for _, o in ends]
-      tag = f"L{group[0]}{'b' if group[1] else 'f'}w{k}"
-      order = {n: i for i, n in enumerate(gm.graph.nodes)}
-      first = min(order[n] for n in segment)
-      last = max(order[n] for n in segment)
-      # The segment must not feed the collective's input (the start barrier
-      # would close a cycle) nor read anything downstream of its result (the
-      # end barrier would).
-      upstream: set[torch.fx.Node] = set()
-      downstream: set[torch.fx.Node] = set()
-      for coll_in in coll_ins:
-        upstream |= _reach(coll_in, upstream=True, order=order, bound=first)
-      for coll_out in coll_outs:
-        downstream |= _reach(coll_out, upstream=False, order=order, bound=last)
-      bad = [n for n in segment if n in upstream or n in downstream]
-      if bad:
-        logger.warning(
-            "%s: skipping window %s (%s): %d segment nodes are %s it, e.g. %s",
-            _TAG,
-            tag,
-            [launch.name for launch in window],
-            len(bad),
-            "upstream of" if bad[0] in upstream else "downstream of",
-            [n.name for n in bad[:4]],
-        )
-        skipped += 1
-        continue
-      ext_in = list(
-          dict.fromkeys(
-              i
-              for n in segment
-              for i in n.all_input_nodes
-              # Activations only: gating one input of each matmul is enough,
-              # and parameters / FSDP-gathered weights stay off the barrier.
-              if i not in seg
-              and _is_tensor(i)
-              and i.op != "placeholder"
-              and i not in in_chain
-          )
+      windows = _select_windows(group_launches)
+      segments = _segments(nodes, len(windows))
+      logger.info(
+          "%s L%d%s: windows %s; %d shared nodes, segment sizes %s",
+          _TAG,
+          group[0],
+          "b" if group[1] else "f",
+          [
+              "+".join(f"{n.name}:{tuple(n.args[0].meta['val'].shape)}" for n in w)
+              for w in windows
+          ],
+          len(nodes),
+          [len(s) for s in segments],
       )
-      # An outside input computed from the segment itself (segment -> other
-      # window's node -> segment) already starts after the segment; gating it
-      # would close a cycle through the start barrier.
-      if ext_in:
-        bound = max(order[i] for i in ext_in)
-        seg_down: set[torch.fx.Node] = set()
-        for n in segment:
-          seg_down |= _reach(n, upstream=False, order=order, bound=bound)
-        ext_in = [i for i in ext_in if i not in seg_down]
-      edit = _Edit(gm)
-      gate = [*coll_ins, *(i for i in ext_in if i not in coll_ins)]
-      if len(gate) > 1:
-        start = edit.barrier(gate, f"{tag}_start")
-        for value, gated in zip(gate, start):
-          for user in list(value.users):
-            if user in seg:
-              edit.rewire(user, value, gated)
-      outs = [
-          n for n in segment if _is_tensor(n) and any(u not in seg for u in n.users)
-      ]
-      # Only the collective's consumers read through the end barrier: that
-      # alone orders the segment before them. Rewiring the segment outputs'
-      # other users too would make them wait for the collective, a cycle when
-      # one of them feeds the collective's input.
-      # One end barrier per collective: a chunk's consumers wait for the
-      # segment and their own gather, not for the other chunks' gathers.
-      for j, coll_out in enumerate(coll_outs):
-        consumers = [u for u in coll_out.users if _group(u) == group]
-        end = edit.barrier([coll_out, *outs], f"{tag}_end{j}")
-        for user in consumers:
-          edit.rewire(user, coll_out, end[0])
-      if not edit.commit(f"{_TAG} {tag}"):
-        skipped += 1
-        continue
-      pinned += 1
+      for k, (window, segment) in enumerate(zip(windows, segments)):
+        if not segment:
+          continue
+        seg = set(segment)
+        ends = [_window_ends(launch) for launch in window]
+        coll_ins = list(dict.fromkeys(i for i, _ in ends))
+        coll_outs = [o for _, o in ends]
+        tag = f"L{group[0]}{'b' if group[1] else 'f'}w{k}"
+        if sort_each:
+          order = {n: i for i, n in enumerate(gm.graph.nodes)}
+        first = min(order[n] for n in segment)
+        last = max(order[n] for n in segment)
+        # The segment must not feed the collective's input (the start barrier
+        # would close a cycle) nor read anything downstream of its result (the
+        # end barrier would).
+        upstream: set[torch.fx.Node] = set()
+        downstream: set[torch.fx.Node] = set()
+        for coll_in in coll_ins:
+          upstream |= _reach(coll_in, upstream=True, order=order, bound=first)
+        for coll_out in coll_outs:
+          downstream |= _reach(coll_out, upstream=False, order=order, bound=last)
+        bad = [n for n in segment if n in upstream or n in downstream]
+        if bad:
+          logger.warning(
+              "%s: skipping window %s (%s): %d segment nodes are %s it, e.g. %s",
+              _TAG,
+              tag,
+              [launch.name for launch in window],
+              len(bad),
+              "upstream of" if bad[0] in upstream else "downstream of",
+              [n.name for n in bad[:4]],
+          )
+          skipped += 1
+          continue
+        ext_in = list(
+            dict.fromkeys(
+                i
+                for n in segment
+                for i in n.all_input_nodes
+                # Activations only: gating one input of each matmul is enough,
+                # and parameters / FSDP-gathered weights stay off the barrier.
+                if i not in seg
+                and _is_tensor(i)
+                and i.op != "placeholder"
+                and i not in in_chain
+            )
+        )
+        # An outside input computed from the segment itself (segment -> other
+        # window's node -> segment) already starts after the segment; gating it
+        # would close a cycle through the start barrier.
+        if ext_in:
+          bound = max(order[i] for i in ext_in)
+          seg_down: set[torch.fx.Node] = set()
+          for n in segment:
+            seg_down |= _reach(n, upstream=False, order=order, bound=bound)
+          ext_in = [i for i in ext_in if i not in seg_down]
+        edit = _Edit(gm)
+        gate = [*coll_ins, *(i for i in ext_in if i not in coll_ins)]
+        if len(gate) > 1:
+          start = edit.barrier(gate, f"{tag}_start")
+          for value, gated in zip(gate, start):
+            for user in list(value.users):
+              if user in seg:
+                edit.rewire(user, value, gated)
+        outs = [
+            n for n in segment if _is_tensor(n) and any(u not in seg for u in n.users)
+        ]
+        # Only the collective's consumers read through the end barrier: that
+        # alone orders the segment before them. Rewiring the segment outputs'
+        # other users too would make them wait for the collective, a cycle when
+        # one of them feeds the collective's input.
+        # One end barrier per collective: a chunk's consumers wait for the
+        # segment and their own gather, not for the other chunks' gathers.
+        for j, coll_out in enumerate(coll_outs):
+          consumers = [u for u in coll_out.users if _group(u) == group]
+          end = edit.barrier([coll_out, *outs], f"{tag}_end{j}")
+          for user in consumers:
+            edit.rewire(user, coll_out, end[0])
+        if sort_each:
+          if not edit.commit(f"{_TAG} {tag}"):
+            skipped += 1
+            continue
+        else:
+          # Not re-sorted yet: place the new nodes just after their latest
+          # input for the next windows' pruned reach.
+          for node in edit.inserted:
+            if node.target is _optimization_barrier:
+              position = max(order[v] for v in node.args) + 0.5
+              for n in (node, *node.users):
+                order[n] = position
+          edits.append(edit)
+        pinned += 1
+
+    return pinned, skipped, edits
+
+  pinned, skipped, edits = pin(sort_each=False)
+  try:
+    _stable_topological_sort(gm)
+  except _CycleError as e:
+    logger.warning(
+        "%s: one-pass pinning closed a cycle (%s); redoing it window by window",
+        _TAG,
+        str(e)[:300],
+    )
+    for edit in reversed(edits):
+      edit.revert()
+    pinned, skipped, _ = pin(sort_each=True)
 
   if not pinned:
     raise ValueError(
@@ -448,173 +490,5 @@ def apply_shared_experts_under_ep_comm(
       skipped,
       time.perf_counter() - t0,
       len(gm.graph.nodes),
-  )
-  return gm
-
-
-def _token_gather_feeding(consumer: torch.fx.Node) -> torch.fx.Node | None:
-  """The large floating-point all-gather an input of ``consumer`` comes from
-  (through views and waits), if any."""
-  stack, seen = list(consumer.all_input_nodes), set()
-  while stack:
-    node = stack.pop()
-    if node in seen or node.op != "call_function":
-      continue
-    seen.add(node)
-    if (
-        is_gather(node)
-        and _is_tensor(node.args[0])
-        and node.args[0].meta["val"].is_floating_point()
-        and node.args[0].meta["val"].numel() >= _MIN_WINDOW_NUMEL
-    ):
-      return node
-    if is_wait_tensor(node) or getattr(node.target, "is_view", False):
-      stack.extend(node.all_input_nodes)
-  return None
-
-
-def apply_routing_metadata_under_ep_comm(
-    gm: torch.fx.GraphModule,
-) -> torch.fx.GraphModule:
-  """Run each Ring-of-Experts routing metadata op under its token all-gather.
-
-  ``tt_moe::roe_routing_metadata`` (expert sort, combine-slot sort, block
-  tables) depends only on the routing ids, but the scheduler runs it on the
-  TensorCore before the token all-gather starts, which then waits with nothing
-  to do. Pin it between that all-gather's start and done (the gather that
-  reads both): start barrier ``(token input, *metadata inputs)``, end barrier
-  ``(token result, *metadata outputs)``. Values pass through.
-  """
-  t0 = time.perf_counter()
-  metas = [n for n in gm.graph.nodes if op_name(n) == "tt_moe::roe_routing_metadata"]
-  pinned, skipped = 0, 0
-  for meta in metas:
-    outs = [u for u in meta.users if u.target is operator.getitem]
-    launch = next(
-        (
-            g
-            for out in outs
-            for user in out.users
-            if (g := _token_gather_feeding(user)) is not None
-        ),
-        None,
-    )
-    if launch is None:
-      skipped += 1
-      continue
-    coll_in, coll_out = _window_ends(launch)
-    seg = {meta, *outs}
-    order = {n: i for i, n in enumerate(gm.graph.nodes)}
-    upstream = _reach(coll_in, upstream=True, order=order, bound=order[meta])
-    downstream = _reach(
-        coll_out, upstream=False, order=order, bound=max(order[n] for n in seg)
-    )
-    if seg & (upstream | downstream):
-      logger.warning("routing_metadata_under_ep_comm: skipping %s", meta.name)
-      skipped += 1
-      continue
-    tag = f"meta_{meta.name}"
-    gate = [coll_in, *(i for i in meta.all_input_nodes if _is_tensor(i) and i.op != "placeholder" and i is not coll_in)]
-    edit = _Edit(gm)
-    if len(gate) > 1:
-      start = edit.barrier(gate, f"{tag}_start")
-      for value, gated in zip(gate[1:], start[1:]):
-        edit.rewire(meta, value, gated)
-    consumers = [u for u in coll_out.users if _group(u) == _group(meta)]
-    end = edit.barrier([coll_out, *outs], f"{tag}_end")
-    for user in consumers:
-      edit.rewire(user, coll_out, end[0])
-    if not edit.commit(f"routing_metadata_under_ep_comm {tag}"):
-      skipped += 1
-      continue
-    pinned += 1
-  if not pinned:
-    raise ValueError(
-        f"routing_metadata_under_ep_comm pinned no metadata op ({len(metas)}"
-        f" found, {skipped} skipped)"
-    )
-  gm.graph.lint()
-  gm.recompile()
-  logger.info(
-      "routing_metadata_under_ep_comm: pinned %d, skipped %d (%.1f s)",
-      pinned,
-      skipped,
-      time.perf_counter() - t0,
-  )
-  return gm
-
-
-def apply_combine_transpose_gather_early(
-    gm: torch.fx.GraphModule,
-) -> torch.fx.GraphModule:
-  """Issue each MoE backward's combine-transpose all-gather before the recompute.
-
-  With the combine output saved (``moe.ep_combine``), the gradient all-gather
-  of the combine (dY) needs only the layer's output gradient and saved values,
-  not the recompute. Join its input with the inputs of the backward
-  executable's first recomputed node in one optimization barrier, so the dY
-  path runs first and its all-gather is in flight during the attention
-  recompute. A layer whose dY still depends on a recomputed value is skipped.
-  Values pass through.
-  """
-  t0 = time.perf_counter()
-  first_gather: dict[int, torch.fx.Node] = {}
-  first_recomputed: dict[int, torch.fx.Node] = {}
-  for node in gm.graph.nodes:
-    if node.op != "call_function" or _get_layer_id(node) == _NOT_IN_LAYERS:
-      continue
-    layer = _get_layer_id(node)
-    if _is_recomputed(node):
-      first_recomputed.setdefault(layer, node)
-    elif (
-        node.meta.get("autograd_backward")
-        and is_gather(node)
-        and "EP" in (node.meta.get("custom") or {})
-        and _is_tensor(node.args[0])
-        and node.args[0].meta["val"].is_floating_point()
-        and node.args[0].meta["val"].numel() >= _MIN_WINDOW_NUMEL
-    ):
-      first_gather.setdefault(layer, node)
-  pinned, skipped = 0, 0
-  for layer, launch in sorted(first_gather.items()):
-    recomputed = first_recomputed.get(layer)
-    if recomputed is None:
-      continue
-    coll_in = launch.args[0]
-    order = {n: i for i, n in enumerate(gm.graph.nodes)}
-    upstream = _reach(coll_in, upstream=True, order=order, bound=order[recomputed])
-    if any(_is_recomputed(n) and _get_layer_id(n) == layer for n in upstream):
-      skipped += 1
-      continue
-    anchors = [
-        i
-        for i in recomputed.all_input_nodes
-        if _is_tensor(i) and not _is_recomputed(i) and i is not coll_in
-    ]
-    if not anchors:
-      skipped += 1
-      continue
-    edit = _Edit(gm)
-    gated = edit.barrier([coll_in, *anchors], f"L{layer}_dy_early")
-    for value, out in zip(anchors, gated[1:]):
-      for user in list(value.users):
-        if _is_recomputed(user) and _get_layer_id(user) == layer:
-          edit.rewire(user, value, out)
-    if not edit.commit(f"combine_transpose_gather_early L{layer}"):
-      skipped += 1
-      continue
-    pinned += 1
-  if not pinned:
-    raise ValueError(
-        "combine_transpose_gather_early pinned no layer (needs the combine"
-        f" output saved, e.g. save_regions moe.ep_combine; {skipped} skipped)"
-    )
-  gm.graph.lint()
-  gm.recompile()
-  logger.info(
-      "combine_transpose_gather_early: pinned %d layers, skipped %d (%.1f s)",
-      pinned,
-      skipped,
-      time.perf_counter() - t0,
   )
   return gm
