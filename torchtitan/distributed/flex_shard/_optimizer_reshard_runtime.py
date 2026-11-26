@@ -98,15 +98,25 @@ def _reserve_tensor(
     return tensor
 
 
+def _fresh_buffers(device: torch.device) -> bool:
+    """Whether buffers are built fresh per use instead of viewing reserved storage.
+
+    A compiled program gets fresh buffers: resizing storage is not traceable,
+    and routing every bucket's exchange through one aliased buffer would
+    serialize the program; the compiler plans this memory itself. TorchTPU
+    eager does too: each write into a slice of a large reserved buffer runs as
+    its own program over the whole buffer (K3 full93 at FSDP1024: 1.5 s of
+    pack / unpack copies per step for five deep8 buckets), while packing with
+    one concatenation and unpacking from views touches only the payload.
+    """
+    return torch.compiler.is_compiling() or device.type == "tpu"
+
+
 def _reserved_view(
     reserved: _ReservedBuffers, name: str, numel: int, key: _BufferKey
 ) -> Tensor:
-    if torch.compiler.is_compiling():
-        # A compiled program gets a fresh buffer per use instead of a view of
-        # the shared reserved storage: resizing storage is not traceable, and
-        # routing every bucket's exchange through one aliased buffer would
-        # serialize the program. The compiler plans this memory itself.
-        device, dtype = key
+    device, dtype = key
+    if _fresh_buffers(device):
         return torch.empty(numel, dtype=dtype, device=device)
     tensor = getattr(reserved, name)
     assert tensor is not None and tensor.numel() >= numel
@@ -212,19 +222,19 @@ class _BufferSlot:
 
     def allocate(self) -> None:
         """Regrow cached tensors on the current caller stream before use."""
-        if torch.compiler.is_compiling():
-            # Compiled runs use fresh in-graph buffers (see _reserved_view).
-            return
         for tensor in self._tensors:
+            if _fresh_buffers(tensor.device):
+                # Fresh buffers per use (see _fresh_buffers).
+                continue
             size = tensor.numel() * tensor.element_size()
             if (storage := tensor.untyped_storage()).nbytes() != size:
                 storage.resize_(size)
 
     def release(self) -> None:
         """Free accelerator storage, retaining host storage and tensor metadata."""
-        if torch.compiler.is_compiling():
-            return
         for tensor in self._tensors:
+            if _fresh_buffers(tensor.device):
+                continue
             if (
                 tensor.device.type != "cpu"
                 and (storage := tensor.untyped_storage()).nbytes()
@@ -693,7 +703,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
             pieces = _prepare_redistributed(
                 plan,
                 slot.buffers,
-                None if torch.compiler.is_compiling() else storage_buffer,
+                None if _fresh_buffers(plan.device) else storage_buffer,
                 prepare=prepare,
             )
             if pieces is not None:
@@ -886,7 +896,7 @@ def _compute_redistributed(
     participant = plan.group.local_participant
     to_compute = plan.storage_to_compute_schedule
     to_storage = plan.compute_to_storage_schedule
-    compiling = torch.compiler.is_compiling()
+    compiling = _fresh_buffers(plan.device)
     returned_fragment_buffer = work.compute_fragment_buffer[
         plan.compute_to_storage_offset :
     ]
@@ -902,21 +912,26 @@ def _compute_redistributed(
         if not math.prod(partition.tensor_shape):
             continue
         received_spans = to_compute.output_spans_by_parameter[index]
-        compute_tensor = slot.compute_buffer(
-            partition.tensor_shape,
-            dtype=plan.compute_dtype,
-            device=plan.device,
-        )
-        compute_views = tuple(
-            _tensor_region_view(compute_tensor, span.region) for span in received_spans
-        )
         received_views = tuple(
             work.compute_fragment_buffer[
                 span.buffer_offset : span.buffer_offset + span.numel
             ].view(span.region.shape)
             for span in received_spans
         )
-        _batched_copy_(compute_views, received_views)
+        compute_tensor = _concatenated_regions(
+            partition.tensor_shape, received_spans, received_views
+        ) if compiling else None
+        if compute_tensor is None:
+            compute_tensor = slot.compute_buffer(
+                partition.tensor_shape,
+                dtype=plan.compute_dtype,
+                device=plan.device,
+            )
+            compute_views = tuple(
+                _tensor_region_view(compute_tensor, span.region)
+                for span in received_spans
+            )
+            _batched_copy_(compute_views, received_views)
 
         compute(item, compute_tensor)
 
@@ -964,21 +979,66 @@ def _finalize_redistributed(
         )
     ):
         partition = redistribution_plan.storage_partition(participant)
-        update = slot.storage_partition_buffer(
-            partition.tensor_shape,
-            dtype=plan.dtype,
-            device=plan.device,
-        )
         spans = schedule.output_spans_by_parameter[index]
-        update_views = tuple(_tensor_region_view(update, span.region) for span in spans)
         packed_views = tuple(
             work.storage_buffer[
                 span.buffer_offset : span.buffer_offset + span.numel
             ].view(span.region.shape)
             for span in spans
         )
-        _batched_copy_(update_views, packed_views)
+        update = (
+            _concatenated_regions(partition.tensor_shape, spans, packed_views)
+            if _fresh_buffers(plan.device)
+            else None
+        )
+        if update is not None:
+            update = update.to(plan.dtype)
+        else:
+            update = slot.storage_partition_buffer(
+                partition.tensor_shape,
+                dtype=plan.dtype,
+                device=plan.device,
+            )
+            update_views = tuple(
+                _tensor_region_view(update, span.region) for span in spans
+            )
+            _batched_copy_(update_views, packed_views)
         finalize(item, update)
+
+
+def _concatenated_regions(
+    shape: tuple[int, ...],
+    spans: Sequence[Any],
+    views: tuple[Tensor, ...],
+) -> Tensor | None:
+    """The tensor of ``shape`` tiled by ``spans``' regions, by one concatenation.
+
+    Returns None unless the regions are slabs along one dimension that tile it
+    in order (then no slice writes are needed); callers copy instead.
+    """
+    regions = [span.region for span in spans]
+    if not regions:
+        return None
+    if len(regions) == 1 and tuple(regions[0].shape) == tuple(shape):
+        return views[0]
+    for dim in range(len(shape)):
+        if any(
+            region.shape[other] != shape[other] or region.offsets[other] != 0
+            for region in regions
+            for other in range(len(shape))
+            if other != dim
+        ):
+            continue
+        order = sorted(range(len(regions)), key=lambda i: regions[i].offsets[dim])
+        cursor = 0
+        for i in order:
+            if regions[i].offsets[dim] != cursor:
+                return None
+            cursor += regions[i].shape[dim]
+        if cursor != shape[dim]:
+            return None
+        return torch.cat([views[i] for i in order], dim=dim)
+    return None
 
 
 def _batched_copy_(
