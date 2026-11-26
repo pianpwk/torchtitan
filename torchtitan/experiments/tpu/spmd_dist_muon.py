@@ -330,6 +330,13 @@ class SpmdCompiledDistMuon(DistMuon):
                 f"{len(self._bucket_plans)} buckets are not rank-symmetric "
                 "and run eagerly"
             )
+            # The eager runtime picks pipeline slots by position among the plans
+            # it runs (only the eager ones here); DistMuon reserved them by
+            # position among all buckets, so an eager bucket could land in a
+            # slot sized for another bucket.
+            self._redistribution_runtime.reserve_buffers(
+                self._eager_plans, local_tensor_spec=self._local_tensor_spec
+            )
         dump_dir = _xla_dump_dir()
         checks_here = (
             collective_check_ranks is None
