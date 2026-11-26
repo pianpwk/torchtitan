@@ -757,6 +757,7 @@ class GraphSplitTest(absltest.TestCase):
             expert_all_gathers_under_attention=False,
             shared_experts_under_ep_comm=False,
             routing_metadata_under_ep_comm=False,
+            combine_transpose_gather_early=False,
         ),
         n_layers=3,
     )
