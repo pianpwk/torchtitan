@@ -659,6 +659,15 @@ def graph_trainer_kimi_k3_deep8_e896_spmd_dist_muon() -> TpuGraphTrainer.Config:
   return cfg
 
 
+def graph_trainer_kimi_k3_full93_e896_fused_kda_dist_muon(
+) -> TpuGraphTrainer.Config:
+  """``graph_trainer_kimi_k3_full93_e896_fused_kda`` with DistMuon (eager,
+  experts too, ``by_layer`` buckets)."""
+  cfg = graph_trainer_kimi_k3_full93_e896_fused_kda()
+  cfg.optimizer = _k3_dist_muon_optimizer(cfg.model_spec.model)
+  return cfg
+
+
 def graph_trainer_kimi_k3_full93_e896_fused_kda_spmd_dist_muon(
 ) -> TpuGraphTrainer.Config:
   """``graph_trainer_kimi_k3_full93_e896_fused_kda`` with DistMuon, routed
