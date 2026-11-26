@@ -96,9 +96,15 @@ def _is_tensor(node: torch.fx.Node) -> bool:
 
 def _matmul_flops(node: torch.fx.Node) -> int:
   target = node.target
-  if not (
-      isinstance(target, torch._ops.OpOverload) and target.name() in _MATMULS
-  ):
+  if not isinstance(target, torch._ops.OpOverload):
+    return 0
+  if target.name() == "aten::linear_backward":
+    # (input, grad_output, weight, output_mask): dInput and dWeight each cost
+    # 2 * input.numel() * out_features.
+    x, _, weight, mask = node.args[:4]
+    per_grad = 2 * x.meta["val"].numel() * weight.meta["val"].shape[0]
+    return per_grad * sum(bool(m) for m in mask[:2])
+  if target.name() not in _MATMULS:
     return 0
   out = node.meta.get("val")
   lhs = node.args[1] if target.name() == "aten::addmm" else node.args[0]
