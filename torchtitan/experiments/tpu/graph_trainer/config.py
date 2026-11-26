@@ -154,6 +154,11 @@ class GraphSplitterConfig:
   # all-gather starts (``passes/shared_experts_under_ep_comm.py``). Values
   # pass through; raises if nothing was pinned.
   routing_metadata_under_ep_comm: bool = False
+  # Join each MoE backward's combine-transpose (dY) all-gather input with the
+  # inputs of the backward's first recomputed node, so that all-gather runs
+  # during the attention recompute. Needs the combine output saved
+  # (save_regions "moe.ep_combine"); raises if no layer qualifies.
+  combine_transpose_gather_early: bool = False
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``

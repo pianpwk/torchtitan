@@ -470,3 +470,76 @@ def apply_routing_metadata_under_ep_comm(
       time.perf_counter() - t0,
   )
   return gm
+
+
+def apply_combine_transpose_gather_early(
+    gm: torch.fx.GraphModule,
+) -> torch.fx.GraphModule:
+  """Issue each MoE backward's combine-transpose all-gather before the recompute.
+
+  With the combine output saved (``moe.ep_combine``), the gradient all-gather
+  of the combine (dY) needs only the layer's output gradient and saved values,
+  not the recompute. Join its input with the inputs of the backward
+  executable's first recomputed node in one optimization barrier, so the dY
+  path runs first and its all-gather is in flight during the attention
+  recompute. A layer whose dY still depends on a recomputed value is skipped.
+  Values pass through.
+  """
+  t0 = time.perf_counter()
+  first_gather: dict[int, torch.fx.Node] = {}
+  first_recomputed: dict[int, torch.fx.Node] = {}
+  for node in gm.graph.nodes:
+    if node.op != "call_function" or _get_layer_id(node) == _NOT_IN_LAYERS:
+      continue
+    layer = _get_layer_id(node)
+    if _is_recomputed(node):
+      first_recomputed.setdefault(layer, node)
+    elif (
+        node.meta.get("autograd_backward")
+        and is_gather(node)
+        and "EP" in (node.meta.get("custom") or {})
+        and _is_tensor(node.args[0])
+        and node.args[0].meta["val"].is_floating_point()
+        and node.args[0].meta["val"].numel() >= _MIN_WINDOW_NUMEL
+    ):
+      first_gather.setdefault(layer, node)
+  pinned, skipped = 0, 0
+  for layer, launch in sorted(first_gather.items()):
+    recomputed = first_recomputed.get(layer)
+    if recomputed is None:
+      continue
+    coll_in = launch.args[0]
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    upstream = _reach(coll_in, upstream=True, order=order, bound=order[recomputed])
+    if any(_is_recomputed(n) and _get_layer_id(n) == layer for n in upstream):
+      skipped += 1
+      continue
+    anchors = [
+        i
+        for i in recomputed.all_input_nodes
+        if _is_tensor(i) and not _is_recomputed(i) and i is not coll_in
+    ]
+    if not anchors:
+      skipped += 1
+      continue
+    gated = _barrier(gm, [coll_in, *anchors], f"L{layer}_dy_early")
+    for value, out in zip(anchors, gated[1:]):
+      for user in list(value.users):
+        if _is_recomputed(user) and _get_layer_id(user) == layer:
+          user.replace_input_with(value, out)
+    _stable_topological_sort(gm)
+    pinned += 1
+  if not pinned:
+    raise ValueError(
+        "combine_transpose_gather_early pinned no layer (needs the combine"
+        f" output saved, e.g. save_regions moe.ep_combine; {skipped} skipped)"
+    )
+  gm.graph.lint()
+  gm.recompile()
+  logger.info(
+      "combine_transpose_gather_early: pinned %d layers, skipped %d (%.1f s)",
+      pinned,
+      skipped,
+      time.perf_counter() - t0,
+  )
+  return gm
