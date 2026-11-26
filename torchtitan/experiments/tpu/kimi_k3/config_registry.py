@@ -720,3 +720,57 @@ def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon_split_check(
   )
   _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
   return cfg
+
+
+# Run-only recipes for the EP overlap track (k3_epov): the F3 options (fused
+# KDA, full remat + host offload) at proxy depth, and EP token chunking.
+def _with_ep_token_chunks(
+    cfg: TpuGraphTrainer.Config, num_token_chunks: int
+) -> TpuGraphTrainer.Config:
+  imports = []
+  for entry in cfg.override.imports:
+    if isinstance(entry, tuple) and entry[0].startswith(
+        f"{_OVERRIDES}.latent_moe."
+    ):
+      entry = (entry[0], {**entry[1], "num_token_chunks": num_token_chunks})
+    imports.append(entry)
+  cfg.override.imports = imports
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e896_fused_kda_offload() -> TpuGraphTrainer.Config:
+  """``k3_deep8_e896`` with the full93 recipe's options (fused KDA, offload)."""
+  cfg = _graph_trainer_kimi_k3_slice("k3_deep8_e896", kda_override=_FUSED_KDA)
+  cfg.compile.memory_policy = "full_and_offload"
+  return cfg
+
+
+def graph_trainer_kimi_k3_deep8_e896_fused_kda_offload_epc2() -> TpuGraphTrainer.Config:
+  return _with_ep_token_chunks(graph_trainer_kimi_k3_deep8_e896_fused_kda_offload(), 2)
+
+
+def graph_trainer_kimi_k3_deep8_e896_fused_kda_offload_epc4() -> TpuGraphTrainer.Config:
+  return _with_ep_token_chunks(graph_trainer_kimi_k3_deep8_e896_fused_kda_offload(), 4)
+
+
+def graph_trainer_kimi_k3_full93_e896_fused_kda_epc2() -> TpuGraphTrainer.Config:
+  return _with_ep_token_chunks(graph_trainer_kimi_k3_full93_e896_fused_kda(), 2)
+
+
+def graph_trainer_kimi_k3_full93_e896_fused_kda_epc4() -> TpuGraphTrainer.Config:
+  return _with_ep_token_chunks(graph_trainer_kimi_k3_full93_e896_fused_kda(), 4)
+
+
+def graph_trainer_kimi_k3_slice_e64_offload() -> TpuGraphTrainer.Config:
+  """``k3_slice_e64`` (2x2x1 bring-up) with fused KDA and host offload."""
+  cfg = _graph_trainer_kimi_k3_slice("k3_slice_e64", kda_override=_FUSED_KDA)
+  cfg.compile.memory_policy = "full_and_offload"
+  return cfg
+
+
+def graph_trainer_kimi_k3_slice_e64_offload_epc2() -> TpuGraphTrainer.Config:
+  return _with_ep_token_chunks(graph_trainer_kimi_k3_slice_e64_offload(), 2)
+
+
+def graph_trainer_kimi_k3_slice_e64_offload_epc4() -> TpuGraphTrainer.Config:
+  return _with_ep_token_chunks(graph_trainer_kimi_k3_slice_e64_offload(), 4)

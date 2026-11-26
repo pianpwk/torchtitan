@@ -128,6 +128,7 @@ def _tpu_latent_moe(
     *,
     ep_capacity_factor: float | None,
     expert_kernel_config: dict,
+    num_token_chunks: int,
 ) -> KimiLatentMoE.Config:
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
@@ -141,6 +142,7 @@ def _tpu_latent_moe(
       routed_experts=derive(
           routed,
           TpuRoutedExperts.Config,
+          num_token_chunks=num_token_chunks,
           inner_experts=derive(
               routed.inner_experts,
               TpuKimiGroupedExperts.Config,
@@ -165,6 +167,7 @@ def tpu_latent_moe(
     cfg: KimiLatentMoE.Config,
     *,
     ep_capacity_factor: float | None = None,
+    num_token_chunks: int = 1,
 ) -> KimiLatentMoE.Config:
   """K3 LatentMoE with TPU MegaBlox experts and the TPU dispatcher.
 
@@ -173,13 +176,15 @@ def tpu_latent_moe(
 
   ``ep_capacity_factor`` (Ring-of-Experts expert rows per EP rank, in units of
   the local routes; None is drop-free) applies only under EP; see
-  ``TpuAllToAllTokenDispatcher.Config``. ``TpuRoutedExperts`` runs one token
-  chunk.
+  ``TpuAllToAllTokenDispatcher.Config``. ``num_token_chunks`` > 1 pipelines
+  the EP dispatch, experts and combine over that many token chunks per layer
+  (``TpuRoutedExperts``; needs SimpleFSDP).
   """
   inner = cfg.routed_experts.inner_experts
   return _tpu_latent_moe(
       cfg,
       ep_capacity_factor=ep_capacity_factor,
+      num_token_chunks=num_token_chunks,
       expert_kernel_config=_expert_kernel_config(inner.dim, inner.hidden_dim),
   )
 
@@ -195,6 +200,7 @@ def tpu_latent_moe_gmm_glu(
     cfg: KimiLatentMoE.Config,
     *,
     ep_capacity_factor: float | None = None,
+    num_token_chunks: int = 1,
 ) -> KimiLatentMoE.Config:
   """``tpu_latent_moe`` with the fused gmm_glu experts (an option).
 
@@ -205,6 +211,7 @@ def tpu_latent_moe_gmm_glu(
   return _tpu_latent_moe(
       cfg,
       ep_capacity_factor=ep_capacity_factor,
+      num_token_chunks=num_token_chunks,
       expert_kernel_config=dict(
           use_pallas_grouped_mm=True,
           use_kernel_native_weight_layout=True,
