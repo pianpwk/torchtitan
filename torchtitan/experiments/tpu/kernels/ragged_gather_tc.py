@@ -44,6 +44,12 @@ d_chunks)``
   backward pass that simultaneously scales ``grad_routed_output`` by routing
   weights and computes the FP32 ``dScore`` dot product while bitwise-masking
   any uninitialized tail rows ``>= count``.
+
+Shape suffixes: G gathered tokens (``ep_size * T``), R expert-buffer rows
+(``cap``), D hidden, C = D // 128 lane chunks, L = 128 lanes, M = G * top_k
+slots. The token side (``[G, C, L]``) is kept 3-D through the public entry
+points: a DMA can move one row of it, while a 2-D ``[G, D]`` row sits inside an
+8-row HBM tile.
 """
 
 import dataclasses
@@ -1084,11 +1090,15 @@ def _ragged_scale_and_dscore_tc(
 def _repack_2d_to_3d_valid_tc(
     x_2d: jax.Array,
     count: jax.Array,
+    row_scale: jax.Array | None = None,
 ) -> jax.Array:
   """Repacks ``[0, cdiv(count, block) * block)`` of ``[cap, D]`` to ``[cap, D // 128, 128]``.
 
   Avoids a full-buffer ``[cap, D] -> [cap, D // 128, 128]`` HBM layout copy over
-  unused padding rows past ``count``.
+  unused padding rows past ``count``. With ``row_scale`` (``float32[cap]``),
+  each row is multiplied by its scale in FP32 and rounded back to ``x_2d.dtype``
+  on the way, bitwise equal to the XLA ``(x * scale[:, None]).astype`` pass it
+  replaces.
   """
   cap, d_dim = x_2d.shape
   dim0, dim1 = d_dim // 128, 128
@@ -1107,6 +1117,8 @@ def _repack_2d_to_3d_valid_tc(
         repack_block = candidate
         break
   if repack_block is None:
+    if row_scale is not None:
+      x_2d = (x_2d.astype(jnp.float32) * row_scale[:, None]).astype(x_2d.dtype)
     return x_2d.reshape(cap, dim0, dim1)
 
   count_1 = jnp.reshape(
@@ -1114,11 +1126,25 @@ def _repack_2d_to_3d_valid_tc(
       (1,),
   )
 
-  def _repack_kernel(c_ref, in_2d_ref, out_3d_ref):
+  def _repack_kernel(c_ref, in_2d_ref, *refs):
     del c_ref
+    if row_scale is None:
+      (out_3d_ref,) = refs
+    else:
+      scale_ref, out_3d_ref = refs
     for r in range(0, repack_block, row_tile):
       slab = in_2d_ref[pl.ds(r, row_tile), :]
+      if row_scale is not None:
+        slab = (
+            slab.astype(jnp.float32) * scale_ref[pl.ds(r, row_tile), :]
+        ).astype(x_2d.dtype)
       out_3d_ref[pl.ds(r, row_tile), :, :] = slab.reshape(row_tile, dim0, dim1)
+
+  in_specs = [pl.BlockSpec((repack_block, d_dim), lambda i, c_ref: (i, 0))]
+  args = [count_1, x_2d]
+  if row_scale is not None:
+    in_specs.append(pl.BlockSpec((repack_block, 1), lambda i, c_ref: (i, 0)))
+    args.append(row_scale.astype(jnp.float32).reshape(cap, 1))
 
   return pl.pallas_call(
       _repack_kernel,
@@ -1126,9 +1152,7 @@ def _repack_2d_to_3d_valid_tc(
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=1,
           grid=(pl.cdiv(count_1[0], repack_block),),
-          in_specs=[
-              pl.BlockSpec((repack_block, d_dim), lambda i, c_ref: (i, 0))
-          ],
+          in_specs=in_specs,
           out_specs=pl.BlockSpec(
               (repack_block, dim0, dim1), lambda i, c_ref: (i, 0, 0)
           ),
@@ -1137,8 +1161,12 @@ def _repack_2d_to_3d_valid_tc(
           dimension_semantics=("parallel",),
           vmem_limit_bytes=vmem_limit,
       ),
-      name="repack_2d_to_3d_valid_tc",
-  )(count_1, x_2d)
+      name=(
+          "repack_2d_to_3d_valid_tc"
+          if row_scale is None
+          else "scale_repack_2d_to_3d_valid_tc"
+      ),
+  )(*args)
 
 
 # --- PyTorch <-> JAX Custom Operators (@pallas.jax_op) ---
@@ -1214,16 +1242,16 @@ def _roe_routing_metadata_tpu(
 
 @pallas.jax_op("tt_moe::roe_gather_fwd")
 def _roe_gather_fwd(
-    x_all_GD: jax.Array,
+    x_all_GCL: jax.Array,
     token_ids_sorted_M: jax.Array,
     start_count_2: jax.Array,
     cap: int,
     gather_block_size: int,
     zero_pad_tail: bool,
 ) -> jax.Array:
-  g_tokens, d_dim = x_all_GD.shape
-  x3d = x_all_GD.reshape(g_tokens, d_dim // 128, 128)
-  itemsize = jnp.dtype(x_all_GD.dtype).itemsize
+  _, num_chunks, lanes = x_all_GCL.shape
+  d_dim = num_chunks * lanes
+  itemsize = jnp.dtype(x_all_GCL.dtype).itemsize
   if roe_gather_out_2d(cap, itemsize, zero_pad_tail):
     eff_block = min(
         gather_block_size,
@@ -1235,7 +1263,7 @@ def _roe_gather_fwd(
         ),
     )
     return ragged_gather_tc(
-        x3d,
+        x_all_GCL,
         token_ids_sorted_M,
         start=start_count_2[0],
         num_tokens=start_count_2[1],
@@ -1244,7 +1272,7 @@ def _roe_gather_fwd(
         out_2d=True,
     )
   out3d = ragged_gather_tc(
-      x3d,
+      x_all_GCL,
       token_ids_sorted_M,
       start=start_count_2[0],
       num_tokens=start_count_2[1],
@@ -1270,7 +1298,6 @@ def _roe_gather_bwd(
     top_k: int,
     reduce_block_size: int,
 ) -> jax.Array:
-  _, d_dim = grad_routed_RD.shape
   meta = RaggedGatherReduceMetadata(
       src_rows=src_rows,
       tokens=tokens,
@@ -1279,14 +1306,13 @@ def _roe_gather_bwd(
       num_indices=num_indices,
   )
   grad3d = _repack_2d_to_3d_valid_tc(grad_routed_RD, start_count_2[1])
-  out3d = ragged_gather_reduce_tc(
+  return ragged_gather_reduce_tc(
       grad3d,
       meta,
       num_out_tokens=num_out_tokens,
       top_k=top_k,
       weights=None,
   )
-  return out3d.reshape(num_out_tokens, d_dim)
 
 
 @pallas.jax_op("tt_moe::roe_unsort_fwd")
@@ -1306,7 +1332,7 @@ def _roe_unsort_fwd(
     zero_pad_tail: bool,
 ) -> jax.Array:
   del gather_block_size, zero_pad_tail
-  cap, d_dim = routed_output_RD.shape
+  cap = routed_output_RD.shape[0]
   count = start_count_2[1]
   iota_cap = jnp.arange(cap, dtype=jnp.int32)
   valid_cap = iota_cap < count
@@ -1320,11 +1346,7 @@ def _roe_unsort_fwd(
   # rows here is bitwise equal to the reduce kernel's per-slot weights (FP32
   # multiply, rounded to the row dtype, FP32 accumulation). It avoids an XLA
   # gather of a weight per slot over all ep_size * T * top_k slots (98 ms per
-  # layer at 2M slots on TPU7x) for one elementwise pass over [cap, D].
-  scaled_RD = (
-      routed_output_RD.astype(jnp.float32) * w_rows_cap[:, None]
-  ).astype(routed_output_RD.dtype)
-
+  # layer at 2M slots on TPU7x); the scale rides on the 2-D -> 3-D repack.
   meta = RaggedGatherReduceMetadata(
       src_rows=src_rows,
       tokens=tokens,
@@ -1332,18 +1354,17 @@ def _roe_unsort_fwd(
       block_size=reduce_block_size,
       num_indices=token_ids_sorted_M.shape[0],
   )
-  out3d = ragged_gather_reduce_tc(
-      _repack_2d_to_3d_valid_tc(scaled_RD, count),
+  return ragged_gather_reduce_tc(
+      _repack_2d_to_3d_valid_tc(routed_output_RD, count, w_rows_cap),
       meta,
       num_out_tokens=num_out_tokens,
       top_k=top_k,
   )
-  return out3d.reshape(num_out_tokens, d_dim)
 
 
 @pallas.jax_op("tt_moe::roe_unsort_bwd")
 def _roe_unsort_bwd(
-    grad_partial_GD: jax.Array,
+    grad_partial_GCL: jax.Array,
     routed_output_RD: jax.Array,
     scores_flat_M: jax.Array,
     token_ids_sorted_M: jax.Array,
@@ -1352,14 +1373,14 @@ def _roe_unsort_bwd(
     gather_block_size: int,
     zero_pad_tail: bool,
 ) -> tuple[jax.Array, jax.Array]:
-  g_tokens, d_dim = grad_partial_GD.shape
+  _, num_chunks, lanes = grad_partial_GCL.shape
+  d_dim = num_chunks * lanes
   cap = routed_output_RD.shape[0]
   m = scores_flat_M.shape[0]
   start = start_count_2[0]
   count = start_count_2[1]
 
-  grad_partial_3d = grad_partial_GD.reshape(g_tokens, d_dim // 128, 128)
-  itemsize = jnp.dtype(grad_partial_GD.dtype).itemsize
+  itemsize = jnp.dtype(grad_partial_GCL.dtype).itemsize
   if roe_gather_out_2d(cap, itemsize, zero_pad_tail):
     eff_block = min(
         gather_block_size,
@@ -1371,7 +1392,7 @@ def _roe_unsort_bwd(
         ),
     )
     g_gathered_RD = ragged_gather_tc(
-        grad_partial_3d,
+        grad_partial_GCL,
         token_ids_sorted_M,
         start=start,
         num_tokens=count,
@@ -1381,7 +1402,7 @@ def _roe_unsort_bwd(
     )
   else:
     g_gathered_3d = ragged_gather_tc(
-        grad_partial_3d,
+        grad_partial_GCL,
         token_ids_sorted_M,
         start=start,
         num_tokens=count,
@@ -1449,7 +1470,7 @@ def _roe_unsort_setup_context(ctx, inputs, output):
   ctx.zero_pad_tail = zero_pad_tail
 
 
-def _roe_unsort_backward(ctx, grad_partial_GD):
+def _roe_unsort_backward(ctx, grad_partial_GCL):
   (
       routed_output_RD,
       scores_flat_M,
@@ -1458,7 +1479,7 @@ def _roe_unsort_backward(ctx, grad_partial_GD):
       start_count_2,
   ) = ctx.saved_tensors
   grad_routed_RD, grad_scores_flat_M = _roe_unsort_bwd(
-      grad_partial_GD.contiguous(),
+      grad_partial_GCL.contiguous(),
       routed_output_RD,
       scores_flat_M,
       token_ids_sorted_M,
@@ -1473,6 +1494,11 @@ def _roe_unsort_backward(ctx, grad_partial_GD):
 _roe_unsort_fwd.register_autograd(
     _roe_unsort_backward, setup_context=_roe_unsort_setup_context
 )
+
+
+@pallas.jax_op("tt_moe::roe_tokens_to_3d")
+def _roe_tokens_to_3d(x_TD: jax.Array) -> jax.Array:
+  return _repack_2d_to_3d_valid_tc(x_TD, jnp.int32(x_TD.shape[0]))
 
 
 @pallas.jax_op("tt_moe::roe_row_scale_fwd")
@@ -1582,12 +1608,12 @@ def roe_compute_routing(
 
 
 class _RoESortGather(torch.autograd.Function):
-  """Gathers ``x_all_GD`` into ``[cap, D]`` with TC gather-reduce backward."""
+  """Gathers ``x_all_GCL`` into ``[cap, D]`` with TC gather-reduce backward."""
 
   @staticmethod
   def forward(
       ctx,
-      x_all_GD: torch.Tensor,
+      x_all_GCL: torch.Tensor,
       token_ids_sorted_M: torch.Tensor,
       start_count_2: torch.Tensor,
       src_rows: torch.Tensor,
@@ -1601,11 +1627,11 @@ class _RoESortGather(torch.autograd.Function):
   ) -> torch.Tensor:
     ctx.save_for_backward(start_count_2, src_rows, tokens, blocks)
     ctx.num_indices = token_ids_sorted_M.shape[0]
-    ctx.num_out_tokens = x_all_GD.shape[0]
+    ctx.num_out_tokens = x_all_GCL.shape[0]
     ctx.top_k = top_k
     ctx.reduce_block_size = reduce_block_size
     return _roe_gather_fwd(
-        x_all_GD.contiguous(),
+        x_all_GCL.contiguous(),
         token_ids_sorted_M,
         start_count_2,
         cap,
@@ -1616,7 +1642,7 @@ class _RoESortGather(torch.autograd.Function):
   @staticmethod
   def backward(ctx, grad_routed_RD: torch.Tensor):
     start_count_2, src_rows, tokens, blocks = ctx.saved_tensors
-    grad_x_all_GD = _roe_gather_bwd(
+    grad_x_all_GCL = _roe_gather_bwd(
         grad_routed_RD.contiguous(),
         start_count_2,
         src_rows,
@@ -1627,11 +1653,11 @@ class _RoESortGather(torch.autograd.Function):
         ctx.top_k,
         ctx.reduce_block_size,
     )
-    return (grad_x_all_GD,) + (None,) * 10
+    return (grad_x_all_GCL,) + (None,) * 10
 
 
 def roe_sort_gather(
-    x_all_GD: torch.Tensor,
+    x_all_GCL: torch.Tensor,
     token_ids_sorted_M: torch.Tensor,
     start_count_2: torch.Tensor,
     src_rows: torch.Tensor,
@@ -1644,9 +1670,14 @@ def roe_sort_gather(
     reduce_block_size: int = 896,
     zero_pad_tail: bool = False,
 ) -> torch.Tensor:
-  """Gathers ``x_all_GD`` into ``[cap, D]`` for this rank's local experts."""
+  """Gathers ``x_all_GCL`` (``[G, D // 128, 128]``) into ``[cap, D]`` for this rank's local experts.
+
+  The token side stays in the kernels' per-row ``[G, D // 128, 128]`` layout so
+  callers can reshape the local ``[T, D]`` tokens before the EP all-gather
+  (``1 / ep_size`` of the relayout bytes) instead of the gathered buffer.
+  """
   return _RoESortGather.apply(
-      x_all_GD,
+      x_all_GCL,
       token_ids_sorted_M,
       start_count_2,
       src_rows,
@@ -1676,7 +1707,7 @@ def roe_unsort_combine(
     reduce_block_size: int = 896,
     zero_pad_tail: bool = False,
 ) -> torch.Tensor:
-  """Weighted FP32 gather-reduce of ``routed_output_RD`` back to ``[G, D]``."""
+  """Weighted FP32 gather-reduce of ``routed_output_RD`` back to ``[G, D // 128, 128]``."""
   return _roe_unsort_fwd(
       routed_output_RD.contiguous(),
       scores_flat_M.contiguous(),
@@ -1695,7 +1726,7 @@ def roe_unsort_combine(
 
 
 class _RoEUnsortReduce(torch.autograd.Function):
-  """Unweighted gather-reduce of ``routed_output_RD`` back to ``[G, D]``.
+  """Unweighted gather-reduce of ``routed_output_RD`` back to ``[G, D // 128, 128]``.
 
   The transpose of ``roe_sort_gather``: forward is the TC ragged gather-reduce
   and backward is the TC ragged gather, so no routing-weight gradient is
@@ -1732,10 +1763,10 @@ class _RoEUnsortReduce(torch.autograd.Function):
     )
 
   @staticmethod
-  def backward(ctx, grad_partial_GD: torch.Tensor):
+  def backward(ctx, grad_partial_GCL: torch.Tensor):
     token_ids_sorted_M, start_count_2 = ctx.saved_tensors
     grad_routed_RD = _roe_gather_fwd(
-        grad_partial_GD.contiguous(),
+        grad_partial_GCL.contiguous(),
         token_ids_sorted_M,
         start_count_2,
         ctx.cap,
@@ -1758,7 +1789,7 @@ def roe_unsort_reduce(
     gather_block_size: int = 1024,
     reduce_block_size: int = 896,
 ) -> torch.Tensor:
-  """Unweighted FP32 gather-reduce of ``routed_output_RD`` back to ``[G, D]``."""
+  """Unweighted FP32 gather-reduce of ``routed_output_RD`` back to ``[G, D // 128, 128]``."""
   return _RoEUnsortReduce.apply(
       routed_output_RD,
       token_ids_sorted_M,
@@ -1771,6 +1802,27 @@ def roe_unsort_reduce(
       gather_block_size,
       reduce_block_size,
   )
+
+
+class _RoETokensTo3d(torch.autograd.Function):
+  """``[T, D] -> [T, D // 128, 128]`` through the Pallas repack; reshape backward."""
+
+  @staticmethod
+  def forward(ctx, x_TD: torch.Tensor) -> torch.Tensor:
+    return _roe_tokens_to_3d(x_TD.contiguous())
+
+  @staticmethod
+  def backward(ctx, grad_TCL: torch.Tensor):
+    return grad_TCL.reshape(grad_TCL.shape[0], -1)
+
+
+def roe_tokens_to_3d(x_TD: torch.Tensor) -> torch.Tensor:
+  """Relayouts local ``[T, D]`` tokens to ``[T, D // 128, 128]`` for ``roe_sort_gather``.
+
+  A Pallas repack rather than a reshape: XLA may fuse a reshape's relayout
+  into the op that produces ``x_TD`` and so change how that op rounds.
+  """
+  return _RoETokensTo3d.apply(x_TD)
 
 
 def roe_gather_row_scales(
@@ -1792,6 +1844,7 @@ __all__ = [
     "roe_gather_out_2d",
     "roe_gather_row_scales",
     "roe_sort_gather",
+    "roe_tokens_to_3d",
     "roe_unsort_combine",
     "roe_unsort_reduce",
     "safe_gather_block_size",
