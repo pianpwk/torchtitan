@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 import concurrent.futures
+import copy
 import functools
 import inspect
 import logging
@@ -18,7 +19,6 @@ import time
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
-from torch._dynamo.utils import detect_fake_mode
 from torch.utils import _pytree
 
 from torchtitan.experiments.graph_trainer.cpu_offload import (
@@ -344,7 +344,7 @@ def _annotate_internal_donations(
         if inference_disabled_due_to_metadata and not forced_positions:
             continue
         positions = tuple(dict.fromkeys((*inferred_positions, *forced_positions)))
-        # _SubmodCompiler deep-copies children; GraphModule.meta is preserved.
+        # The compiled copy of each child keeps a shallow copy of its meta.
         submodule.meta["tpu_donated_input_positions"] = positions
         for position in positions:
             value = placeholders[position].meta.get("val")
@@ -547,58 +547,80 @@ def tpu_backend_compile_partitioned_pass(
     is_fwd: bool = True,
     donate_internal_buffers: bool = False,
 ) -> torch.fx.GraphModule:
-    """Discover child inputs and compile each split GraphModule independently."""
-    # TorchTPU is an optional dependency, so importing its private split helper
-    # at module load time would break host-only TorchTitan tests.
-    from torch_tpu._internal.compile.split_compiler import _SubmodCompiler
+    """Compile each child of a split GraphModule independently.
 
+    A child's compile inputs are the parent's example inputs or the traced
+    ``meta["val"]`` of the producing child's outputs. The children are not
+    executed, not even under the fake mode: the split graph already records
+    every boundary value's shape, stride, dtype and device.
+    """
     _ensure_optimization_barrier_fake()
-    fake_mode = detect_fake_mode(example_inputs)
-    if fake_mode is None:
-        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
-
     _annotate_internal_donations(
         gm,
         donate_internal_buffers=donate_internal_buffers,
     )
 
-    def compile_submodule(
-        submodule: torch.fx.GraphModule,
-        submodule_inputs: list[torch.Tensor],
-        *,
-        module_name: str | None = None,
-    ) -> torch.fx.GraphModule:
-        # Newer TorchTPU passes this diagnostic name to the callback, while
-        # the canonical build calls it with only the module and inputs.
-        del module_name
-        return tpu_backend_compile_pass(
-            submodule,
-            tuple(submodule_inputs),
-            is_fwd=is_fwd,
-            donated_input_positions=tuple(
-                submodule.meta.get("tpu_donated_input_positions", ())
-            ),
-        )
-
-    compiler = _SubmodCompiler(gm, compile_submodule, fake_mode)
-    # ProcessGroups can cross split-module boundaries as opaque inputs. The
-    # FakeTensor dispatch cache compares inputs while propagating each child's
-    # output shapes, but torchbind ProcessGroups do not implement equality.
-    # This setting is scoped to child-output propagation and does not alter
-    # graph tracing or TorchTPU executable caches.
-    cache_was_enabled = fake_mode.cache_enabled
-    fake_mode.cache_enabled = False
-    # Match TorchTPU's SplitCompiler: fake execution must not fire user saved-
-    # tensor pack/unpack hooks that are intended to run once at runtime.
-    with (
-        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
-    ):
-        try:
-            compiler.run(*example_inputs)
-        finally:
-            fake_mode.cache_enabled = cache_was_enabled
+    env: dict[torch.fx.Node, Any] = {}
+    placeholders = iter(example_inputs)
+    for node in list(gm.graph.nodes):
+        if node.op == "placeholder":
+            env[node] = next(placeholders)
+        elif node.op == "call_module":
+            child = gm.get_submodule(str(node.target))
+            child_output = next(
+                n for n in child.graph.nodes if n.op == "output"
+            )
+            single_output = not isinstance(child_output.args[0], tuple)
+            outputs = (
+                (child_output.args[0],) if single_output
+                else child_output.args[0]
+            )
+            # Compile a copy: the compile pass rewrites the graph's output.
+            compiled = torch.fx.GraphModule(child, copy.deepcopy(child.graph))
+            compiled.meta = copy.copy(child.meta)
+            if single_output:
+                compiled.graph.output_node().args = (outputs,)
+                compiled.recompile()
+            compiled = tpu_backend_compile_pass(
+                compiled,
+                tuple(env[arg] for arg in node.args),
+                is_fwd=is_fwd,
+                donated_input_positions=tuple(
+                    compiled.meta.get("tpu_donated_input_positions", ())
+                ),
+            )
+            gm.delete_submodule(str(node.target))
+            node.target = f"compiled_{node.target}"
+            gm.add_submodule(
+                node.target, _ChildExecutable(compiled, single_output)
+            )
+            values = tuple(
+                out.meta["val"] if isinstance(out, torch.fx.Node) else out
+                for out in outputs
+            )
+            env[node] = values[0] if single_output else values
+        elif node.op == "call_function" and node.target is operator.getitem:
+            source, index = node.args
+            env[node] = env[source][index]
+        elif node.op != "output":
+            raise ValueError(
+                f"Unexpected node in a split TPU graph: {node.format_node()}"
+            )
     gm.recompile()
     return gm
+
+
+class _ChildExecutable(torch.nn.Module):
+    """A compiled split child; restores a single output's bare value."""
+
+    def __init__(self, compiled: torch.fx.GraphModule, single_output: bool):
+        super().__init__()
+        self.compiled = compiled
+        self.single_output = single_output
+
+    def forward(self, *args: Any) -> Any:
+        outputs = self.compiled(*args)
+        return outputs[0] if self.single_output else outputs
 
 
 def construct_tpu_transform_passes(
