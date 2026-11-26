@@ -29,6 +29,9 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
 )
 from torchtitan.experiments.tpu.graph_trainer.kimi_k3 import (
+    GraphTrainerTpuKimiK3Model,
+)
+from torchtitan.experiments.tpu.graph_trainer.kimi_k3 import (
     model_registry as graph_trainer_model_registry,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
@@ -137,7 +140,9 @@ def _graph_trainer_kimi_k3_slice(
   cfg.model_spec = dataclasses.replace(
       graph_trainer_model_registry(flavor), max_context_length=seq_len
   )
-  use_tpu_attention_residual(cfg.model_spec.model)
+  cfg.model_spec.model = use_tpu_attention_residual(
+      cfg.model_spec.model, config_cls=GraphTrainerTpuKimiK3Model.Config
+  )
   cfg.override.imports = [
       kda_override,
       f"{_OVERRIDES}.tokamax_mla.tokamax_mla_attention",
