@@ -511,11 +511,16 @@ def _restore_pinned_host_compile_inputs(
             f"{len(example_inputs)} != {len(placeholders)}"
         )
 
-    fake_mode = detect_fake_mode(example_inputs)
-    if fake_mode is None:
-        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+    # Build the pinned-host inputs in a fake mode of their own. With
+    # compile.async_compile_workers, StaticCompiler reads each input's
+    # ``.device`` on a worker thread while this thread keeps running fake ops
+    # in the graph's shared mode, and FakeTensor.device reports "meta" whenever
+    # its mode is inside a kernel (a flag on the mode, not per thread). The
+    # input then reads as not pinned and the executable expects device memory.
+    # TODO: drop the private mode once StaticCompiler snapshots pinned-host
+    # inputs on the submitting thread (or FakeTensor.device is thread-safe).
     compile_inputs = list(example_inputs)
-    with fake_mode:
+    with torch._subclasses.fake_tensor.FakeTensorMode():
         for index in pinned_positions:
             value = compile_inputs[index]
             if not isinstance(value, torch.Tensor):
