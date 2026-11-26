@@ -330,14 +330,12 @@ class PartitionDonationTest(absltest.TestCase):
       kwargs["device"] = "cpu"
       return real_empty_strided(*args, **kwargs)
 
+    graph_fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+    with graph_fake_mode:
+      example_input = torch.randn(2, 3)
     with (
         mock.patch.object(
             tpu_backend_pass, "_import_static_compiler", return_value=compiler
-        ),
-        mock.patch.object(
-            tpu_backend_pass.torch._subclasses.fake_tensor,
-            "FakeTensorMode",
-            return_value=mock.MagicMock(),
         ),
         mock.patch.object(
             tpu_backend_pass.torch,
@@ -347,13 +345,20 @@ class PartitionDonationTest(absltest.TestCase):
     ):
       tpu_backend_pass.tpu_backend_compile_pass(
           gm,
-          (torch.randn(2, 3),),
+          (example_input,),
           is_fwd=False,
       )
 
     compile_inputs = compiler_instance.call_args.args[1]
     self.assertEqual(len(compile_inputs), 1)
     self.assertTrue(compile_inputs[0]._is_pinned_host)
+    # An async compile worker reads the input's device while the graph's fake
+    # mode may be inside a kernel on the main thread; it must not read "meta".
+    graph_fake_mode.in_kernel_invocation = True
+    try:
+      self.assertEqual(compile_inputs[0].device.type, "cpu")
+    finally:
+      graph_fake_mode.in_kernel_invocation = False
 
   def test_legacy_static_compiler_works_when_donation_is_disabled(self):
     gm = make_fx(lambda x: (x.sin(),))(torch.randn(2, 3))
