@@ -701,13 +701,14 @@ def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon_two_rank_check(
 def graph_trainer_kimi_k3_deep8_e448_spmd_dist_muon_split_check(
 ) -> TpuGraphTrainer.Config:
   """``..._deep8_e448_spmd_dist_muon_two_rank_check`` with the captured buckets
-  in programs of at most four (three programs), as the full93 recipe splits
-  them."""
+  in programs of at most two (five programs). Programs 0-2 hold same-shape
+  w1 / w3 buckets and compile to one executable, as the full93 recipe's first
+  three programs do."""
   cfg = graph_trainer_kimi_k3_deep8_e448()
   cfg.optimizer = _k3_dist_muon_optimizer(
       cfg.model_spec.model,
       spmd_expert_bucket_size=2,
-      spmd_max_buckets_per_program=4,
+      spmd_max_buckets_per_program=2,
   )
   _with_spmd_dist_muon_flags(cfg, check_two_ranks=True)
   return cfg

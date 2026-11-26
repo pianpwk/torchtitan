@@ -158,6 +158,9 @@ class _CollectiveGuard:
     check_ranks: tuple[int, ...] | None = None
     compile_start: float = 0.0
     num_compiles: int = 0
+    # Executables this rank already checked. Shared by the guards of one
+    # optimizer: programs of same-shape buckets compile to the same executable,
+    # which XLA serves from its cache without dumping new HLO.
     verified_fingerprints: set[str] = field(default_factory=set)
 
     def __call__(self, debug: Any) -> None:
@@ -350,6 +353,7 @@ class SpmdCompiledDistMuon(DistMuon):
             if collective_check_ranks is None
             else tuple(sorted(set(collective_check_ranks)))
         )
+        verified_fingerprints: set[str] = set()
         self._collective_guards = tuple(
             _CollectiveGuard(
                 tag=(
@@ -359,6 +363,7 @@ class SpmdCompiledDistMuon(DistMuon):
                 ),
                 dump_dir=dump_dir,
                 check_ranks=check_ranks,
+                verified_fingerprints=verified_fingerprints,
                 expected_all_to_alls=sum(
                     int(schedule.has_remote_transfers)
                     for plan in plans
