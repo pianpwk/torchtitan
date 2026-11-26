@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
 import itertools
@@ -677,11 +678,29 @@ def _build_region_redistribution_plan(
         for participant in participants
     )
 
+    # Compute regions are dim-0 row ranges: only endpoints whose rows overlap a
+    # storage region's rows can intersect it (bisect instead of all pairs).
+    endpoint_order = sorted(
+        range(len(compute_endpoints)),
+        key=lambda index: compute_endpoints[index][1].offsets[0],
+    )
+    endpoint_starts = [compute_endpoints[i][1].offsets[0] for i in endpoint_order]
+    endpoint_max_rows = max(
+        (region.shape[0] for _destination, region, _offsets in compute_endpoints),
+        default=0,
+    )
     storage_to_compute_routes = []
     for storage_mapping in storage_domain.mappings:
         source_holders = storage_mapping.holders
         storage_region = storage_mapping.logical_region
-        for destination, compute_region, packed_offsets in compute_endpoints:
+        row_start = storage_region.offsets[0]
+        row_end = row_start + storage_region.shape[0]
+        first = bisect.bisect_left(endpoint_starts, row_start - endpoint_max_rows + 1)
+        last = bisect.bisect_left(endpoint_starts, row_end)
+        candidates = sorted(endpoint_order[first:last])
+        for destination, compute_region, packed_offsets in (
+            compute_endpoints[index] for index in candidates
+        ):
             logical_region = _tensor_region_intersection(
                 storage_region,
                 compute_region,
@@ -962,10 +981,24 @@ def _requires_equal_all_to_all_splits(process_group: dist.ProcessGroup) -> bool:
     return "tpu" in str(dist.get_backend(process_group))
 
 
+# Per-mesh rank order and rank -> flat index, keyed by the mesh object (meshes
+# are long-lived; planning queries them once per parameter and participant).
+_mesh_rank_cache: dict[int, tuple[DeviceMesh, tuple[int, ...], dict[int, int]]] = {}
+
+
+def _cached_mesh_ranks(mesh: DeviceMesh) -> tuple[tuple[int, ...], dict[int, int]]:
+    cached = _mesh_rank_cache.get(id(mesh))
+    if cached is None or cached[0] is not mesh:
+        ranks = tuple(mesh.mesh.flatten().tolist())
+        cached = (mesh, ranks, {rank: index for index, rank in enumerate(ranks)})
+        _mesh_rank_cache[id(mesh)] = cached
+    return cached[1], cached[2]
+
+
 def _device_mesh_ranks(mesh: DeviceMesh) -> tuple[int, ...]:
     # Process groups can canonicalize rank order, but DeviceMesh order defines
     # which logical shard each global rank holds.
-    return tuple(mesh.mesh.flatten().tolist())
+    return _cached_mesh_ranks(mesh)[0]
 
 
 def _redistribution_group(mesh: DeviceMesh) -> _RedistributionGroup:
@@ -985,7 +1018,7 @@ def _device_mesh_coordinate(
     participant: int,
 ) -> list[int]:
     mesh_shape = tuple(mesh.shape)
-    flat_mesh_index = _device_mesh_ranks(mesh).index(participant)
+    flat_mesh_index = _cached_mesh_ranks(mesh)[1][participant]
     mesh_coordinate = [0] * len(mesh_shape)
     for mesh_axis in range(len(mesh_shape) - 1, -1, -1):
         flat_mesh_index, mesh_coordinate[mesh_axis] = divmod(
