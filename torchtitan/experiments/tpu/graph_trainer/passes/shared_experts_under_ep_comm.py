@@ -421,13 +421,13 @@ def apply_shared_experts_under_ep_comm(
       # alone orders the segment before them. Rewiring the segment outputs'
       # other users too would make them wait for the collective, a cycle when
       # one of them feeds the collective's input.
-      consumers = [
-          [u for u in coll_out.users if _group(u) == group] for coll_out in coll_outs
-      ]
-      end = edit.barrier([*coll_outs, *outs], f"{tag}_end")
-      for coll_out, gated, users in zip(coll_outs, end, consumers):
-        for user in users:
-          edit.rewire(user, coll_out, gated)
+      # One end barrier per collective: a chunk's consumers wait for the
+      # segment and their own gather, not for the other chunks' gathers.
+      for j, coll_out in enumerate(coll_outs):
+        consumers = [u for u in coll_out.users if _group(u) == group]
+        end = edit.barrier([coll_out, *outs], f"{tag}_end{j}")
+        for user in consumers:
+          edit.rewire(user, coll_out, end[0])
       if not edit.commit(f"{_TAG} {tag}"):
         skipped += 1
         continue
