@@ -63,6 +63,7 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
     collect_collective_chains,
     is_gather,
     is_reduce_scatter,
+    op_name,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _is_recomputed,
@@ -373,5 +374,99 @@ def apply_shared_experts_under_ep_comm(
       skipped,
       time.perf_counter() - t0,
       len(gm.graph.nodes),
+  )
+  return gm
+
+
+def _token_gather_feeding(consumer: torch.fx.Node) -> torch.fx.Node | None:
+  """The large floating-point all-gather an input of ``consumer`` comes from
+  (through views and waits), if any."""
+  stack, seen = list(consumer.all_input_nodes), set()
+  while stack:
+    node = stack.pop()
+    if node in seen or node.op != "call_function":
+      continue
+    seen.add(node)
+    if (
+        is_gather(node)
+        and _is_tensor(node.args[0])
+        and node.args[0].meta["val"].is_floating_point()
+        and node.args[0].meta["val"].numel() >= _MIN_WINDOW_NUMEL
+    ):
+      return node
+    if is_wait_tensor(node) or getattr(node.target, "is_view", False):
+      stack.extend(node.all_input_nodes)
+  return None
+
+
+def apply_routing_metadata_under_ep_comm(
+    gm: torch.fx.GraphModule,
+) -> torch.fx.GraphModule:
+  """Run each Ring-of-Experts routing metadata op under its token all-gather.
+
+  ``tt_moe::roe_routing_metadata`` (expert sort, combine-slot sort, block
+  tables) depends only on the routing ids, but the scheduler runs it on the
+  TensorCore before the token all-gather starts, which then waits with nothing
+  to do. Pin it between that all-gather's start and done (the gather that
+  reads both): start barrier ``(token input, *metadata inputs)``, end barrier
+  ``(token result, *metadata outputs)``. Values pass through.
+  """
+  t0 = time.perf_counter()
+  metas = [n for n in gm.graph.nodes if op_name(n) == "tt_moe::roe_routing_metadata"]
+  pinned, skipped = 0, 0
+  for meta in metas:
+    outs = [u for u in meta.users if u.target is operator.getitem]
+    launch = next(
+        (
+            g
+            for out in outs
+            for user in out.users
+            if (g := _token_gather_feeding(user)) is not None
+        ),
+        None,
+    )
+    if launch is None:
+      skipped += 1
+      continue
+    coll_in, coll_out = _window_ends(launch)
+    seg = {meta, *outs}
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    upstream = _reach(coll_in, upstream=True, order=order, bound=order[meta])
+    downstream = _reach(
+        coll_out, upstream=False, order=order, bound=max(order[n] for n in seg)
+    )
+    if seg & (upstream | downstream):
+      logger.warning("routing_metadata_under_ep_comm: skipping %s", meta.name)
+      skipped += 1
+      continue
+    tag = f"meta_{meta.name}"
+    gate = [coll_in, *(i for i in meta.all_input_nodes if _is_tensor(i) and i.op != "placeholder" and i is not coll_in)]
+    if len(gate) > 1:
+      start = _barrier(gm, gate, f"{tag}_start")
+      for value, gated in zip(gate[1:], start[1:]):
+        meta.replace_input_with(value, gated)
+    consumers = [u for u in coll_out.users if _group(u) == _group(meta)]
+    end = _barrier(gm, [coll_out, *outs], f"{tag}_end")
+    end_nodes = {e.args[0] for e in end} | set(end)
+    for user in consumers:
+      user.replace_input_with(coll_out, end[0])
+    for value, gated in zip(outs, end[1:]):
+      for user in list(value.users):
+        if user not in end_nodes:
+          user.replace_input_with(value, gated)
+    _stable_topological_sort(gm)
+    pinned += 1
+  if not pinned:
+    raise ValueError(
+        f"routing_metadata_under_ep_comm pinned no metadata op ({len(metas)}"
+        f" found, {skipped} skipped)"
+    )
+  gm.graph.lint()
+  gm.recompile()
+  logger.info(
+      "routing_metadata_under_ep_comm: pinned %d, skipped %d (%.1f s)",
+      pinned,
+      skipped,
+      time.perf_counter() - t0,
   )
   return gm
