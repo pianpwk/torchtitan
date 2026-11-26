@@ -17,6 +17,22 @@ def _relative_l2_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
   )
 
 
+def _sort_gather(x_GD: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+  """``roe_sort_gather`` on 2-D tokens (the kernels take ``[G, D // 128, 128]``)."""
+  x_GCL = x_GD.reshape(x_GD.shape[0], -1, 128)
+  return ragged_gather_tc.roe_sort_gather(x_GCL, *args, **kwargs)
+
+
+def _unsort_combine(*args, **kwargs) -> torch.Tensor:
+  out_GCL = ragged_gather_tc.roe_unsort_combine(*args, **kwargs)
+  return out_GCL.reshape(out_GCL.shape[0], -1)
+
+
+def _unsort_reduce(*args, **kwargs) -> torch.Tensor:
+  out_GCL = ragged_gather_tc.roe_unsort_reduce(*args, **kwargs)
+  return out_GCL.reshape(out_GCL.shape[0], -1)
+
+
 def _roe_reference(
     x_all_GD: torch.Tensor,
     ids_flat_M: torch.Tensor,
@@ -192,7 +208,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
 
     x = x_ref.detach().clone().requires_grad_(True)
     scores = scores_ref.detach().clone().requires_grad_(True)
-    gathered_RD = ragged_gather_tc.roe_sort_gather(
+    gathered_RD = _sort_gather(
         x,
         token_ids_sorted_M,
         start_count_2,
@@ -209,7 +225,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
         (cap - count, d_dim), float("nan"), device=dev, dtype=torch.bfloat16
     )
     routed_with_nan_tail = torch.cat([gathered_RD[:count], nan_tail], dim=0)
-    out = ragged_gather_tc.roe_unsort_combine(
+    out = _unsort_combine(
         routed_with_nan_tail,
         scores,
         token_ids_sorted_M,
@@ -246,7 +262,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
     (dx_u_ref,) = torch.autograd.grad(out_u_ref, (x_u_ref,), grad_out)
 
     x_u = x_ref.detach().clone().requires_grad_(True)
-    gathered_u = ragged_gather_tc.roe_sort_gather(
+    gathered_u = _sort_gather(
         x_u,
         token_ids_sorted_M,
         start_count_2,
@@ -259,7 +275,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
         reduce_block_size=reduce_block_size,
     )
     routed_u = torch.cat([gathered_u[:count], nan_tail], dim=0)
-    out_u = ragged_gather_tc.roe_unsort_reduce(
+    out_u = _unsort_reduce(
         routed_u,
         token_ids_sorted_M,
         start_count_2,
@@ -298,7 +314,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
         cap=count,
         reduce_block_size=reduce_block_size,
     )
-    gathered_exact = ragged_gather_tc.roe_sort_gather(
+    gathered_exact = _sort_gather(
         x_ref.detach(),
         tok_exact,
         sc_exact,
@@ -390,7 +406,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
         * 0.3
     )
 
-    out = ragged_gather_tc.roe_unsort_combine(
+    out = _unsort_combine(
         routed,
         scores,
         token_ids_sorted_M,
@@ -407,7 +423,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
 
     # Compare against zero_pad_tail=True (pure-JAX reference branch in
     # _ragged_scale_and_dscore_tc) on zero-padded clean inputs.
-    out_ref = ragged_gather_tc.roe_unsort_combine(
+    out_ref = _unsort_combine(
         routed_clean,
         scores_ref,
         token_ids_sorted_M,
@@ -559,6 +575,36 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
               block_2d % ragged_gather_tc._packed_row_tile(itemsize), 0
           )
 
+  def test_scale_repack_is_bitwise_the_xla_row_scale(self):
+    """The combine's row scale rides on the repack; it must stay bitwise exact."""
+    self._require_tpu()
+    cap, d_dim, count = 2048, 3584, 1500
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.standard_normal((cap, d_dim), np.float32)).astype(
+        jnp.bfloat16
+    )
+    w = jnp.asarray(rng.random(cap, np.float32))
+    out = ragged_gather_tc._repack_2d_to_3d_valid_tc(x, jnp.int32(count), w)
+    expected = (x.astype(jnp.float32) * w[:, None]).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(
+        np.asarray(out[:count].reshape(count, d_dim)).view(np.uint16),
+        np.asarray(expected[:count]).view(np.uint16),
+    )
+
+  def test_token_relayout_is_exact(self):
+    """roe_tokens_to_3d is an exact reshape, forward and backward."""
+    self._require_tpu()
+    dev = self.accelerator_device
+    x = torch.randn(1024, 3584, device=dev, dtype=torch.bfloat16)
+    x_req = x.clone().requires_grad_(True)
+    x_TCL = ragged_gather_tc.roe_tokens_to_3d(x_req)
+    torch.testing.assert_close(
+        x_TCL, x.reshape(1024, 28, 128), rtol=0, atol=0
+    )
+    g = torch.randn(1024, 28, 128, device=dev, dtype=torch.bfloat16)
+    (dx,) = torch.autograd.grad(x_TCL, (x_req,), g)
+    torch.testing.assert_close(dx, g.reshape(1024, 3584), rtol=0, atol=0)
+
   def test_2d_gather_path_matches_reference_and_ignores_tail_rows(self):
     """cap = 1024 takes the 2D gathers and the valid-prefix 2D -> 3D repack."""
     self._require_tpu()
@@ -633,10 +679,10 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
     # (zero_pad_tail=True keeps the 3D path), and the rest of the last gather
     # block is zero.
     x_2d = x.clone().requires_grad_(True)
-    gathered_2d = ragged_gather_tc.roe_sort_gather(
+    gathered_2d = _sort_gather(
         x_2d, *routing, **gather_kwargs
     )
-    gathered_3d = ragged_gather_tc.roe_sort_gather(
+    gathered_3d = _sort_gather(
         x, *routing, zero_pad_tail=True, **gather_kwargs
     )
     torch.testing.assert_close(
@@ -687,12 +733,12 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
         )
         x_k = x.clone().requires_grad_(True)
         scores_k = scores.clone().requires_grad_(True)
-        gathered = ragged_gather_tc.roe_sort_gather(
+        gathered = _sort_gather(
             x_k, *routing, **gather_kwargs
         )
         routed = torch.cat([gathered[:count], nan_tail], dim=0)
         if weighted:
-          out = ragged_gather_tc.roe_unsort_combine(
+          out = _unsort_combine(
               routed,
               scores_k,
               token_ids_sorted_M,
@@ -715,7 +761,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
               _relative_l2_error(dscores, dscores_ref), 1e-2
           )
         else:
-          out = ragged_gather_tc.roe_unsort_reduce(
+          out = _unsort_reduce(
               routed,
               token_ids_sorted_M,
               start_count_2,

@@ -2001,7 +2001,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           sc_peer = global_scores[s_peer].clone().requires_grad_(True)
 
           def _fake_ag_apply(t, _mesh, _pg):
-            peer = x_peer if t.shape[1] == dim else sc_peer
+            if t.dim() == 3:  # the Pallas path gathers [T, dim // 128, 128]
+              peer = x_peer.reshape(t.shape)
+            else:
+              peer = x_peer if t.shape[1] == dim else sc_peer
             return (
                 torch.cat([t, peer], dim=0)
                 if rank == 0
@@ -2010,6 +2013,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
 
           def _fake_rs_apply(g, _mesh, _pg):
             return g[s_self]
+
+          def _fake_roe_rs_apply(g, _mesh, _pg):
+            return g.reshape(g.shape[0], -1)[s_self]
 
           disp = config_cls(
               num_experts=num_experts,
@@ -2030,6 +2036,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
               mock.patch.object(td_mod._EpAllGather, "apply", _fake_ag_apply),
               mock.patch.object(
                   td_mod._EpReduceScatter, "apply", _fake_rs_apply
+              ),
+              mock.patch.object(
+                  td_mod._RoECombineReduceScatter, "apply", _fake_roe_rs_apply
               ),
           ):
             routed_in, counts_e, meta = disp.dispatch(
