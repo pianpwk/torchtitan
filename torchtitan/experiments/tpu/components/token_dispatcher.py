@@ -49,6 +49,7 @@ from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
+    MOE_EP_COMBINE,
     MOE_EP_DISPATCH,
     MOE_ROUTING,
 )
@@ -1156,7 +1157,8 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             reduce_block_size=metadata.reduce_block_size,
             zero_pad_tail=metadata.zero_pad_tail,
         )
-      return _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
+      with annotate_region(MOE_EP_COMBINE):
+        return _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
 
   @annotate_fn({"EP": "dispatch"})
   def dispatch(
