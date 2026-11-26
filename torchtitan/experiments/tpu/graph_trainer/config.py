@@ -142,6 +142,13 @@ class GraphSplitterConfig:
   # unchanged. Applies to layers that have both an MoE and such a kernel;
   # raises if no layer does.
   expert_all_gathers_under_attention: bool = False
+  # Run each MoE layer copy's shared-expert work inside its exposed EP
+  # token-exchange windows (first dispatch all-gather and last combine
+  # reduce-scatter; in the backward also the combine's first transposed
+  # all-gather), pinned with optimization barriers
+  # (``passes/shared_experts_under_ep_comm.py``). Values pass through; raises
+  # if no window could be pinned.
+  shared_experts_under_ep_comm: bool = False
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``
