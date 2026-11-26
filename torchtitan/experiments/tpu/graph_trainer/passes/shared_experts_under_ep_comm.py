@@ -21,8 +21,8 @@ two optimization barriers:
   start: ``barrier(collective input, *segment inputs)`` -- the segment reads
          its inputs through it, so it cannot start before the collective can.
   end:   ``barrier(collective result, *segment outputs)`` -- the collective's
-         consumers and the segment's outside users read through it, so the
-         segment must finish before the routed path resumes.
+         consumers read its result through it, so the segment must finish
+         before the routed path resumes.
 
 Barriers pass values through, so values are unchanged unless XLA would
 otherwise have fused across a segment edge.
@@ -348,15 +348,14 @@ def apply_shared_experts_under_ep_comm(
       outs = [
           n for n in segment if _is_tensor(n) and any(u not in seg for u in n.users)
       ]
+      # Only the collective's consumers read through the end barrier: that
+      # alone orders the segment before them. Rewiring the segment outputs'
+      # other users too would make them wait for the collective, a cycle when
+      # one of them feeds the collective's input.
       consumers = [u for u in coll_out.users if _group(u) == group]
       end = _barrier(gm, [coll_out, *outs], f"{tag}_end")
-      end_nodes = {e.args[0] for e in end} | set(end)
       for user in consumers:
         user.replace_input_with(coll_out, end[0])
-      for value, gated in zip(outs, end[1:]):
-        for user in list(value.users):
-          if user not in seg and user not in end_nodes:
-            user.replace_input_with(value, gated)
       _stable_topological_sort(gm)
       pinned += 1
 
@@ -447,13 +446,8 @@ def apply_routing_metadata_under_ep_comm(
         meta.replace_input_with(value, gated)
     consumers = [u for u in coll_out.users if _group(u) == _group(meta)]
     end = _barrier(gm, [coll_out, *outs], f"{tag}_end")
-    end_nodes = {e.args[0] for e in end} | set(end)
     for user in consumers:
       user.replace_input_with(coll_out, end[0])
-    for value, gated in zip(outs, end[1:]):
-      for user in list(value.users):
-        if user not in end_nodes:
-          user.replace_input_with(value, gated)
     _stable_topological_sort(gm)
     pinned += 1
   if not pinned:
