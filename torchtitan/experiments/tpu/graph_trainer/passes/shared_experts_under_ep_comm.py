@@ -338,6 +338,15 @@ def apply_shared_experts_under_ep_comm(
               and i not in in_chain
           )
       )
+      # An outside input computed from the segment itself (segment -> other
+      # window's node -> segment) already starts after the segment; gating it
+      # would close a cycle through the start barrier.
+      if ext_in:
+        bound = max(order[i] for i in ext_in)
+        seg_down: set[torch.fx.Node] = set()
+        for n in segment:
+          seg_down |= _reach(n, upstream=False, order=order, bound=bound)
+        ext_in = [i for i in ext_in if i not in seg_down]
       gate = [coll_in, *(i for i in ext_in if i is not coll_in)]
       if len(gate) > 1:
         start = _barrier(gm, gate, f"{tag}_start")
