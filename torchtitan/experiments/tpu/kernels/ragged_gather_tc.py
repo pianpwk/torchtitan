@@ -1219,9 +1219,13 @@ def _roe_routing_metadata_tpu(
   else:
     window_slot_order_cap = jnp.zeros((cap,), dtype=jnp.int32)
 
+  # Only this rank's window [start, start + count) of the M expert-sorted
+  # slots reaches the gather-reduce, so sort just the [cap] window (the same
+  # stable (token, slot) order over the valid slots, hence the same reduce)
+  # instead of all M slots with a sentinel key past the window.
   meta = ragged_gather_reduce_tc_metadata(
-      token_ids_sorted_M,
-      start,
+      window_slot_order_cap // top_k,
+      0,
       count,
       top_k=top_k,
       block_size=reduce_block_size,
@@ -1352,7 +1356,7 @@ def _roe_unsort_fwd(
       tokens=tokens,
       blocks=blocks,
       block_size=reduce_block_size,
-      num_indices=token_ids_sorted_M.shape[0],
+      num_indices=cap,
   )
   return ragged_gather_reduce_tc(
       _repack_2d_to_3d_valid_tc(routed_output_RD, count, w_rows_cap),
@@ -1626,7 +1630,7 @@ class _RoESortGather(torch.autograd.Function):
       zero_pad_tail: bool,
   ) -> torch.Tensor:
     ctx.save_for_backward(start_count_2, src_rows, tokens, blocks)
-    ctx.num_indices = token_ids_sorted_M.shape[0]
+    ctx.num_indices = cap
     ctx.num_out_tokens = x_all_GCL.shape[0]
     ctx.top_k = top_k
     ctx.reduce_block_size = reduce_block_size
@@ -1756,7 +1760,7 @@ class _RoEUnsortReduce(torch.autograd.Function):
         src_rows,
         tokens,
         blocks,
-        token_ids_sorted_M.shape[0],
+        routed_output_RD.shape[0],
         num_out_tokens,
         top_k,
         reduce_block_size,
