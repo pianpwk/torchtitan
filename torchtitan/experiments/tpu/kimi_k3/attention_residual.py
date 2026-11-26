@@ -226,6 +226,24 @@ class TpuKimiK3TransformerBlock(KimiK3TransformerBlock):
     return prefix_sum_TD + h_TD, block_values_TD
 
 
+class _ContiguousGrad(torch.autograd.Function):
+  """Identity whose backward returns a contiguous gradient.
+
+  The gradient of a ``torch.stack`` input is a strided view of the stacked
+  gradient. Graph split passes a view across executables as its whole
+  storage, so N block values would each carry the ``[T, N + 1, D]`` buffer
+  (N x 2 GiB for full93); a contiguous ``[T, D]`` gradient carries 224 MiB.
+  """
+
+  @staticmethod
+  def forward(ctx, value_TD):
+    return value_TD.view_as(value_TD)
+
+  @staticmethod
+  def backward(ctx, grad_TD):
+    return grad_TD.contiguous()
+
+
 def _output_attention_residual(
     prefix_sum_TD: torch.Tensor,
     block_values_TD: tuple[torch.Tensor, ...],
@@ -241,7 +259,10 @@ def _output_attention_residual(
   numerics (see the module docstring), so it is a separate change.
   """
   assert norm.eps is not None
-  values_TND = torch.stack((*block_values_TD, prefix_sum_TD), dim=1)
+  values_TND = torch.stack(
+      (*(_ContiguousGrad.apply(v) for v in block_values_TD), prefix_sum_TD),
+      dim=1,
+  )
   values_float = values_TND.float()
   variance = values_float.pow(2).mean(dim=-1, keepdim=True)
   keys_TND = values_float * torch.rsqrt(variance + norm.eps)
