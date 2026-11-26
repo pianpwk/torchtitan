@@ -90,6 +90,7 @@ def tpu_latent_moe(
     cfg: KimiLatentMoE.Config,
     *,
     ep_capacity_factor: float | None = None,
+    num_token_chunks: int = 1,
 ) -> KimiLatentMoE.Config:
   """K3 LatentMoE with TPU gmm_v2 experts and the TPU dispatcher.
 
@@ -98,8 +99,9 @@ def tpu_latent_moe(
 
   ``ep_capacity_factor`` (Ring-of-Experts expert rows per EP rank, in units of
   the local routes; None is drop-free) applies only under EP; see
-  ``TpuAllToAllTokenDispatcher.Config``. ``TpuRoutedExperts`` runs one token
-  chunk.
+  ``TpuAllToAllTokenDispatcher.Config``. ``num_token_chunks`` > 1 pipelines
+  the EP dispatch, experts and combine over that many token chunks per layer
+  (``TpuRoutedExperts``; needs SimpleFSDP).
   """
   routed = cfg.routed_experts
   if type(routed.token_dispatcher) is not AllToAllTokenDispatcher.Config:
@@ -113,6 +115,7 @@ def tpu_latent_moe(
       routed_experts=derive(
           routed,
           TpuRoutedExperts.Config,
+          num_token_chunks=num_token_chunks,
           inner_experts=derive(
               routed.inner_experts,
               TpuKimiGroupedExperts.Config,
