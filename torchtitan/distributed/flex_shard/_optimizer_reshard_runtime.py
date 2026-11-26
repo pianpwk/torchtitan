@@ -303,6 +303,9 @@ class _BucketWork(Generic[_ItemT]):
     slot: _PipelineSlot
     storage_buffer: Tensor
     compute_fragment_buffer: Tensor
+    # Compiled runs only: the compute -> storage send buffer, built on its own
+    # instead of over the consumed received fragments (see _packed_buffer).
+    returned_fragment_buffer: Tensor | None = None
 
 
 class _NoOpStream:
@@ -687,13 +690,20 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
                 storage_buffer,
                 compute_fragment_buffer,
             ) = slot.buffers.communication_buffers(plan)
-            work = _BucketWork(plan, slot, storage_buffer, compute_fragment_buffer)
-            _prepare_redistributed(
+            pieces = _prepare_redistributed(
                 plan,
                 slot.buffers,
-                storage_buffer,
+                None if torch.compiler.is_compiling() else storage_buffer,
                 prepare=prepare,
             )
+            if pieces is not None:
+                storage_buffer = _packed_buffer(
+                    pieces,
+                    plan.storage_to_compute_schedule.input_buffer_numel,
+                    dtype=plan.compute_dtype,
+                    device=plan.device,
+                )
+            work = _BucketWork(plan, slot, storage_buffer, compute_fragment_buffer)
             _execute_packed_all_to_all(
                 plan.storage_to_compute_schedule,
                 output=compute_fragment_buffer,
@@ -745,12 +755,23 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         transfer = context.transfer_stream
         with handle.stream(transfer):
             transfer.wait_event(work.slot.compute_done)
+            returned = work.returned_fragment_buffer
+            if returned is not None:
+                # Compiled: receive into a fresh buffer rather than over the
+                # storage -> compute send buffer.
+                work.storage_buffer = torch.empty(
+                    work.plan.compute_to_storage_schedule.output_buffer_numel,
+                    dtype=work.plan.compute_dtype,
+                    device=work.plan.device,
+                )
+            else:
+                returned = work.compute_fragment_buffer[
+                    work.plan.compute_to_storage_offset :
+                ]
             _execute_packed_all_to_all(
                 work.plan.compute_to_storage_schedule,
                 output=work.storage_buffer,
-                input=work.compute_fragment_buffer[
-                    work.plan.compute_to_storage_offset :
-                ],
+                input=returned,
             )
             _finalize_redistributed(work, work.slot.buffers, finalize=finalize)
             work.slot.done.record(transfer)
@@ -779,15 +800,50 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
             finalize(item, prepared)
 
 
+def _packed_buffer(
+    pieces: list[tuple[int, Tensor]],
+    numel: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    """A flat send buffer from (offset, flat source) pieces, zeros elsewhere.
+
+    Compiled runs build send buffers with one concatenation. Writing each
+    piece into a flat buffer becomes a chain of dynamic-update-slices on the
+    whole buffer, and writing returned fragments over received ones that are
+    still being read makes XLA copy the whole buffer per write: the 64-rank
+    expert buckets of K3 at EP16 x eFSDP64 held ~120 copies of a 147 MiB buffer
+    per bucket (66 GiB for seven buckets).
+    """
+    parts: list[Tensor] = []
+    cursor = 0
+    for offset, piece in sorted(pieces, key=lambda entry: entry[0]):
+        if offset < cursor:
+            raise RuntimeError("overlapping packed all-to-all spans")
+        if offset > cursor:
+            parts.append(torch.zeros(offset - cursor, dtype=dtype, device=device))
+        parts.append(piece.reshape(-1).to(dtype))
+        cursor = offset + piece.numel()
+    if cursor > numel:
+        raise RuntimeError("packed all-to-all spans exceed the buffer")
+    if cursor < numel:
+        parts.append(torch.zeros(numel - cursor, dtype=dtype, device=device))
+    return torch.cat(parts) if len(parts) > 1 else parts[0]
+
+
 def _prepare_redistributed(
     plan: _RedistributionBucketPlan[_ItemT],
     slot: _BufferSlot,
-    storage_buffer: Tensor,
+    storage_buffer: Tensor | None,
     *,
     prepare: Callable[[_ItemT, Tensor], None],
-) -> None:
+) -> list[tuple[int, Tensor]] | None:
+    """Pack every redistributed item into ``storage_buffer``; without one
+    (compiled runs), return the (offset, flat source) pieces instead."""
     schedule = plan.storage_to_compute_schedule
     participant = plan.group.local_participant
+    pieces: list[tuple[int, Tensor]] = []
     for index, (item, redistribution_plan) in enumerate(
         zip(
             plan.redistributed_items,
@@ -803,14 +859,21 @@ def _prepare_redistributed(
         )
         prepare(item, prepared)
         spans = schedule.input_spans_by_parameter[index]
+        prepared_views = tuple(
+            _tensor_region_view(prepared, span.region).reshape(-1) for span in spans
+        )
+        if storage_buffer is None:
+            pieces.extend(
+                (span.buffer_offset, view)
+                for span, view in zip(spans, prepared_views, strict=True)
+            )
+            continue
         packed_views = tuple(
             storage_buffer[span.buffer_offset : span.buffer_offset + span.numel]
             for span in spans
         )
-        prepared_views = tuple(
-            _tensor_region_view(prepared, span.region).reshape(-1) for span in spans
-        )
         _batched_copy_(packed_views, prepared_views)
+    return None if storage_buffer is not None else pieces
 
 
 def _compute_redistributed(
@@ -823,9 +886,11 @@ def _compute_redistributed(
     participant = plan.group.local_participant
     to_compute = plan.storage_to_compute_schedule
     to_storage = plan.compute_to_storage_schedule
+    compiling = torch.compiler.is_compiling()
     returned_fragment_buffer = work.compute_fragment_buffer[
         plan.compute_to_storage_offset :
     ]
+    returned_pieces: list[tuple[int, Tensor]] = []
     for index, (item, redistribution_plan) in enumerate(
         zip(
             plan.redistributed_items,
@@ -856,17 +921,30 @@ def _compute_redistributed(
         compute(item, compute_tensor)
 
         output_spans = to_storage.input_spans_by_parameter[index]
+        compute_output_views = tuple(
+            _tensor_region_view(compute_tensor, span.region).reshape(-1)
+            for span in output_spans
+        )
+        if compiling:
+            returned_pieces.extend(
+                (span.buffer_offset, view)
+                for span, view in zip(output_spans, compute_output_views, strict=True)
+            )
+            continue
         packed_views = tuple(
             returned_fragment_buffer[
                 span.buffer_offset : span.buffer_offset + span.numel
             ]
             for span in output_spans
         )
-        compute_output_views = tuple(
-            _tensor_region_view(compute_tensor, span.region).reshape(-1)
-            for span in output_spans
-        )
         _batched_copy_(packed_views, compute_output_views)
+    if compiling:
+        work.returned_fragment_buffer = _packed_buffer(
+            returned_pieces,
+            to_storage.input_buffer_numel,
+            dtype=plan.compute_dtype,
+            device=plan.device,
+        )
 
 
 def _finalize_redistributed(
