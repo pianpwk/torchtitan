@@ -63,6 +63,7 @@ from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gathers import (
     apply_expert_all_gathers_under_attention,
 )
 from torchtitan.experiments.tpu.graph_trainer.passes.shared_experts_under_ep_comm import (
+    apply_routing_metadata_under_ep_comm,
     apply_shared_experts_under_ep_comm,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
@@ -354,6 +355,8 @@ class GraphSplitter:
       apply_expert_all_gathers_under_attention(traced.gm)
     if self.config.shared_experts_under_ep_comm:
       apply_shared_experts_under_ep_comm(traced.gm)
+    if self.config.routing_metadata_under_ep_comm:
+      apply_routing_metadata_under_ep_comm(traced.gm)
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
     # Host-slot recurrence belongs to the top-level forward signature, whether

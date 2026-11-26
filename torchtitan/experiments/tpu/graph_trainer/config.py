@@ -149,6 +149,11 @@ class GraphSplitterConfig:
   # (``passes/shared_experts_under_ep_comm.py``). Values pass through; raises
   # if no window could be pinned.
   shared_experts_under_ep_comm: bool = False
+  # Run each Ring-of-Experts routing metadata op (sorts, block tables) under
+  # the token all-gather whose gather reads it, instead of before that
+  # all-gather starts (``passes/shared_experts_under_ep_comm.py``). Values
+  # pass through; raises if nothing was pinned.
+  routing_metadata_under_ep_comm: bool = False
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``
