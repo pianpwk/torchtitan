@@ -31,12 +31,16 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
-from torchtitan.experiments.tpu.graph_trainer.collectives import is_reduce_scatter
+from torchtitan.experiments.tpu.graph_trainer.collectives import (
+    is_reduce_scatter,
+    op_name,
+)
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
     MOE_EP_COMBINE,
     MOE_EP_DISPATCH,
+    MOE_EP_ROUTING_METADATA,
     MOE_ROUTING,
     REMAT_REGION,
 )
@@ -316,6 +320,20 @@ def select_ep_combine(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 EP_COMBINE_REGION = SaveRegion(name=MOE_EP_COMBINE, select=select_ep_combine)
 
+
+def select_ep_routing_metadata(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return the Ring-of-Experts routing metadata ops (all seven outputs)."""
+    return [
+        node
+        for node in _forward_call_nodes(gm)
+        if op_name(node) == "tt_moe::roe_routing_metadata"
+    ]
+
+
+EP_ROUTING_METADATA_REGION = SaveRegion(
+    name=MOE_EP_ROUTING_METADATA, select=select_ep_routing_metadata
+)
+
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
@@ -324,6 +342,7 @@ SAVE_REGIONS: dict[str, SaveRegion] = {
         FFN_W2_REGION,
         EP_DISPATCH_REGION,
         EP_COMBINE_REGION,
+        EP_ROUTING_METADATA_REGION,
     )
 }
 

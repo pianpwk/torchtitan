@@ -37,6 +37,10 @@ MOE_EP_DISPATCH = "moe.ep_dispatch"
 # The Ring-of-Experts combine output (the EP reduce-scatter result): saving it
 # drops the combine and its reduce-scatter from the backward recompute.
 MOE_EP_COMBINE = "moe.ep_combine"
+# The Ring-of-Experts routing metadata (the ``tt_moe::roe_routing_metadata``
+# outputs: expert sort, slot order, block tables), which the backward
+# otherwise recomputes from the routing ids. Selected by op, not annotated.
+MOE_EP_ROUTING_METADATA = "moe.ep_routing_metadata"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"

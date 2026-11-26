@@ -166,8 +166,8 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # (which offloads them with the layer boundaries) only: full recompute,
   # except these save regions, whose values are saved for backward in every
   # layer: "moe.routing", "moe.ep_dispatch", "moe.ep_combine",
-  # "attention.inner_attention" and "feed_forward.w2" (see
-  # ``experiments/tpu/components/remat_regions.py``).
+  # "moe.ep_routing_metadata", "attention.inner_attention" and
+  # "feed_forward.w2" (see ``experiments/tpu/components/remat_regions.py``).
   save_regions: tuple[str, ...] = ()
   # ``tpu_selective`` and ``tpu_selective_and_offload`` only: save regions to
   # save only in their last N transformer layers, which backward reaches
