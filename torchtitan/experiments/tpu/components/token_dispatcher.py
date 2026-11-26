@@ -197,6 +197,39 @@ class _EpReduceScatter(torch.autograd.Function):
     return grad_in, None, None
 
 
+class _RoECombineReduceScatter(torch.autograd.Function):
+  """Reduce-scatters the RoE combine's ``[G, D // 128, 128]`` to ``[T, D]``.
+
+  The backward relayouts the local ``[T, D]`` gradient with
+  ``roe_tokens_to_3d`` and all-gathers it 3-D for the gather kernel, instead of
+  relayouting the all-gathered ``[G, D]``.
+  """
+
+  @staticmethod
+  def forward(ctx, partial_GCL: torch.Tensor, ep_mesh, pg) -> torch.Tensor:
+    ctx.set_materialize_grads(False)
+    ctx.ep_mesh = ep_mesh
+    ctx.pg = pg
+    # Reduce-scatter the 2-D view: XLA keeps its own layout for it, so the
+    # reduce-scatter and the op consuming its result round as before.
+    return _ep_reduce_scatter_sum_impl(
+        partial_GCL.reshape(partial_GCL.shape[0], -1), ep_mesh, pg
+    )
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_TD: torch.Tensor | None):
+    if grad_TD is None or not ctx.needs_input_grad[0]:
+      return None, None, None
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.experiments.tpu.kernels.ragged_gather_tc import (
+        roe_tokens_to_3d,
+    )
+
+    grad_TCL = roe_tokens_to_3d(grad_TD)
+    return _ep_all_gather_impl(grad_TCL, ctx.ep_mesh, ctx.pg), None, None
+
+
 def _ragged_all_to_all_impl(
     operand: torch.Tensor,
     output_rows: int,
@@ -980,6 +1013,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         roe_gather_out_2d,
         roe_gather_row_scales,
         roe_sort_gather,
+        roe_tokens_to_3d,
         safe_gather_block_size,
         safe_reduce_block_size,
         SCALE_DSCORE_BLOCK_ROWS,
@@ -1062,11 +1096,15 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         self._record_dropped_count(x_TD, dropped_count)
 
       with annotate_region(MOE_EP_DISPATCH):
-        x_all_GD = _EpAllGather.apply(x_TD, self.ep_mesh, pg)
+        # The gather kernel reads tokens as [G, D // 128, 128] rows. Relayout
+        # the local [T, D] before the all-gather, not the gathered [G, D]:
+        # 1 / ep_size of the copy bytes.
+        x_TCL = roe_tokens_to_3d(x_TD)
+        x_all_GCL = _EpAllGather.apply(x_TCL, self.ep_mesh, pg)
         scores_all_GK = _EpAllGather.apply(topk_scores_TK, self.ep_mesh, pg)
 
       routed_input_RD = roe_sort_gather(
-          x_all_GD,
+          x_all_GCL,
           token_ids_sorted_M,
           start_count_2,
           src_rows,
@@ -1129,7 +1167,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     with maybe_set_sparse_mesh():
       pg = self.ep_mesh.get_group()
       if metadata.row_scale_applied:
-        partial_GD = roe_unsort_reduce(
+        partial_GCL = roe_unsort_reduce(
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
             metadata.start_count_2,
@@ -1142,7 +1180,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             reduce_block_size=metadata.reduce_block_size,
         )
       else:
-        partial_GD = roe_unsort_combine(
+        partial_GCL = roe_unsort_combine(
             routed_output_RD,
             metadata.scores_flat_M,
             metadata.token_indices_experts_sorted_N,
@@ -1158,7 +1196,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             zero_pad_tail=metadata.zero_pad_tail,
         )
       with annotate_region(MOE_EP_COMBINE):
-        return _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
+        return _RoECombineReduceScatter.apply(partial_GCL, self.ep_mesh, pg)
 
   @annotate_fn({"EP": "dispatch"})
   def dispatch(
