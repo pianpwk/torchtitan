@@ -31,9 +31,11 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
+from torchtitan.experiments.tpu.graph_trainer.collectives import is_reduce_scatter
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
+    MOE_EP_COMBINE,
     MOE_EP_DISPATCH,
     MOE_ROUTING,
     REMAT_REGION,
@@ -296,6 +298,24 @@ def select_ep_dispatch(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 EP_DISPATCH_REGION = SaveRegion(name=MOE_EP_DISPATCH, select=select_ep_dispatch)
 
+
+def select_ep_combine(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return the Ring-of-Experts combine reduce-scatter outputs.
+
+    The backward reads the combine output only through the norm after it
+    (``routed_norm`` in K3's LatentMoE). Saving it removes the combine's
+    gather-reduce and EP reduce-scatter from the recompute, and the backward's
+    transposed all-gather no longer waits for them.
+    """
+    return [
+        node
+        for node in _forward_call_nodes(gm)
+        if _in_remat_region(node, MOE_EP_COMBINE) and is_reduce_scatter(node)
+    ]
+
+
+EP_COMBINE_REGION = SaveRegion(name=MOE_EP_COMBINE, select=select_ep_combine)
+
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
@@ -303,6 +323,7 @@ SAVE_REGIONS: dict[str, SaveRegion] = {
         SPLASH_ATTENTION_REGION,
         FFN_W2_REGION,
         EP_DISPATCH_REGION,
+        EP_COMBINE_REGION,
     )
 }
 
@@ -313,8 +334,19 @@ def _full_and_offload_memory_policy_pass(
     *,
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
-    """Full recompute plus CPU offload of saved layer boundaries."""
-    _full_memory_policy_pass(gm, config=config)
+    """Full recompute plus CPU offload of saved layer boundaries.
+
+    The ``compile.save_regions`` values, if any, are saved too and offloaded
+    with the layer boundaries (``tpu_selective_and_offload`` keeps its saves
+    in HBM instead).
+    """
+    if config.compile.save_regions:
+        regions = resolve_save_regions(
+            config.compile.save_regions, {}, "full_and_offload"
+        )
+        full_remat_with_saves(gm, config, select_saves(gm, regions, {}))
+    else:
+        _full_memory_policy_pass(gm, config=config)
     tag_all_offloadable_activations(
         gm,
         cpu_budget_gb=config.compile.cpu_offload_budget_gb,
