@@ -48,6 +48,7 @@ from __future__ import annotations
 import heapq
 import math
 import operator
+import time
 from collections import defaultdict
 
 import torch
@@ -245,6 +246,7 @@ def _stable_topological_sort(gm: torch.fx.GraphModule) -> None:
 def apply_shared_experts_under_ep_comm(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.GraphModule:
+  t0 = time.perf_counter()
   in_chain = set().union(*collect_collective_chains(gm).values())
   shared: dict[tuple, list[torch.fx.Node]] = defaultdict(list)
   launches: dict[tuple, list[torch.fx.Node]] = defaultdict(list)
@@ -364,5 +366,12 @@ def apply_shared_experts_under_ep_comm(
     )
   gm.graph.lint()
   gm.recompile()
-  logger.info("%s: pinned %d windows, skipped %d", _TAG, pinned, skipped)
+  logger.info(
+      "%s: pinned %d windows, skipped %d (%.1f s, %d nodes)",
+      _TAG,
+      pinned,
+      skipped,
+      time.perf_counter() - t0,
+      len(gm.graph.nodes),
+  )
   return gm
