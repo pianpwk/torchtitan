@@ -62,8 +62,8 @@ class _AttentionResidual(torch.autograd.Function):
   pass over the block values for the score gradients and one fused pass that
   writes the N block value gradients (autograd's version builds them from N
   per-value ``select`` gradients and was 1.5x slower at N = 8). The block
-  values are stacked only as operands of the reductions, as in the
-  ``[T, N, D]`` form, so XLA fuses the stack into them.
+  values are stacked as operands of that pass and of the reductions, as in
+  the ``[T, N, D]`` form, so XLA fuses the stack into them.
   """
 
   @staticmethod
@@ -119,14 +119,13 @@ class _AttentionResidual(torch.autograd.Function):
     #   = inv_rms * (w - score * inv_rms * value / D).
     a_TV = grad_scores_TV * inv_rms_TV
     c_TV = scores_TV * inv_rms_TV / dim
-    grad_block_values_TD = tuple(
-        (
-            probs_TV[:, i : i + 1] * grad_float_TD
-            + a_TV[:, i : i + 1]
-            * (score_weight_D - c_TV[:, i : i + 1] * value_TD.float())
-        ).to(value_TD.dtype)
-        for i, value_TD in enumerate(block_values_TD)
-    )
+    grad_block_values_TD = ()
+    if n:
+      grad_block_values_TD = (
+          probs_TV[:, :n, None] * grad_float_TD.unsqueeze(1)
+          + a_TV[:, :n, None]
+          * (score_weight_D - c_TV[:, :n, None] * block_float_TND)
+      ).to(prefix_sum_TD.dtype).unbind(1)
     grad_prefix_TD = (
         probs_TV[:, n:] * grad_float_TD
         + a_TV[:, n:] * (score_weight_D - c_TV[:, n:] * prefix_float_TD)
