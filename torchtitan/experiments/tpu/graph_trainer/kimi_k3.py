@@ -48,6 +48,9 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
 from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
+from torchtitan.experiments.tpu.kimi_k3.attention_residual import (
+    TpuKimiK3Model,
+)
 from torchtitan.models.kimi_k3 import KimiK3Model
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -62,6 +65,18 @@ class GraphTrainerKimiK3Model(KimiK3Model):
   def init_states(self, *, buffer_device: torch.device | None = None) -> None:
     with disable_active_parametrization():
       super().init_states(buffer_device=buffer_device)
+
+
+class GraphTrainerTpuKimiK3Model(GraphTrainerKimiK3Model, TpuKimiK3Model):
+  """``GraphTrainerKimiK3Model`` with ``TpuKimiK3Model``'s forward.
+
+  For recipes that build their layers as ``TpuKimiK3TransformerBlock``
+  (``use_tpu_attention_residual``).
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(GraphTrainerKimiK3Model.Config, TpuKimiK3Model.Config):
+    pass
 
 
 def _shard_routed_experts(

@@ -58,7 +58,7 @@ class AttentionResidualTest(base_device_test.BaseAcceleratorDeviceTest):
     # below must keep as a separate leaf.
     prefix_d = prefix.to(dev).detach().requires_grad_()
     block_d = block.to(dev).detach().requires_grad_()
-    out = attention_residual(prefix_d, block_d, proj, norm)
+    out = attention_residual(prefix_d, tuple(block_d.unbind(1)), proj, norm)
     out.backward(grad_out.to(dev))
     self.assertEqual(out.dtype, torch.bfloat16)
 
