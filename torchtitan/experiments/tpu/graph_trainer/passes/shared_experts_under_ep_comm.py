@@ -112,12 +112,16 @@ def _window_ends(launch: torch.fx.Node) -> tuple[torch.fx.Node, torch.fx.Node]:
   return launch.args[0], waits[0] if waits else launch
 
 
-def _select_windows(launches: list[torch.fx.Node]) -> list[torch.fx.Node]:
+def _select_windows(launches: list[torch.fx.Node]) -> list[list[torch.fx.Node]]:
   """The exposed windows of one layer copy, in graph order.
 
   Phases are the forward / recompute (dispatch all-gathers, then combine
   reduce-scatters) and the backward's transposed all-gathers. Per phase keep
-  the first all-gather and the last reduce-scatter.
+  the first all-gather and the last reduce-scatter. With EP token chunking the
+  first window is the first all-gather of every chunk: they are independent,
+  and the scheduler runs whichever chunk is unconstrained first, so pinning
+  into one chunk's gather would leave the gather that actually runs first
+  empty.
   """
   phases: dict[str, list[torch.fx.Node]] = defaultdict(list)
   for launch in launches:
@@ -130,11 +134,22 @@ def _select_windows(launches: list[torch.fx.Node]) -> list[torch.fx.Node]:
     gathers = [n for n in nodes if is_gather(n)]
     scatters = [n for n in nodes if is_reduce_scatter(n)]
     if gathers:
-      chosen.append(gathers[0])
+      first_per_chunk: dict[int | None, torch.fx.Node] = {}
+      for n in gathers:
+        first_per_chunk.setdefault(_chunk(n), n)
+      if _chunk(gathers[0]) is None:
+        chosen.append([gathers[0]])
+      else:
+        chosen.append(list(first_per_chunk.values()))
     if scatters:
-      chosen.append(scatters[-1])
+      chosen.append([scatters[-1]])
   order = {n: i for i, n in enumerate(launches)}
-  return sorted(chosen, key=order.__getitem__)
+  return sorted(chosen, key=lambda w: order[w[0]])
+
+
+def _chunk(node: torch.fx.Node) -> int | None:
+  """EP token chunk index (``TpuRoutedExperts._forward_ep_chunked``), if any."""
+  return (node.meta.get("custom") or {}).get("ep_chunk_idx")
 
 
 def _segments(
@@ -329,15 +344,20 @@ def apply_shared_experts_under_ep_comm(
         _TAG,
         group[0],
         "b" if group[1] else "f",
-        [f"{w.name}:{tuple(w.args[0].meta['val'].shape)}" for w in windows],
+        [
+            "+".join(f"{n.name}:{tuple(n.args[0].meta['val'].shape)}" for n in w)
+            for w in windows
+        ],
         len(nodes),
         [len(s) for s in segments],
     )
-    for k, (launch, segment) in enumerate(zip(windows, segments)):
+    for k, (window, segment) in enumerate(zip(windows, segments)):
       if not segment:
         continue
       seg = set(segment)
-      coll_in, coll_out = _window_ends(launch)
+      ends = [_window_ends(launch) for launch in window]
+      coll_ins = list(dict.fromkeys(i for i, _ in ends))
+      coll_outs = [o for _, o in ends]
       tag = f"L{group[0]}{'b' if group[1] else 'f'}w{k}"
       order = {n: i for i, n in enumerate(gm.graph.nodes)}
       first = min(order[n] for n in segment)
@@ -345,15 +365,19 @@ def apply_shared_experts_under_ep_comm(
       # The segment must not feed the collective's input (the start barrier
       # would close a cycle) nor read anything downstream of its result (the
       # end barrier would).
-      upstream = _reach(coll_in, upstream=True, order=order, bound=first)
-      downstream = _reach(coll_out, upstream=False, order=order, bound=last)
+      upstream: set[torch.fx.Node] = set()
+      downstream: set[torch.fx.Node] = set()
+      for coll_in in coll_ins:
+        upstream |= _reach(coll_in, upstream=True, order=order, bound=first)
+      for coll_out in coll_outs:
+        downstream |= _reach(coll_out, upstream=False, order=order, bound=last)
       bad = [n for n in segment if n in upstream or n in downstream]
       if bad:
         logger.warning(
             "%s: skipping window %s (%s): %d segment nodes are %s it, e.g. %s",
             _TAG,
             tag,
-            launch.name,
+            [launch.name for launch in window],
             len(bad),
             "upstream of" if bad[0] in upstream else "downstream of",
             [n.name for n in bad[:4]],
@@ -383,7 +407,7 @@ def apply_shared_experts_under_ep_comm(
           seg_down |= _reach(n, upstream=False, order=order, bound=bound)
         ext_in = [i for i in ext_in if i not in seg_down]
       edit = _Edit(gm)
-      gate = [coll_in, *(i for i in ext_in if i is not coll_in)]
+      gate = [*coll_ins, *(i for i in ext_in if i not in coll_ins)]
       if len(gate) > 1:
         start = edit.barrier(gate, f"{tag}_start")
         for value, gated in zip(gate, start):
@@ -397,10 +421,13 @@ def apply_shared_experts_under_ep_comm(
       # alone orders the segment before them. Rewiring the segment outputs'
       # other users too would make them wait for the collective, a cycle when
       # one of them feeds the collective's input.
-      consumers = [u for u in coll_out.users if _group(u) == group]
-      end = edit.barrier([coll_out, *outs], f"{tag}_end")
-      for user in consumers:
-        edit.rewire(user, coll_out, end[0])
+      consumers = [
+          [u for u in coll_out.users if _group(u) == group] for coll_out in coll_outs
+      ]
+      end = edit.barrier([*coll_outs, *outs], f"{tag}_end")
+      for coll_out, gated, users in zip(coll_outs, end, consumers):
+        for user in users:
+          edit.rewire(user, coll_out, gated)
       if not edit.commit(f"{_TAG} {tag}"):
         skipped += 1
         continue
