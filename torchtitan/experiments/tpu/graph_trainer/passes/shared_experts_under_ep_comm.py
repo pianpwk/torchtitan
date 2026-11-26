@@ -118,10 +118,11 @@ def _select_windows(launches: list[torch.fx.Node]) -> list[list[torch.fx.Node]]:
   Phases are the forward / recompute (dispatch all-gathers, then combine
   reduce-scatters) and the backward's transposed all-gathers. Per phase keep
   the first all-gather and the last reduce-scatter. With EP token chunking the
-  first window is the first all-gather of every chunk: they are independent,
-  and the scheduler runs whichever chunk is unconstrained first, so pinning
-  into one chunk's gather would leave the gather that actually runs first
-  empty.
+  forward / recompute phase's first window is the first all-gather of every
+  chunk: they are independent, and the scheduler runs whichever chunk is
+  unconstrained first, so pinning into one chunk's gather would leave the
+  gather that actually runs first empty. The backward's transposed gathers
+  keep one window (measured: pinning into every chunk's exposed both).
   """
   phases: dict[str, list[torch.fx.Node]] = defaultdict(list)
   for launch in launches:
@@ -130,14 +131,14 @@ def _select_windows(launches: list[torch.fx.Node]) -> list[list[torch.fx.Node]]:
     )
     phases["bwd" if backward else "fwd"].append(launch)
   chosen = []
-  for nodes in phases.values():
+  for phase, nodes in phases.items():
     gathers = [n for n in nodes if is_gather(n)]
     scatters = [n for n in nodes if is_reduce_scatter(n)]
     if gathers:
       first_per_chunk: dict[int | None, torch.fx.Node] = {}
       for n in gathers:
         first_per_chunk.setdefault(_chunk(n), n)
-      if _chunk(gathers[0]) is None:
+      if phase == "bwd" or _chunk(gathers[0]) is None:
         chosen.append([gathers[0]])
       else:
         chosen.append(list(first_per_chunk.values()))
