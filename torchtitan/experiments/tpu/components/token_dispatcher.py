@@ -209,11 +209,8 @@ class _RoECombineReduceScatter(torch.autograd.Function):
     ctx.set_materialize_grads(False)
     ctx.ep_mesh = ep_mesh
     ctx.pg = pg
-    # Reduce-scatter the 2-D view: XLA keeps its own layout for it, so the
-    # reduce-scatter and the op consuming its result round as before.
-    return _ep_reduce_scatter_sum_impl(
-        partial_GCL.reshape(partial_GCL.shape[0], -1), ep_mesh, pg
-    )
+    out_TCL = _ep_reduce_scatter_sum_impl(partial_GCL, ep_mesh, pg)
+    return out_TCL.reshape(out_TCL.shape[0], -1)
 
   @staticmethod
   @once_differentiable
@@ -1165,6 +1162,8 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
     with maybe_set_sparse_mesh():
       pg = self.ep_mesh.get_group()
+      # The gather-reduce writes [G, D // 128, 128]; reduce-scatter it in that
+      # layout and relayout only the local [T, D // 128, 128] result.
       if metadata.row_scale_applied:
         partial_GCL = roe_unsort_reduce(
             routed_output_RD,
