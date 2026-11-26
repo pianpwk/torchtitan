@@ -34,6 +34,9 @@ ATTENTION_INNER_ATTENTION = "attention.inner_attention"
 MOE_ROUTING = "moe.routing"
 # Expert-parallel activation all-gather outputs in Ring-of-Experts dispatch.
 MOE_EP_DISPATCH = "moe.ep_dispatch"
+# The Ring-of-Experts combine output (the EP reduce-scatter result): saving it
+# drops the combine and its reduce-scatter from the backward recompute.
+MOE_EP_COMBINE = "moe.ep_combine"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"
