@@ -582,7 +582,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         local_tensor_spec: Callable[
             [_ItemT], tuple[torch.Size, torch.dtype, torch.device]
         ],
-        prepare: Callable[[_ItemT, Tensor], None],
+        prepare: Callable[[Sequence[_ItemT], Sequence[Tensor] | None], Sequence[Tensor]],
         compute: Callable[[_ItemT, Tensor], None],
         finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
@@ -727,7 +727,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         slot: _PipelineSlot,
         context: _CommunicationContext,
         *,
-        prepare: Callable[[_ItemT, Tensor], None],
+        prepare: Callable[[Sequence[_ItemT], Sequence[Tensor] | None], Sequence[Tensor]],
     ) -> _BucketWork[_ItemT]:
         handle = context.device_handle
         transfer = context.transfer_stream
@@ -768,7 +768,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         local_tensor_spec: Callable[
             [_ItemT], tuple[torch.Size, torch.dtype, torch.device]
         ],
-        prepare: Callable[[_ItemT, Tensor], None],
+        prepare: Callable[[Sequence[_ItemT], Sequence[Tensor] | None], Sequence[Tensor]],
         compute: Callable[[_ItemT, Tensor], None],
         finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
@@ -834,14 +834,14 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         local_tensor_spec: Callable[
             [_ItemT], tuple[torch.Size, torch.dtype, torch.device]
         ],
-        prepare: Callable[[_ItemT, Tensor], None],
+        prepare: Callable[[Sequence[_ItemT], Sequence[Tensor] | None], Sequence[Tensor]],
         compute: Callable[[_ItemT, Tensor], None],
         finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
         for item in items:
             shape, dtype, device = local_tensor_spec(item)
             prepared = slot.compute_buffer(shape, dtype=dtype, device=device)
-            prepare(item, prepared)
+            prepare((item,), (prepared,))
             compute(item, prepared)
             finalize((item,), (prepared,))
 
@@ -890,13 +890,27 @@ def _prepare_redistributed(
     slot: _BufferSlot,
     storage_buffer: Tensor | None,
     *,
-    prepare: Callable[[_ItemT, Tensor], None],
+    prepare: Callable[[Sequence[_ItemT], Sequence[Tensor] | None], Sequence[Tensor]],
 ) -> list[tuple[int, Tensor]] | None:
-    """Pack every redistributed item into ``storage_buffer``; without one
-    (compiled runs), return the (offset, flat source) pieces instead."""
+    """Pack every redistributed item into ``storage_buffer``, preparing one
+    item at a time into the reserved scratch; without one (fresh buffers),
+    prepare the whole bucket with one call and return the (offset, flat
+    source) pieces instead."""
     schedule = plan.storage_to_compute_schedule
     participant = plan.group.local_participant
-    pieces: list[tuple[int, Tensor]] = []
+    if storage_buffer is None:
+        prepared_items = prepare(plan.redistributed_items, None)
+        pieces: list[tuple[int, Tensor]] = []
+        for index, (prepared, redistribution_plan) in enumerate(
+            zip(prepared_items, plan.redistribution_plans, strict=True)
+        ):
+            partition = redistribution_plan.storage_partition(participant)
+            assert tuple(prepared.shape) == tuple(partition.tensor_shape)
+            pieces.extend(
+                (span.buffer_offset, _tensor_region_view(prepared, span.region))
+                for span in schedule.input_spans_by_parameter[index]
+            )
+        return pieces
     for index, (item, redistribution_plan) in enumerate(
         zip(
             plan.redistributed_items,
@@ -910,23 +924,17 @@ def _prepare_redistributed(
             dtype=plan.dtype,
             device=plan.device,
         )
-        prepare(item, prepared)
+        prepare((item,), (prepared,))
         spans = schedule.input_spans_by_parameter[index]
         prepared_views = tuple(
             _tensor_region_view(prepared, span.region).reshape(-1) for span in spans
         )
-        if storage_buffer is None:
-            pieces.extend(
-                (span.buffer_offset, view)
-                for span, view in zip(spans, prepared_views, strict=True)
-            )
-            continue
         packed_views = tuple(
             storage_buffer[span.buffer_offset : span.buffer_offset + span.numel]
             for span in spans
         )
         _batched_copy_(packed_views, prepared_views)
-    return None if storage_buffer is not None else pieces
+    return None
 
 
 def _compute_redistributed(

@@ -668,20 +668,46 @@ class DistMuon(Optimizer):
         return local_grad, local_momentum, momentum_state, group
 
     def _prepare_local(
-        self, compute_layout: _ParameterComputeLayout, out: Tensor
-    ) -> None:
-        grad, momentum, momentum_state, group = self._local_gradient_and_momentum(
-            compute_layout
-        )
-        _prepare_muon_input(
-            grad,
-            momentum,
-            momentum=group["momentum"],
-            nesterov=group["nesterov"],
-            out=out,
-            momentum_updated=self._momenta_and_decay_applied,
-        )
-        torch.autograd.graph.increment_version(momentum_state)
+        self,
+        compute_layouts: Sequence[_ParameterComputeLayout],
+        outs: Sequence[Tensor] | None,
+    ) -> Sequence[Tensor]:
+        """Update momenta (unless already updated) and return the Muon inputs:
+        written into ``outs`` per item when given, else new tensors from one
+        foreach op per param group (a per-item op is a program per item on
+        TorchTPU eager)."""
+        grads: list[Tensor] = []
+        momenta: list[Tensor] = []
+        indices_by_group: dict[int, list[int]] = {}
+        for index, compute_layout in enumerate(compute_layouts):
+            grad, momentum, momentum_state, _group = (
+                self._local_gradient_and_momentum(compute_layout)
+            )
+            grads.append(grad)
+            momenta.append(momentum)
+            torch.autograd.graph.increment_version(momentum_state)
+            indices_by_group.setdefault(compute_layout.group_index, []).append(index)
+        prepared: list[Tensor] = list(outs) if outs is not None else momenta[:]
+        for group_index, indices in indices_by_group.items():
+            group = self.param_groups[group_index]
+            group_grads = [grads[i] for i in indices]
+            group_momenta = [momenta[i] for i in indices]
+            if not self._momenta_and_decay_applied:
+                torch._foreach_lerp_(group_momenta, group_grads, 1 - group["momentum"])
+            if outs is not None:
+                for i in indices:
+                    if group["nesterov"]:
+                        torch.lerp(grads[i], momenta[i], group["momentum"], out=outs[i])
+                    else:
+                        outs[i].copy_(momenta[i])
+            elif group["nesterov"]:
+                for i, value in zip(
+                    indices,
+                    torch._foreach_lerp(group_grads, group_momenta, group["momentum"]),
+                    strict=True,
+                ):
+                    prepared[i] = value
+        return prepared
 
     def _compute_update(
         self, compute_layout: _ParameterComputeLayout, compute: Tensor
@@ -1967,31 +1993,6 @@ def _adjust_muon_learning_rate(
     else:
         raise ValueError(f"unsupported adjust_lr_fn {adjust_lr_fn!r}")
     return lr * ratio
-
-
-def _prepare_muon_input(
-    gradient: Tensor,
-    momentum_buffer: Tensor,
-    *,
-    momentum: float,
-    nesterov: bool,
-    out: Tensor,
-    momentum_updated: bool,
-) -> Tensor:
-    """Update momentum (unless already updated) and prepare the Tensor passed
-    to Muon computation."""
-    if not momentum_updated:
-        momentum_buffer.lerp_(gradient, 1 - momentum)
-    if nesterov:
-        torch.lerp(
-            gradient,
-            momentum_buffer,
-            momentum,
-            out=out,
-        )
-    else:
-        out.copy_(momentum_buffer)
-    return out
 
 
 def _compute_muon_direction(
