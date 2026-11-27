@@ -866,21 +866,31 @@ def _packed_buffer(
     program per piece, specialized on the piece's offset.
     """
     source_dtype = pieces[0][1].dtype if pieces else dtype
-    parts: list[Tensor] = []
+    ordered = sorted(pieces, key=lambda entry: entry[0])
+    gaps: list[int] = []
     cursor = 0
-    for offset, piece in sorted(pieces, key=lambda entry: entry[0]):
+    for offset, piece in ordered:
         if offset < cursor:
             raise RuntimeError("overlapping packed all-to-all spans")
-        if offset > cursor:
-            parts.append(
-                torch.zeros(offset - cursor, dtype=source_dtype, device=device)
-            )
-        parts.append(piece.reshape(-1))
+        gaps.append(offset - cursor)
         cursor = offset + piece.numel()
     if cursor > numel:
         raise RuntimeError("packed all-to-all spans exceed the buffer")
-    if cursor < numel:
-        parts.append(torch.zeros(numel - cursor, dtype=source_dtype, device=device))
+    gaps.append(numel - cursor)
+    # Gaps (equal-split padding) are slices of one zeros tensor: a zeros tensor
+    # per gap is a program per gap on TorchTPU eager.
+    zeros = (
+        torch.zeros(max(gaps), dtype=source_dtype, device=device) if any(gaps) else None
+    )
+    parts: list[Tensor] = []
+    for gap, (_offset, piece) in zip(gaps, ordered):
+        if gap:
+            assert zeros is not None
+            parts.append(zeros[:gap])
+        parts.append(piece.reshape(-1))
+    if gaps[-1]:
+        assert zeros is not None
+        parts.append(zeros[: gaps[-1]])
     packed = torch.cat(parts) if len(parts) > 1 else parts[0]
     return packed.to(dtype)
 
