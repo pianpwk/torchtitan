@@ -248,6 +248,16 @@ class _BufferSlot:
         to_storage = plan.compute_to_storage_schedule
         key = (plan.device, plan.compute_dtype)
         reserved = self.buffers[key]
+        if _fresh_buffers(plan.device):
+            # Fresh buffers carry only the storage -> compute exchange (the
+            # send buffer is built by concatenation), sized exactly so that
+            # _received_region can view the received buffer as whole rows.
+            received = torch.empty(
+                to_compute.output_buffer_numel,
+                dtype=plan.compute_dtype,
+                device=plan.device,
+            )
+            return received, received
         return (
             _reserved_view(
                 reserved,
@@ -913,9 +923,7 @@ def _compute_redistributed(
             continue
         received_spans = to_compute.output_spans_by_parameter[index]
         received_views = tuple(
-            work.compute_fragment_buffer[
-                span.buffer_offset : span.buffer_offset + span.numel
-            ].view(span.region.shape)
+            _received_region(work.compute_fragment_buffer, span)
             for span in received_spans
         )
         compute_tensor = _concatenated_regions(
@@ -981,10 +989,7 @@ def _finalize_redistributed(
         partition = redistribution_plan.storage_partition(participant)
         spans = schedule.output_spans_by_parameter[index]
         packed_views = tuple(
-            work.storage_buffer[
-                span.buffer_offset : span.buffer_offset + span.numel
-            ].view(span.region.shape)
-            for span in spans
+            _received_region(work.storage_buffer, span) for span in spans
         )
         update = (
             _concatenated_regions(partition.tensor_shape, spans, packed_views)
@@ -1004,6 +1009,32 @@ def _finalize_redistributed(
             )
             _batched_copy_(update_views, packed_views)
         finalize(item, update)
+
+
+def _received_region(buffer: Tensor, span: Any) -> Tensor:
+    """``span``'s region of a received all-to-all buffer, in the region's shape.
+
+    TODO: Drop the row slicing once TorchTPU eager lowers a view of a slice
+    without relaying out the whole base. It lowers ``buffer[a:b].view(r, c)``
+    of a buffer the all-to-all wrote as [rows, 1024] by reshaping the whole
+    buffer to ``c`` columns: a [896, 7] region (K3's Shard(1) router and latent
+    storage shards at FSDP1024) cost 7 ms per 168 MiB buffer and 77 ms per
+    1792 MiB buffer, ~0.25 ms with the covering rows cloned first. Regions
+    whose minor dimension is a multiple of the 128 TPU lanes view cheaply and
+    skip the extra clone.
+    """
+    start, stop = span.buffer_offset, span.buffer_offset + span.numel
+    columns = _TPU_ALL_TO_ALL_COLUMNS
+    if (
+        buffer.device.type == "tpu"
+        and not torch.compiler.is_compiling()
+        and buffer.numel() % columns == 0
+        and span.region.shape[-1] % 128 != 0
+    ):
+        first_row, skip = divmod(start, columns)
+        rows = buffer.view(-1, columns)[first_row : -(-stop // columns)].clone()
+        return rows.view(-1)[skip : skip + span.numel].view(span.region.shape)
+    return buffer[start:stop].view(span.region.shape)
 
 
 def _concatenated_regions(
