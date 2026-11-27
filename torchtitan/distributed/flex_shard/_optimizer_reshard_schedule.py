@@ -366,10 +366,15 @@ def _validate_redistribution_plan(plan: _RedistributionPlan) -> None:
     compute_by_participant = {
         partition.participant: partition for partition in plan.compute_partitions
     }
+    source_routes_by_participant: dict[int, list[_TensorRegionRoute]] = {}
+    destination_routes_by_participant: dict[int, list[_TensorRegionRoute]] = {}
+    for route in routes:
+        for participant in route.source.participants:
+            source_routes_by_participant.setdefault(participant, []).append(route)
+        for participant in route.destination.participants:
+            destination_routes_by_participant.setdefault(participant, []).append(route)
     for participant in plan.participants:
-        source_routes = tuple(
-            route for route in routes if participant in route.source.participants
-        )
+        source_routes = source_routes_by_participant.get(participant, ())
         _validate_regions_cover_partition(
             tuple(route.logical_region for route in source_routes),
             storage_by_participant[participant].logical_regions,
@@ -382,9 +387,7 @@ def _validate_redistribution_plan(plan: _RedistributionPlan) -> None:
             direction=f"storage source tensor {participant}",
         )
 
-        destination_routes = tuple(
-            route for route in routes if participant in route.destination.participants
-        )
+        destination_routes = destination_routes_by_participant.get(participant, ())
         _validate_regions_cover_partition(
             tuple(route.logical_region for route in destination_routes),
             compute_by_participant[participant].logical_regions,
@@ -421,6 +424,8 @@ def _validate_disjoint_regions_in_bounds(
     )
 
     positive_regions = [region for region in regions if region.numel]
+    if len(positive_regions) < 2:
+        return
     # Sweep along the first dim on which the regions' offsets differ: once a
     # later region starts past ``first``'s end on that dim, so do all after it.
     # (Sweeping dim 0 is quadratic for column shards, whose regions all start
@@ -899,53 +904,41 @@ def _build_packed_all_to_all_schedule(
                 )
         split_stride = max(pair_numel.values(), default=0)
 
-    input_split_sizes = []
-    input_spans = []
-    input_cursor = 0
-    for destination_index, destination in enumerate(participants):
-        if split_stride is not None:
-            input_cursor = destination_index * split_stride
-        split_start = input_cursor
-        for parameter_index, transfers in enumerate(transfers_by_parameter):
-            for (
-                source,
-                transfer_destination,
-                source_region,
-                _destination_region,
-            ) in transfers:
-                if source != local_participant or transfer_destination != destination:
-                    continue
-                input_spans.append(
-                    (parameter_index, _PackedSpan(source_region, input_cursor))
+    # This participant's sends grouped by destination and receives grouped by
+    # source, each in (parameter, transfer) order.
+    sends: dict[int, list[tuple[int, _TensorRegion]]] = {}
+    receives: dict[int, list[tuple[int, _TensorRegion]]] = {}
+    for parameter_index, transfers in enumerate(transfers_by_parameter):
+        for source, destination, source_region, destination_region in transfers:
+            if source == local_participant:
+                sends.setdefault(destination, []).append(
+                    (parameter_index, source_region)
                 )
-                input_cursor += source_region.numel
-        input_split_sizes.append(
-            input_cursor - split_start if split_stride is None else split_stride
-        )
+            if destination == local_participant:
+                receives.setdefault(source, []).append(
+                    (parameter_index, destination_region)
+                )
 
-    output_split_sizes = []
-    output_spans = []
-    output_cursor = 0
-    for source_index, source in enumerate(participants):
-        if split_stride is not None:
-            output_cursor = source_index * split_stride
-        split_start = output_cursor
-        for parameter_index, transfers in enumerate(transfers_by_parameter):
-            for (
-                transfer_source,
-                destination,
-                _source_region,
-                destination_region,
-            ) in transfers:
-                if transfer_source != source or destination != local_participant:
-                    continue
-                output_spans.append(
-                    (parameter_index, _PackedSpan(destination_region, output_cursor))
-                )
-                output_cursor += destination_region.numel
-        output_split_sizes.append(
-            output_cursor - split_start if split_stride is None else split_stride
-        )
+    def pack(
+        regions_by_peer: dict[int, list[tuple[int, _TensorRegion]]],
+    ) -> tuple[list[int], list[tuple[int, _PackedSpan]]]:
+        split_sizes = []
+        spans = []
+        cursor = 0
+        for peer_index, peer in enumerate(participants):
+            if split_stride is not None:
+                cursor = peer_index * split_stride
+            split_start = cursor
+            for parameter_index, region in regions_by_peer.get(peer, ()):
+                spans.append((parameter_index, _PackedSpan(region, cursor)))
+                cursor += region.numel
+            split_sizes.append(
+                cursor - split_start if split_stride is None else split_stride
+            )
+        return split_sizes, spans
+
+    input_split_sizes, input_spans = pack(sends)
+    output_split_sizes, output_spans = pack(receives)
 
     return _PackedAllToAllSchedule(
         process_group=process_group,

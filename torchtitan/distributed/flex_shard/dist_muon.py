@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -1206,6 +1207,13 @@ def _assign_balanced_compute_regions(
     position_of = {
         participant: position for position, participant in enumerate(participants)
     }
+    # Preferring a rank that already stores part of a chunk saves bytes on a
+    # packed all-to-all, but on an equal-split one (TPU) it concentrates many
+    # chunks with the same storage rows (e.g. head h of every layer) on one
+    # holder, and every rank's buffer grows with the largest (source,
+    # destination) pair. There, spread chunks by load, bytes and cumulative
+    # load only.
+    prefer_stored = not _requires_equal_all_to_all_splits(group.process_group)
     bucket_loads = [0] * num_participants
     jobs = []
     for index, (layout, domain) in enumerate(
@@ -1230,7 +1238,7 @@ def _assign_balanced_compute_regions(
                 continue
             views = _matrix_batch_views_for_regions(layout.compute_sharding, (region,))
             stored_numel = [0] * num_participants
-            for mapping in domain.mappings:
+            for mapping in domain.mappings if prefer_stored else ():
                 intersection = _tensor_region_intersection(
                     mapping.logical_region, region
                 )
@@ -1255,17 +1263,30 @@ def _assign_balanced_compute_regions(
         (load, 0, cumulative_loads[position] + load)
         for position, load in enumerate(bucket_loads)
     ]
-    # Preferring a rank that already stores part of a chunk saves bytes on a
-    # packed all-to-all, but on an equal-split one (TPU) it concentrates many
-    # chunks with the same storage rows (e.g. head h of every layer) on one
-    # holder, and every rank's buffer grows with the largest (source,
-    # destination) pair. There, spread chunks by load, bytes and cumulative
-    # load only.
-    prefer_stored = not _requires_equal_all_to_all_splits(group.process_group)
     assignments: list[list[_ComputeRegionMapping]] = [[] for _layout in compute_layouts]
-    for job in sorted(
+    ordered_jobs = sorted(
         jobs, key=lambda entry: (-entry.cost, -entry.num_bytes, entry.stable_key)
-    ):
+    )
+    if not prefer_stored:
+        # Same choice as the scan below without the stored-elements term: the
+        # least (load, bytes, cumulative load, position), kept in a heap.
+        heap = [(*entry, position) for position, entry in enumerate(loads)]
+        heapq.heapify(heap)
+        for job in ordered_jobs:
+            load, num_bytes, cumulative, position = heapq.heappop(heap)
+            assignments[job.item_index].append((participants[position], job.region))
+            heapq.heappush(
+                heap,
+                (
+                    load + job.cost,
+                    num_bytes + job.num_bytes,
+                    cumulative + job.cost,
+                    position,
+                ),
+            )
+        loads = [entry[:3] for entry in sorted(heap, key=lambda entry: entry[3])]
+        ordered_jobs = []
+    for job in ordered_jobs:
         *_key, position = min(
             (
                 load,
