@@ -779,3 +779,15 @@ def graph_trainer_kimi_k3_slice_e64_offload_epc2() -> TpuGraphTrainer.Config:
 
 def graph_trainer_kimi_k3_slice_e64_offload_epc4() -> TpuGraphTrainer.Config:
   return _with_ep_token_chunks(graph_trainer_kimi_k3_slice_e64_offload(), 4)
+
+
+def graph_trainer_kimi_k3_deep8_e896_fused_kda_offload_epc2_ars1() -> TpuGraphTrainer.Config:
+  """Proxy only: deep8 epc2 with one layer per attention-residual block, so the
+  last layers see 7-8 block values (as full93 does with blocks of 12)."""
+  cfg = graph_trainer_kimi_k3_deep8_e896_fused_kda_offload_epc2()
+  model = cfg.model_spec.model
+  cfg.model_spec.model = dataclasses.replace(
+      model,
+      layers=[dataclasses.replace(l, attn_res_block_size=1) for l in model.layers],
+  )
+  return cfg
