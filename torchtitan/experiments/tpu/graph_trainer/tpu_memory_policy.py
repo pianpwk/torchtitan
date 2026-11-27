@@ -37,6 +37,7 @@ from torchtitan.experiments.tpu.graph_trainer.collectives import (
 )
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
+    DELTA_ATTENTION_PROJECTIONS,
     FEED_FORWARD_W2,
     MOE_EP_COMBINE,
     MOE_EP_DISPATCH,
@@ -291,6 +292,45 @@ def select_ffn_down_projection(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 FFN_W2_REGION = SaveRegion(name=FEED_FORWARD_W2, select=select_ffn_down_projection)
 
 
+_DELTA_ATTENTION_PROJECTION_FQN_PATTERNS = tuple(
+    f"layers.*.delta_attention.{name}"
+    for name in ("q_proj", "k_proj", "v_proj", "output_gate")
+)
+
+
+def select_delta_attention_projections(
+    gm: torch.fx.GraphModule,
+) -> list[torch.fx.Node]:
+    """Return each KDA layer's q / k / v and output-gate projection matmuls.
+
+    Backward reads all four outputs (the short conv and the gated output norm
+    take them as inputs), so full recompute re-runs these four [T, D] x [D, H *
+    K] matmuls in every KDA layer. Raises unless each module traced exactly one
+    forward matmul, as ``select_ffn_down_projection`` does.
+    """
+    by_fqn: dict[str, list[torch.fx.Node]] = {}
+    for node in _forward_call_nodes(gm):
+        fqn = _get_module_fqn(node)
+        if node.target in _MATMUL_OPS and any(
+            matches_module_fqn_pattern(pattern, fqn)
+            for pattern in _DELTA_ATTENTION_PROJECTION_FQN_PATTERNS
+        ):
+            by_fqn.setdefault(fqn, []).append(node)
+    bad = {fqn: len(nodes) for fqn, nodes in by_fqn.items() if len(nodes) != 1}
+    if bad:
+        raise ValueError(
+            f"KDA projection modules without exactly one forward matmul: {bad}; "
+            "update select_delta_attention_projections for this model."
+        )
+    chosen = {nodes[0] for nodes in by_fqn.values()}
+    return [node for node in _forward_call_nodes(gm) if node in chosen]
+
+
+DELTA_ATTENTION_PROJECTIONS_REGION = SaveRegion(
+    name=DELTA_ATTENTION_PROJECTIONS, select=select_delta_attention_projections
+)
+
+
 def select_ep_dispatch(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     """Return Ring-of-Experts activation all-gather outputs marked in dispatch."""
     return [
@@ -340,6 +380,7 @@ SAVE_REGIONS: dict[str, SaveRegion] = {
         ROUTING_REGION,
         SPLASH_ATTENTION_REGION,
         FFN_W2_REGION,
+        DELTA_ATTENTION_PROJECTIONS_REGION,
         EP_DISPATCH_REGION,
         EP_COMBINE_REGION,
         EP_ROUTING_METADATA_REGION,
@@ -359,11 +400,12 @@ def _full_and_offload_memory_policy_pass(
     with the layer boundaries (``tpu_selective_and_offload`` keeps its saves
     in HBM instead).
     """
-    if config.compile.save_regions:
+    last_n_layers = config.compile.save_last_n_layers
+    if config.compile.save_regions or last_n_layers:
         regions = resolve_save_regions(
-            config.compile.save_regions, {}, "full_and_offload"
+            config.compile.save_regions, last_n_layers, "full_and_offload"
         )
-        full_remat_with_saves(gm, config, select_saves(gm, regions, {}))
+        full_remat_with_saves(gm, config, select_saves(gm, regions, last_n_layers))
     else:
         _full_memory_policy_pass(gm, config=config)
     tag_all_offloadable_activations(

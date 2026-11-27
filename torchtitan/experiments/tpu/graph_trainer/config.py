@@ -173,12 +173,14 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # (which offloads them with the layer boundaries) only: full recompute,
   # except these save regions, whose values are saved for backward in every
   # layer: "moe.routing", "moe.ep_dispatch", "moe.ep_combine",
-  # "moe.ep_routing_metadata", "attention.inner_attention" and
-  # "feed_forward.w2" (see ``experiments/tpu/components/remat_regions.py``).
+  # "moe.ep_routing_metadata", "attention.inner_attention",
+  # "delta_attention.projections" and "feed_forward.w2" (see
+  # ``experiments/tpu/components/remat_regions.py``).
   save_regions: tuple[str, ...] = ()
-  # ``tpu_selective`` and ``tpu_selective_and_offload`` only: save regions to
-  # save only in their last N transformer layers, which backward reaches
-  # first. List each region here or in save_regions, not both. Example:
+  # ``tpu_selective``, ``tpu_selective_and_offload`` and ``full_and_offload``:
+  # save regions to save only in their last N transformer layers, which
+  # backward reaches first. List each region here or in save_regions, not
+  # both. Example:
   # {"attention.inner_attention": 4}, or on the CLI
   # --compile.save-last-n-layers attention.inner_attention 4
   save_last_n_layers: dict[str, int] = field(default_factory=dict)
@@ -274,17 +276,17 @@ def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
   save_regions = compile_config.save_regions
   last_n_layers = compile_config.save_last_n_layers
   policy = compile_config.memory_policy
-  if policy == "full_and_offload" and save_regions and not last_n_layers:
+  if policy == "full_and_offload":
     # Saved and offloaded with the layer boundaries.
-    resolve_save_regions(save_regions, {}, policy)
+    if save_regions or last_n_layers:
+      resolve_save_regions(save_regions, last_n_layers, policy)
     return
   if policy not in ("tpu_selective", "tpu_selective_and_offload"):
     if save_regions or last_n_layers:
       raise ValueError(
           "compile.save_regions and compile.save_last_n_layers only apply to "
-          "compile.memory_policy='tpu_selective' or "
-          "'tpu_selective_and_offload' (save_regions also to "
-          "'full_and_offload')"
+          "compile.memory_policy='tpu_selective', "
+          "'tpu_selective_and_offload' or 'full_and_offload'"
       )
     return
   if compile_config.use_scan_layers:

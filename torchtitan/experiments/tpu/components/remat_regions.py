@@ -44,6 +44,7 @@ MOE_EP_ROUTING_METADATA = "moe.ep_routing_metadata"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"
+DELTA_ATTENTION_PROJECTIONS = "delta_attention.projections"
 
 
 def annotate_region(name: str) -> AbstractContextManager[None]:

@@ -55,6 +55,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     resolve_save_regions,
     ROUTING_REGION,
     SaveRegion,
+    select_delta_attention_projections,
     select_ffn_down_projection,
     select_route_permutations,
     select_routing,
@@ -819,6 +820,67 @@ class TestFeedForwardW2Region(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "exactly one forward matmul"):
             select_ffn_down_projection(gm)
+
+
+class _DeltaAttentionToy(nn.Module):
+    """KDA-shaped projections: q / k / v feed one product, output_gate gates it."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.output_gate = nn.Linear(dim, dim, bias=False)
+        self.output_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mixed = self.q_proj(x) * self.k_proj(x) * self.v_proj(x)
+        return self.output_proj(mixed * torch.sigmoid(self.output_gate(x)))
+
+
+class _DeltaAttentionBlock(nn.Module):
+    def __init__(self, dim: int, kda: bool) -> None:
+        super().__init__()
+        # Only KDA layers have a ``delta_attention``; the others use ``attention``.
+        if kda:
+            self.delta_attention = _DeltaAttentionToy(dim)
+        else:
+            self.attention = _DeltaAttentionToy(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn = getattr(self, "delta_attention", None) or self.attention
+        return x + attn(x)
+
+
+class _DeltaAttentionModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            _DeltaAttentionBlock(_DIM, kda) for kda in (True, False, True)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class TestDeltaAttentionProjectionsRegion(unittest.TestCase):
+    def test_selects_the_four_projections_of_each_kda_layer(self) -> None:
+        torch.manual_seed(0)
+        traced, _ = _trace_toy(_DeltaAttentionModel())
+
+        chosen = select_delta_attention_projections(traced.gm)
+
+        fqns = sorted(node.meta["custom"]["module_fqn"] for node in chosen)
+        self.assertEqual(
+            fqns,
+            sorted(
+                f"layers.{layer}.delta_attention.{name}"
+                for layer in (0, 2)
+                for name in ("q_proj", "k_proj", "v_proj", "output_gate")
+            ),
+        )
 
 
 def _is_splash_node(node: torch.fx.Node) -> bool:
