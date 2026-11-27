@@ -470,6 +470,13 @@ def _k3_dist_muon_optimizer(
 
 
 def _k3_adamw_rest(lr: float) -> ParamGroupConfig:
+  """AdamW on the parameters DistMuon does not take (norms, biases, embeddings).
+
+  DistMuon needs ``implementation="for-loop"``, which would also give this
+  group the per-parameter AdamW: ~8 eager programs for each of ~1,200
+  parameters at full93, host-dispatch bound on TPU. The group asks for the
+  foreach implementation itself.
+  """
   return ParamGroupConfig(
       pattern=r".*",
       optimizer_name="AdamW",
@@ -478,6 +485,7 @@ def _k3_adamw_rest(lr: float) -> ParamGroupConfig:
           "betas": (0.9, 0.95),
           "eps": 1e-8,
           "weight_decay": 0.1,
+          "foreach": True,
       },
   )
 
