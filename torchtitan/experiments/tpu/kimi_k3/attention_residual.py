@@ -62,8 +62,8 @@ class _AttentionResidual(torch.autograd.Function):
   pass over the block values for the score gradients and one fused pass that
   writes the N block value gradients (autograd's version builds them from N
   per-value ``select`` gradients and was 1.5x slower at N = 8). The block
-  values are stacked only as operands of the reductions, as in the
-  ``[T, N, D]`` form, so XLA fuses the stack into them.
+  values are never stacked: every reduction reads them one by one, so XLA
+  keeps no fp32 copy of them.
   """
 
   @staticmethod
@@ -100,18 +100,17 @@ class _AttentionResidual(torch.autograd.Function):
     grad_prefix_probs_T1 = (prefix_float_TD * grad_float_TD).sum(
         dim=-1, keepdim=True
     )
-    if n:
-      block_float_TND = torch.stack([v.float() for v in block_values_TD], 1)
-      # d out / d probs, then through the softmax.
-      grad_probs_TV = torch.cat(
-          (
-              (block_float_TND * grad_float_TD.unsqueeze(1)).sum(dim=-1),
-              grad_prefix_probs_T1,
-          ),
-          dim=-1,
-      )
-    else:
-      grad_probs_TV = grad_prefix_probs_T1
+    # d out / d probs, then through the softmax. One reduction per value: a
+    # stacked fp32 [T, N, D] operand read by two reductions is materialized
+    # (2 x 3 GiB at full93 N = 7).
+    grad_probs_TV = torch.cat(
+        [
+            (v.float() * grad_float_TD).sum(dim=-1, keepdim=True)
+            for v in block_values_TD
+        ]
+        + [grad_prefix_probs_T1],
+        dim=-1,
+    )
     grad_scores_TV = probs_TV * (
         grad_probs_TV - (probs_TV * grad_probs_TV).sum(dim=-1, keepdim=True)
     )
@@ -131,11 +130,10 @@ class _AttentionResidual(torch.autograd.Function):
         probs_TV[:, n:] * grad_float_TD
         + a_TV[:, n:] * (score_weight_D - c_TV[:, n:] * prefix_float_TD)
     ).to(prefix_sum_TD.dtype)
-    grad_weight_D = (a_TV[:, n:] * prefix_float_TD).sum(dim=0)
-    if n:
-      grad_weight_D = (a_TV[:, :n, None] * block_float_TND).sum(
-          dim=(0, 1)
-      ) + grad_weight_D
+    weighted_TD = a_TV[:, n:] * prefix_float_TD
+    for i, value_TD in enumerate(block_values_TD):
+      weighted_TD = weighted_TD + a_TV[:, i : i + 1] * value_TD.float()
+    grad_weight_D = weighted_TD.sum(dim=0)
     return grad_prefix_TD, grad_weight_D, None, *grad_block_values_TD
 
 
