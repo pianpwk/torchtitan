@@ -268,6 +268,7 @@ class DistMuon(Optimizer):
             "adjust_lr_fn": adjust_lr_fn,
         }
         self._first_step_validated = False
+        self._momenta_and_decay_applied = False
         self._param_groups_frozen = False
         super().__init__(_normalize_param_groups(params), defaults)
         self._validate_groups()
@@ -308,15 +309,46 @@ class DistMuon(Optimizer):
                 loss = closure()
 
         self._preflight_step()
-        self._redistribution_runtime.run(
-            self._bucket_plans,
-            local_tensor_spec=self._local_tensor_spec,
-            prepare=self._prepare_local,
-            compute=self._compute_update,
-            finalize=self._apply_update,
-        )
+        self._update_momenta_and_decay_parameters()
+        try:
+            self._redistribution_runtime.run(
+                self._bucket_plans,
+                local_tensor_spec=self._local_tensor_spec,
+                prepare=self._prepare_local,
+                compute=self._compute_update,
+                finalize=self._apply_update,
+            )
+        finally:
+            self._momenta_and_decay_applied = False
         self._redistribution_runtime.release_buffers()
         return loss
+
+    def _update_momenta_and_decay_parameters(self) -> None:
+        """Update every momentum and apply weight decay to every parameter,
+        with one foreach op each, before the buckets run.
+
+        The per-item callbacks would otherwise issue both as two small ops per
+        local tensor (~2,400 at K3 full93), which on TPU eager are separate,
+        host-dispatch bound programs. Same elementwise arithmetic and order per
+        parameter: decay before the update, momentum before the Muon input.
+        """
+        (group,) = self.param_groups
+        grads, momenta, params = [], [], []
+        for compute_layout in self._parameter_compute_layouts:
+            grad, momentum, momentum_state, _group = (
+                self._local_gradient_and_momentum(compute_layout)
+            )
+            local_param = compute_layout.param.to_local()
+            if compute_layout.storage_is_compute_ready:
+                local_param = local_param.detach()
+            grads.append(grad)
+            momenta.append(momentum)
+            params.append(local_param)
+            torch.autograd.graph.increment_version(momentum_state)
+        if grads:
+            torch._foreach_lerp_(momenta, grads, 1 - group["momentum"])
+            torch._foreach_mul_(params, 1 - group["lr"] * group["weight_decay"])
+        self._momenta_and_decay_applied = True
 
     def add_param_group(self, param_group: dict[str, Any]) -> None:
         if self._param_groups_frozen:
@@ -643,6 +675,7 @@ class DistMuon(Optimizer):
             momentum=group["momentum"],
             nesterov=group["nesterov"],
             out=out,
+            momentum_updated=self._momenta_and_decay_applied,
         )
         torch.autograd.graph.increment_version(momentum_state)
 
@@ -689,7 +722,9 @@ class DistMuon(Optimizer):
             local_param,
             direction,
             lr=group["lr"],
-            weight_decay=group["weight_decay"],
+            weight_decay=(
+                0.0 if self._momenta_and_decay_applied else group["weight_decay"]
+            ),
             adjust_lr_fn=group["adjust_lr_fn"],
             compute_matrix_shape=compute_layout.lr_reference_shape,
         )
@@ -1903,9 +1938,12 @@ def _prepare_muon_input(
     momentum: float,
     nesterov: bool,
     out: Tensor,
+    momentum_updated: bool,
 ) -> Tensor:
-    """Update momentum and prepare the Tensor passed to Muon computation."""
-    momentum_buffer.lerp_(gradient, 1 - momentum)
+    """Update momentum (unless already updated) and prepare the Tensor passed
+    to Muon computation."""
+    if not momentum_updated:
+        momentum_buffer.lerp_(gradient, 1 - momentum)
     if nesterov:
         torch.lerp(
             gradient,
@@ -2054,7 +2092,8 @@ def _apply_muon_update(
     A Tensor ``lr`` lets a compiled step take the scheduled LR as a program
     input instead of specializing (and recompiling) on every new value.
     """
-    parameter.mul_(1 - lr * weight_decay)
+    if weight_decay:
+        parameter.mul_(1 - lr * weight_decay)
     if isinstance(lr, Tensor):
         ratio = _adjust_muon_learning_rate(1.0, adjust_lr_fn, compute_matrix_shape)
         parameter.sub_(direction * (lr * ratio))
