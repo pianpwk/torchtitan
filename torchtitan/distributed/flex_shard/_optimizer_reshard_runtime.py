@@ -584,7 +584,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         ],
         prepare: Callable[[_ItemT, Tensor], None],
         compute: Callable[[_ItemT, Tensor], None],
-        finalize: Callable[[_ItemT, Tensor], None],
+        finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
         context = self._context
         handle = (
@@ -770,7 +770,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         ],
         prepare: Callable[[_ItemT, Tensor], None],
         compute: Callable[[_ItemT, Tensor], None],
-        finalize: Callable[[_ItemT, Tensor], None],
+        finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
         handle = context.device_handle
         with handle.stream(caller_stream):
@@ -795,7 +795,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         work: _BucketWork[_ItemT],
         context: _CommunicationContext,
         *,
-        finalize: Callable[[_ItemT, Tensor], None],
+        finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
         handle = context.device_handle
         transfer = context.transfer_stream
@@ -836,14 +836,14 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
         ],
         prepare: Callable[[_ItemT, Tensor], None],
         compute: Callable[[_ItemT, Tensor], None],
-        finalize: Callable[[_ItemT, Tensor], None],
+        finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
     ) -> None:
         for item in items:
             shape, dtype, device = local_tensor_spec(item)
             prepared = slot.compute_buffer(shape, dtype=dtype, device=device)
             prepare(item, prepared)
             compute(item, prepared)
-            finalize(item, prepared)
+            finalize((item,), (prepared,))
 
 
 def _packed_buffer(
@@ -853,29 +853,36 @@ def _packed_buffer(
     dtype: torch.dtype,
     device: torch.device,
 ) -> Tensor:
-    """A flat send buffer from (offset, flat source) pieces, zeros elsewhere.
+    """A flat ``dtype`` send buffer from (offset, flat source) pieces, zeros
+    elsewhere.
 
     Compiled runs build send buffers with one concatenation. Writing each
     piece into a flat buffer becomes a chain of dynamic-update-slices on the
     whole buffer, and writing returned fragments over received ones that are
     still being read makes XLA copy the whole buffer per write: the 64-rank
     expert buckets of K3 at EP16 x eFSDP64 held ~120 copies of a 147 MiB buffer
-    per bucket (66 GiB for seven buckets).
+    per bucket (66 GiB for seven buckets). The conversion to ``dtype`` runs
+    once on the concatenation: on TorchTPU eager a conversion per piece is a
+    program per piece, specialized on the piece's offset.
     """
+    source_dtype = pieces[0][1].dtype if pieces else dtype
     parts: list[Tensor] = []
     cursor = 0
     for offset, piece in sorted(pieces, key=lambda entry: entry[0]):
         if offset < cursor:
             raise RuntimeError("overlapping packed all-to-all spans")
         if offset > cursor:
-            parts.append(torch.zeros(offset - cursor, dtype=dtype, device=device))
-        parts.append(piece.reshape(-1).to(dtype))
+            parts.append(
+                torch.zeros(offset - cursor, dtype=source_dtype, device=device)
+            )
+        parts.append(piece.reshape(-1))
         cursor = offset + piece.numel()
     if cursor > numel:
         raise RuntimeError("packed all-to-all spans exceed the buffer")
     if cursor < numel:
-        parts.append(torch.zeros(numel - cursor, dtype=dtype, device=device))
-    return torch.cat(parts) if len(parts) > 1 else parts[0]
+        parts.append(torch.zeros(numel - cursor, dtype=source_dtype, device=device))
+    packed = torch.cat(parts) if len(parts) > 1 else parts[0]
+    return packed.to(dtype)
 
 
 def _prepare_redistributed(
@@ -1000,11 +1007,18 @@ def _finalize_redistributed(
     work: _BucketWork[_ItemT],
     slot: _BufferSlot,
     *,
-    finalize: Callable[[_ItemT, Tensor], None],
+    finalize: Callable[[Sequence[_ItemT], Sequence[Tensor]], None],
 ) -> None:
+    """Hand every item its returned update. With fresh buffers the received
+    buffer is converted to the storage dtype once and the whole bucket is
+    finalized with one call; reserved buffers reuse one scratch per item."""
     plan = work.plan
     participant = plan.group.local_participant
     schedule = work.plan.compute_to_storage_schedule
+    fresh = _fresh_buffers(plan.device)
+    received = work.storage_buffer.to(plan.dtype) if fresh else work.storage_buffer
+    items: list[_ItemT] = []
+    updates: list[Tensor] = []
     for index, (item, redistribution_plan) in enumerate(
         zip(
             plan.redistributed_items,
@@ -1014,17 +1028,13 @@ def _finalize_redistributed(
     ):
         partition = redistribution_plan.storage_partition(participant)
         spans = schedule.output_spans_by_parameter[index]
-        packed_views = tuple(
-            _received_region(work.storage_buffer, span) for span in spans
-        )
+        packed_views = tuple(_received_region(received, span) for span in spans)
         update = (
             _concatenated_regions(partition.tensor_shape, spans, packed_views)
-            if _fresh_buffers(plan.device)
+            if fresh
             else None
         )
-        if update is not None:
-            update = update.to(plan.dtype)
-        else:
+        if update is None:
             update = slot.storage_partition_buffer(
                 partition.tensor_shape,
                 dtype=plan.dtype,
@@ -1034,7 +1044,13 @@ def _finalize_redistributed(
                 _tensor_region_view(update, span.region) for span in spans
             )
             _batched_copy_(update_views, packed_views)
-        finalize(item, update)
+        if not fresh:
+            finalize((item,), (update,))
+            continue
+        items.append(item)
+        updates.append(update)
+    if items:
+        finalize(items, updates)
 
 
 def _received_region(buffer: Tensor, span: Any) -> Tensor:

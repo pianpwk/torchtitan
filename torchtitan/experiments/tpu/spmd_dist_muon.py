@@ -287,7 +287,7 @@ def _run_buckets(
         local_tensor_spec=optimizer._local_tensor_spec,
         prepare=optimizer._prepare_local,
         compute=optimizer._compute_update,
-        finalize=optimizer._apply_update,
+        finalize=optimizer._apply_updates,
     )
     optimizer._step_local_grads = None
 
@@ -440,7 +440,7 @@ class SpmdCompiledDistMuon(DistMuon):
                 local_tensor_spec=self._local_tensor_spec,
                 prepare=self._prepare_local,
                 compute=self._compute_update,
-                finalize=self._apply_update,
+                finalize=self._apply_updates,
             )
             self._redistribution_runtime.release_buffers()
 

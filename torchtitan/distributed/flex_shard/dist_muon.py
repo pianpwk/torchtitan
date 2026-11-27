@@ -316,7 +316,7 @@ class DistMuon(Optimizer):
                 local_tensor_spec=self._local_tensor_spec,
                 prepare=self._prepare_local,
                 compute=self._compute_update,
-                finalize=self._apply_update,
+                finalize=self._apply_updates,
             )
         finally:
             self._momenta_and_decay_applied = False
@@ -708,27 +708,63 @@ class DistMuon(Optimizer):
         if staged is not compute:
             compute.copy_(staged, non_blocking=False)
 
-    def _apply_update(
-        self, compute_layout: _ParameterComputeLayout, direction: Tensor
+    def _apply_updates(
+        self,
+        compute_layouts: Sequence[_ParameterComputeLayout],
+        directions: Sequence[Tensor],
     ) -> None:
-        group = self._group(compute_layout)
-        local_param = compute_layout.param.to_local()
-        if compute_layout.storage_is_compute_ready:
-            local_param = local_param.detach()
-        row_scale = self._direction_row_scale_by_fqn.get(compute_layout.fqn)
-        if row_scale is not None:
-            direction.mul_(row_scale)
-        _apply_muon_update(
-            local_param,
-            direction,
-            lr=group["lr"],
-            weight_decay=(
-                0.0 if self._momenta_and_decay_applied else group["weight_decay"]
-            ),
-            adjust_lr_fn=group["adjust_lr_fn"],
-            compute_matrix_shape=compute_layout.lr_reference_shape,
-        )
-        torch.autograd.graph.increment_version(compute_layout.param)
+        """Apply a bucket's directions (and weight decay unless already applied)
+        with one foreach op per (param group, adjusted LR).
+
+        Per-parameter ops are separate programs on TorchTPU eager, and one that
+        reads a view of a received buffer is specialized on the view's offset:
+        K3 full93 at FSDP1024 ran ~1,000 distinct such executables per step.
+        """
+        updates: dict[tuple[int, float | None], tuple[list[Tensor], list[Tensor]]] = {}
+        decayed: dict[int, list[Tensor]] = {}
+        lr_tensor_ratios: dict[tuple[int, float | None], float] = {}
+        for compute_layout, direction in zip(compute_layouts, directions, strict=True):
+            group = self._group(compute_layout)
+            local_param = compute_layout.param.to_local()
+            if compute_layout.storage_is_compute_ready:
+                local_param = local_param.detach()
+            row_scale = self._direction_row_scale_by_fqn.get(compute_layout.fqn)
+            if row_scale is not None:
+                # Out of place: an in-place write into a view of a received
+                # buffer rewrites the whole buffer on TorchTPU eager.
+                direction = direction * row_scale
+            if not self._momenta_and_decay_applied and group["weight_decay"]:
+                decayed.setdefault(compute_layout.group_index, []).append(local_param)
+            ratio = _adjust_muon_learning_rate(
+                1.0, group["adjust_lr_fn"], compute_layout.lr_reference_shape
+            )
+            lr = group["lr"]
+            key = (
+                compute_layout.group_index,
+                ratio
+                if isinstance(lr, Tensor)
+                else _adjust_muon_learning_rate(
+                    lr, group["adjust_lr_fn"], compute_layout.lr_reference_shape
+                ),
+            )
+            lr_tensor_ratios[key] = ratio
+            params, deltas = updates.setdefault(key, ([], []))
+            params.append(local_param)
+            deltas.append(direction)
+            torch.autograd.graph.increment_version(compute_layout.param)
+        for group_index, params in decayed.items():
+            group = self.param_groups[group_index]
+            torch._foreach_mul_(params, 1 - group["lr"] * group["weight_decay"])
+        for (group_index, adjusted_lr), (params, deltas) in updates.items():
+            lr = self.param_groups[group_index]["lr"]
+            if isinstance(lr, Tensor):
+                # A Tensor LR is a compiled step's program input: scaling it
+                # instead of specializing on its value avoids a recompile per
+                # scheduled LR.
+                scale = lr * lr_tensor_ratios[(group_index, adjusted_lr)]
+                torch._foreach_sub_(params, torch._foreach_mul(deltas, scale))
+            else:
+                torch._foreach_add_(params, deltas, alpha=-adjusted_lr)
 
     @staticmethod
     def _local_tensor_spec(
@@ -2076,35 +2112,6 @@ def _direction_row_scale(
     return torch.tensor(scales, dtype=torch.float32, device=local.device).view(
         -1, *([1] * (local.ndim - 1))
     )
-
-
-def _apply_muon_update(
-    parameter: Tensor,
-    direction: Tensor,
-    *,
-    lr: float | Tensor,
-    weight_decay: float,
-    adjust_lr_fn: str | None,
-    compute_matrix_shape: torch.Size | tuple[int, ...],
-) -> Tensor:
-    """Apply decoupled weight decay and a computed Muon direction.
-
-    A Tensor ``lr`` lets a compiled step take the scheduled LR as a program
-    input instead of specializing (and recompiling) on every new value.
-    """
-    if weight_decay:
-        parameter.mul_(1 - lr * weight_decay)
-    if isinstance(lr, Tensor):
-        ratio = _adjust_muon_learning_rate(1.0, adjust_lr_fn, compute_matrix_shape)
-        parameter.sub_(direction * (lr * ratio))
-        return parameter
-    adjusted_lr = _adjust_muon_learning_rate(
-        lr,
-        adjust_lr_fn,
-        compute_matrix_shape,
-    )
-    parameter.add_(direction, alpha=-adjusted_lr)
-    return parameter
 
 
 def _zeropower_via_newtonschulz(
