@@ -662,7 +662,12 @@ def graph_trainer_kimi_k3_deep8_e896_spmd_dist_muon() -> TpuGraphTrainer.Config:
 def graph_trainer_kimi_k3_full93_e896_fused_kda_spmd_dist_muon(
 ) -> TpuGraphTrainer.Config:
   """``graph_trainer_kimi_k3_full93_e896_fused_kda`` with DistMuon, routed
-  experts captured in ``SpmdDistMuon``, dense matrices eager (``by_layer``).
+  experts captured in ``SpmdDistMuon``, dense matrices eager (``by_shape``).
+
+  Dense buckets by shape family: at FSDP1024 every equal-split all-to-all
+  costs each rank about one owner's receive volume, so 12 family buckets
+  (6.0 GiB padded per rank per step) beat 47 layer buckets (16.0 GiB): 37.55 vs
+  44.12 s per step on 8x8x8 (F6D / F6C), identical loss.
 
   Expert buckets hold eight same-shape tensors: at EP16 x eFSDP64 (8x8x8,
   TP1) eight tensors of 56 local experts split into equal runs of seven
@@ -678,6 +683,7 @@ def graph_trainer_kimi_k3_full93_e896_fused_kda_spmd_dist_muon(
   cfg = graph_trainer_kimi_k3_full93_e896_fused_kda()
   cfg.optimizer = _k3_dist_muon_optimizer(
       cfg.model_spec.model,
+      bucketing="by_shape",
       spmd_expert_bucket_size=8,
       spmd_max_buckets_per_program=7,
   )
