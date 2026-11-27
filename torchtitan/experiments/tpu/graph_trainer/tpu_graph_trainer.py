@@ -226,6 +226,10 @@ class TpuGraphTrainer(GraphTrainer):
         )
         if self._optimizer_separate_graph:
             apply_compiled_optimizer(self)
+        elif not self._optimizer_in_graph:
+            self.optimizers.register_step_post_hook(
+                lambda *args, **kwargs: _materialize_params(self.model_parts)
+            )
 
         self._mfu_benchmark = None
         if config.tpu_config.enable_mfu_benchmark:
@@ -836,6 +840,28 @@ def _unique_param_grads(
         unique_params.append(param)
         unique_grads.append(grad)
     return unique_params, unique_grads
+
+
+@torch.no_grad()
+def _materialize_params(model_parts: list[nn.Module]) -> None:
+    """Start executing the eager grad-norm clip and optimizer ops, without waiting.
+
+    torch_tpu defers eager ops until a value is needed. Left alone, the
+    optimizer's ops (and the reload of their programs) only launch when the
+    device reaches them, so they run back to back with the device idle in
+    between. Materializing the updated parameters right after dispatch
+    queues them behind the backward instead.
+    """
+    from torch_tpu._internal.sync import synchronize  # pytype: disable=import-error
+
+    synchronize(
+        [
+            p.to_local() if isinstance(p, DTensor) else p
+            for part in model_parts
+            for p in part.parameters()
+        ],
+        wait=False,
+    )
 
 
 def _check_in_graph_optimizer_grad_accum(
