@@ -273,15 +273,23 @@ def _is_rank_symmetric(plan: Any) -> bool:
     return len(signatures) == 1
 
 
+def _plan_items(plan: Any) -> tuple[Any, ...]:
+    if hasattr(plan, "redistributed_items"):
+        return plan.unredistributed_items + plan.redistributed_items
+    return plan.items
+
+
 def _run_buckets(
     optimizer: "SpmdCompiledDistMuon",
     program: int,
-    local_grads: dict[str, torch.Tensor],
+    local_tensors: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 ) -> None:
-    # Gradients enter as an explicit input: tracing an optimizer makes Dynamo
-    # guard on the identity of every ``param.grad`` it reads, and the trainer
-    # allocates new gradients each step (one recompile per step).
-    optimizer._step_local_grads = local_grads
+    # Every tensor enters as an explicit input keyed by the traced program's
+    # parameter names: tracing an optimizer makes Dynamo guard on the identity
+    # of every ``param.grad`` it reads (the trainer allocates new gradients
+    # each step), and explicit inputs let a structurally identical program
+    # reuse this trace with another program's tensors.
+    optimizer._step_local_tensors = local_tensors
     optimizer._redistribution_runtime.run(
         optimizer._program_plans[program],
         local_tensor_spec=optimizer._local_tensor_spec,
@@ -289,7 +297,7 @@ def _run_buckets(
         compute=optimizer._compute_update,
         finalize=optimizer._apply_updates,
     )
-    optimizer._step_local_grads = None
+    optimizer._step_local_tensors = None
 
 
 class SpmdCompiledDistMuon(DistMuon):
@@ -304,7 +312,10 @@ class SpmdCompiledDistMuon(DistMuon):
     exchange buffers and Newton-Schulz temporaries live at once (so the
     all-to-alls can overlap) and returns new parameters and momenta without
     aliasing the inputs, so its HBM grows with the number of buckets; several
-    programs bound it, overlapping only within each.
+    programs bound it, overlapping only within each. A program whose buckets
+    match an earlier program's in every shape, layout and schedule (e.g. the
+    same-shape w1 / w3 buckets of different layers) reuses that program's
+    trace with its own tensors instead of tracing again.
     """
 
     def __init__(
@@ -383,20 +394,89 @@ class SpmdCompiledDistMuon(DistMuon):
             )
             for i, plans in enumerate(self._program_plans)
         )
-        self._compiled_runs: tuple[Callable[..., None], ...] | None = None
-        self._step_local_grads: dict[str, torch.Tensor] | None = None
+        # Index of the first program each program reuses the trace of.
+        representatives: list[int] = []
+        for i, plans in enumerate(self._program_plans):
+            representatives.append(
+                next(
+                    (
+                        j
+                        for j in range(i)
+                        if representatives[j] == j
+                        and self._same_program(self._program_plans[j], plans)
+                    ),
+                    i,
+                )
+            )
+        self._program_representatives = tuple(representatives)
+        if len(set(representatives)) < len(representatives):
+            logger.info(
+                f"SpmdDistMuon: {len(representatives)} programs, "
+                f"{len(set(representatives))} traces (program -> trace: "
+                f"{representatives})"
+            )
+        self._compiled_runs: tuple[Callable[..., None] | None, ...] | None = None
+        self._step_local_tensors: (
+            dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
+        ) = None
+
+    def _reuse_item_signature(self, compute_layout: Any) -> tuple[Any, ...]:
+        """Everything about an item a traced program depends on, except which
+        parameter it is."""
+        local = compute_layout.param.to_local()
+        row_scale = self._direction_row_scale_by_fqn.get(compute_layout.fqn)
+        return (
+            self._plan_item_signature(compute_layout)[1:],
+            tuple(local.shape),
+            tuple(local.stride()),
+            self._matrix_views_by_fqn[compute_layout.fqn],
+            None if row_scale is None else tuple(row_scale.flatten().tolist()),
+        )
+
+    def _same_program(self, plans: tuple[Any, ...], other: tuple[Any, ...]) -> bool:
+        if len(plans) != len(other):
+            return False
+        for plan, other_plan in zip(plans, other):
+            if type(plan) is not type(other_plan):
+                return False
+            items, other_items = _plan_items(plan), _plan_items(other_plan)
+            if len(items) != len(other_items) or any(
+                self._reuse_item_signature(a) != self._reuse_item_signature(b)
+                for a, b in zip(items, other_items)
+            ):
+                return False
+            if hasattr(plan, "redistributed_items") and (
+                len(plan.redistributed_items) != len(other_plan.redistributed_items)
+                or any(
+                    getattr(plan, name) != getattr(other_plan, name)
+                    for name in (
+                        "redistribution_plans",
+                        "group",
+                        "storage_to_compute_schedule",
+                        "compute_to_storage_schedule",
+                        "compute_to_storage_offset",
+                        "dtype",
+                        "compute_dtype",
+                        "device",
+                    )
+                )
+            ):
+                return False
+        return True
+
+    def _local_parameter(self, compute_layout: Any) -> torch.Tensor:
+        if self._step_local_tensors is None:
+            return super()._local_parameter(compute_layout)
+        return self._step_local_tensors[compute_layout.fqn][0]
 
     def _local_gradient_and_momentum(self, compute_layout: Any) -> Any:
-        if self._step_local_grads is None:
+        if self._step_local_tensors is None:
             return super()._local_gradient_and_momentum(compute_layout)
-        momentum_state = self.state[compute_layout.param]["momentum_buffer"]
-        local_reference = compute_layout.param.to_local()
-        if compute_layout.storage_is_compute_ready:
-            local_reference = local_reference.detach()
+        param, momentum, grad = self._step_local_tensors[compute_layout.fqn]
         return (
-            self._step_local_grads[compute_layout.fqn].view_as(local_reference),
-            momentum_state.to_local().view_as(local_reference),
-            momentum_state,
+            grad.view_as(param),
+            momentum.view_as(param),
+            momentum,
             self._group(compute_layout),
         )
 
@@ -406,7 +486,8 @@ class SpmdCompiledDistMuon(DistMuon):
             raise ValueError("SpmdCompiledDistMuon does not support a closure")
         self._preflight_step()
         if self._compiled_runs is None:
-            # One torch.compile per program: each has its own guard and cache.
+            # One torch.compile per traced program: each has its own guard and
+            # cache.
             self._compiled_runs = tuple(
                 torch.compile(
                     torch.tpu.distributed.spmd_safe(_run_buckets),
@@ -415,25 +496,49 @@ class SpmdCompiledDistMuon(DistMuon):
                     dynamic=False,
                     options={"debug_callback": guard, "serializable": False},
                 )
-                for guard in self._collective_guards
+                if self._program_representatives[i] == i
+                else None
+                for i, guard in enumerate(self._collective_guards)
             )
         group = self.param_groups[0]
         lr = group["lr"]
         device = self._parameter_compute_layouts[0].param.device
         group["lr"] = torch.tensor(lr, dtype=torch.float32, device=device)
-        local_grads = {
-            layout.fqn: layout.param.grad.to_local()
+        local_tensors = {
+            layout.fqn: (
+                DistMuon._local_parameter(self, layout),
+                self.state[layout.param]["momentum_buffer"].to_local(),
+                layout.param.grad.to_local(),
+            )
             for layout in self._parameter_compute_layouts
         }
         try:
-            for program, (run, guard) in enumerate(
-                zip(self._compiled_runs, self._collective_guards)
-            ):
-                guard.compile_start = time.time()
-                run(self, program, local_grads)
+            for program, plans in enumerate(self._program_plans):
+                traced = self._program_representatives[program]
+                program_tensors = {
+                    traced_item.fqn: local_tensors[item.fqn]
+                    for traced_item, item in zip(
+                        (
+                            item
+                            for plan in self._program_plans[traced]
+                            for item in _plan_items(plan)
+                        ),
+                        (item for plan in plans for item in _plan_items(plan)),
+                        strict=True,
+                    )
+                }
+                self._collective_guards[traced].compile_start = time.time()
+                run = self._compiled_runs[traced]
+                assert run is not None
+                run(self, traced, program_tensors)
         finally:
             group["lr"] = lr
-            self._step_local_grads = None
+            self._step_local_tensors = None
+        for layout in self._parameter_compute_layouts:
+            torch.autograd.graph.increment_version(layout.param)
+            torch.autograd.graph.increment_version(
+                self.state[layout.param]["momentum_buffer"]
+            )
         if self._eager_plans:
             self._redistribution_runtime.run(
                 self._eager_plans,

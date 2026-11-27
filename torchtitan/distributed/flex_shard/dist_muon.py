@@ -338,9 +338,7 @@ class DistMuon(Optimizer):
             grad, momentum, momentum_state, _group = (
                 self._local_gradient_and_momentum(compute_layout)
             )
-            local_param = compute_layout.param.to_local()
-            if compute_layout.storage_is_compute_ready:
-                local_param = local_param.detach()
+            local_param = self._local_parameter(compute_layout)
             grads.append(grad)
             momenta.append(momentum)
             params.append(local_param)
@@ -647,6 +645,12 @@ class DistMuon(Optimizer):
             )
         return state["momentum_buffer"]
 
+    def _local_parameter(self, compute_layout: _ParameterComputeLayout) -> Tensor:
+        local_param = compute_layout.param.to_local()
+        if compute_layout.storage_is_compute_ready:
+            local_param = local_param.detach()
+        return local_param
+
     def _local_gradient_and_momentum(
         self, compute_layout: _ParameterComputeLayout
     ) -> tuple[Tensor, Tensor, DTensor, dict[str, Any]]:
@@ -725,9 +729,7 @@ class DistMuon(Optimizer):
         lr_tensor_ratios: dict[tuple[int, float | None], float] = {}
         for compute_layout, direction in zip(compute_layouts, directions, strict=True):
             group = self._group(compute_layout)
-            local_param = compute_layout.param.to_local()
-            if compute_layout.storage_is_compute_ready:
-                local_param = local_param.detach()
+            local_param = self._local_parameter(compute_layout)
             row_scale = self._direction_row_scale_by_fqn.get(compute_layout.fqn)
             if row_scale is not None:
                 # Out of place: an in-place write into a view of a received
