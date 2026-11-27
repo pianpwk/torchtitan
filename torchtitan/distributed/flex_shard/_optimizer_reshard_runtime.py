@@ -40,6 +40,25 @@ __all__: list[str] = []
 
 _NUM_PIPELINE_SLOTS = 2
 
+# TorchTPU eager queues work far ahead of the device, and every queued bucket
+# keeps its exchange buffers live. K3 at FSDP1024: 47 queued buckets of ~3.6 GiB
+# of exchange buffers each (170 GiB) stalled the step-1 optimizer on every rank;
+# five of them (18 GiB, deep8) ran. The eager runtime synchronizes once the
+# buckets queued since the last synchronize exceed this many exchange bytes.
+_TPU_MAX_QUEUED_EXCHANGE_BYTES = 16 * 2**30
+
+
+def _exchange_bytes(plan: _RedistributionBucketPlan[Any]) -> int:
+    """Bytes of the send and receive buffers of a bucket's two all-to-alls."""
+    element_size = torch.empty((), dtype=plan.compute_dtype).element_size()
+    return element_size * sum(
+        schedule.input_buffer_numel + schedule.output_buffer_numel
+        for schedule in (
+            plan.storage_to_compute_schedule,
+            plan.compute_to_storage_schedule,
+        )
+    )
+
 
 _BufferKey: TypeAlias = tuple[torch.device, torch.dtype]
 
@@ -602,6 +621,7 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
                 prepare=prepare,
             )
 
+        queued_exchange_bytes = 0
         try:
             for plan_index, plan in enumerate(plans):
                 if isinstance(plan, _LocalBucketPlan):
@@ -669,6 +689,12 @@ class _BucketedRedistributionRuntime(Generic[_ItemT]):
                     self._release(previous_work, caller)
                 previous = work
                 redistributed_index += 1
+                if self._device.type == "tpu" and not torch.compiler.is_compiling():
+                    queued_exchange_bytes += _exchange_bytes(plan)
+                    if queued_exchange_bytes > _TPU_MAX_QUEUED_EXCHANGE_BYTES:
+                        # TODO: Drop once TorchTPU bounds its eager queue.
+                        torch.accelerator.synchronize()
+                        queued_exchange_bytes = 0
 
                 while len(prefetched) < len(context.slots) - 1:
                     slot = context.slots[
