@@ -1628,10 +1628,16 @@ def _resolve_storage_to_compute_transition(
         normalized_target_sharding_by_storage_mesh_axis,
         tuple(applicable_compute_shardings_by_storage_mesh_axis),
     )
+    # An owned axis needs a transport only if storage shards the tensor on it.
+    # Where storage replicates it, every rank already holds the whole tensor
+    # and updates it locally: an owner would have to send its update back to
+    # every rank, and on TPU equal splits pad every pair of the bucket's
+    # all-to-all to that whole tensor.
     active_owned_storage_mesh_axes = tuple(
         storage_mesh_axis
         for storage_mesh_axis in applicable_owned_storage_mesh_axes
         if param.device_mesh.size(storage_mesh_axis) > 1
+        and type(param.placements[storage_mesh_axis]) is not Replicate
     )
     transport_mesh_axes = tuple(
         sorted(set(changed_storage_mesh_axes).union(active_owned_storage_mesh_axes))
